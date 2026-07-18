@@ -35,6 +35,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
@@ -3797,4 +3798,214 @@ func TestReconcile_TracingNormalization(t *testing.T) {
 
 	require.NotNil(t, mt.capturedAttrs)
 	require.Equal(t, "unknown", mt.capturedAttrs[sandboxv1beta1.CreatedByLabel], "created-by label must be normalized in span attributes")
+}
+
+// convergedReadySandboxAndPod returns a Sandbox and its Pod in a fully
+// converged Ready state: the Pod carries the tracking label and no stale
+// metadata, and the Sandbox status/annotations already reflect the Pod. A
+// reconcile over this pair must be a pure no-op unless generation !=
+// observedGeneration.
+func convergedReadySandboxAndPod(generation, observedGeneration int64) (*sandboxv1beta1.Sandbox, *corev1.Pod) {
+	name := "sandbox-name"
+	ns := "sandbox-ns"
+	hash := NameHash(name)
+
+	sb := &sandboxv1beta1.Sandbox{}
+	sb.Name = name
+	sb.Namespace = ns
+	sb.UID = sandboxUID
+	sb.Generation = generation
+	sb.Annotations = map[string]string{
+		sandboxv1beta1.SandboxPodNameAnnotation: name,
+	}
+	sb.Spec = sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "test-container"}},
+		},
+	}}}
+	sb.Status = sandboxv1beta1.SandboxStatus{
+		LabelSelector: sandboxLabel + "=" + hash,
+		PodIPs:        []string{"10.244.0.5"},
+		NodeName:      "node-1",
+		Conditions: []metav1.Condition{
+			{
+				Type:               string(sandboxv1beta1.SandboxConditionReady),
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: observedGeneration,
+				Reason:             sandboxv1beta1.SandboxReasonDependenciesReady,
+				Message:            "Pod is Ready",
+				LastTransitionTime: metav1.NewTime(time.Unix(1000, 0)),
+			},
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels: map[string]string{
+				sandboxLabel: hash,
+			},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(name)},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node-1",
+			Containers: []corev1.Container{{Name: "test-container"}},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIPs: []corev1.PodIP{{IP: "10.244.0.5"}},
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+	return sb, pod
+}
+
+// writeCounters tallies every mutating client call issued during a reconcile.
+type writeCounters struct {
+	creates            int
+	updates            int
+	patches            int
+	deletes            int
+	subResourceUpdates int
+	subResourcePatches int
+}
+
+func (w *writeCounters) total() int {
+	return w.creates + w.updates + w.patches + w.deletes + w.subResourceUpdates + w.subResourcePatches
+}
+
+func (w *writeCounters) interceptors() interceptor.Funcs {
+	return interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			w.creates++
+			return c.Create(ctx, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			w.updates++
+			return c.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			w.patches++
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			w.deletes++
+			return c.Delete(ctx, obj, opts...)
+		},
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			w.subResourceUpdates++
+			return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+		},
+		SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			w.subResourcePatches++
+			return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+		},
+	}
+}
+
+// TestUpdateStatus_ToleratesConcurrentObjectPatch verifies that the status
+// write does not fail with a conflict when another actor (e.g. the
+// SandboxClaim controller's warm-pool adoption metadata patch) has bumped the
+// Sandbox resourceVersion after this controller read it from its cache.
+func TestUpdateStatus_ToleratesConcurrentObjectPatch(t *testing.T) {
+	ctx := t.Context()
+	sb, pod := convergedReadySandboxAndPod(1, 1)
+	key := types.NamespacedName{Name: sb.Name, Namespace: sb.Namespace}
+
+	cl := newFakeClient(sb, pod)
+	r := SandboxReconciler{
+		Client:        cl,
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	// Read the sandbox as the reconciler would (this copy's resourceVersion
+	// will go stale below).
+	stale := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, cl.Get(ctx, key, stale))
+	oldStatus := stale.Status.DeepCopy()
+
+	// Concurrent actor patches sandbox metadata, bumping resourceVersion.
+	live := stale.DeepCopy()
+	live.Labels = map[string]string{"extensions.agents.x-k8s.io/claim": "some-claim"}
+	require.NoError(t, cl.Update(ctx, live))
+
+	// The reconciler now writes a recomputed status using its stale copy.
+	stale.Status.NodeName = "node-2"
+	meta.SetStatusCondition(&stale.Status.Conditions, metav1.Condition{
+		Type:               string(sandboxv1beta1.SandboxConditionReady),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: stale.Generation,
+		Reason:             sandboxv1beta1.SandboxReasonDependenciesReady,
+		Message:            "Pod is Ready",
+	})
+	require.NoError(t, r.updateStatus(ctx, oldStatus, stale),
+		"status write must not conflict with a concurrent metadata patch")
+
+	got := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, cl.Get(ctx, key, got))
+	assert.Equal(t, "node-2", got.Status.NodeName, "recomputed status must be persisted")
+	assert.Equal(t, "some-claim", got.Labels["extensions.agents.x-k8s.io/claim"],
+		"concurrent metadata patch must not be lost")
+}
+
+// TestReconcile_StatusWriteSurvivesAdoptionRace runs a full reconcile in which
+// the Sandbox is modified out-of-band after the reconciler's initial Get,
+// mirroring the claim controller's adoption patch racing an adoption-triggered
+// reconcile. The reconcile must succeed in one pass (no 409 -> backoff requeue).
+func TestReconcile_StatusWriteSurvivesAdoptionRace(t *testing.T) {
+	ctx := t.Context()
+	// generation 2 vs observedGeneration 1 forces a status write.
+	sb, pod := convergedReadySandboxAndPod(2, 1)
+	key := types.NamespacedName{Name: sb.Name, Namespace: sb.Namespace}
+
+	raced := false
+	cl := fake.NewClientBuilder().
+		WithScheme(Scheme).
+		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
+		WithIndex(&corev1.Pod{}, podSandboxNameHashIndex, podSandboxNameHashIndexer).
+		WithRuntimeObjects(sb, pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, k client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if err := c.Get(ctx, k, obj, opts...); err != nil {
+					return err
+				}
+				if got, ok := obj.(*sandboxv1beta1.Sandbox); ok && !raced {
+					raced = true
+					// Bump the stored object after handing out this copy, so
+					// the reconciler proceeds with a stale resourceVersion.
+					live := got.DeepCopy()
+					live.Labels = map[string]string{"extensions.agents.x-k8s.io/claim": "some-claim"}
+					if err := c.Update(ctx, live); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		}).
+		Build()
+
+	r := SandboxReconciler{
+		Client:        cl,
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require.NoError(t, err, "reconcile must not fail on a concurrent sandbox metadata patch")
+	require.True(t, raced, "test must have injected the concurrent patch")
+
+	got := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, cl.Get(ctx, key, got))
+	cond := meta.FindStatusCondition(got.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	require.NotNil(t, cond)
+	assert.Equal(t, int64(2), cond.ObservedGeneration, "status write must land despite the race")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, "some-claim", got.Labels["extensions.agents.x-k8s.io/claim"],
+		"concurrent metadata patch must not be lost")
 }

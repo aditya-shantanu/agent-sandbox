@@ -451,8 +451,29 @@ func (r *SandboxReconciler) updateStatus(ctx context.Context, oldStatus *sandbox
 		return nil
 	}
 
-	if err := r.Status().Update(ctx, sandbox); err != nil {
-		logger.Error(err, "Failed to update sandbox status")
+	// Write the status via a merge patch WITHOUT optimistic locking rather than
+	// an Update. An Update carries the resourceVersion of the (possibly stale)
+	// cached object and is rejected with a 409 whenever anything else touched
+	// the Sandbox in the meantime — notably the SandboxClaim controller's
+	// warm-pool adoption metadata patch, which races this reconcile by design.
+	// Each 409 costs a full requeue through per-item exponential backoff, which
+	// is pure added latency on the claim-ready critical path.
+	//
+	// Last-writer-wins is safe here because:
+	//   - This controller is the ONLY writer of Sandbox .status in the system
+	//     (the claim/warmpool controllers only patch their own statuses), so
+	//     there is no other writer whose fields a merge patch could clobber.
+	//   - controller-runtime serializes reconciles per object, so this
+	//     controller never races itself on the same Sandbox.
+	//   - Every field written (PodIPs, NodeName, LabelSelector, Service,
+	//     ServiceFQDN, Conditions) is recomputed from observed child state on
+	//     every reconcile; a write from a stale view is corrected by the next
+	//     child-event-driven reconcile (level-based reconciliation), exactly as
+	//     it would have been with Update.
+	base := sandbox.DeepCopy()
+	base.Status = *oldStatus
+	if err := r.Status().Patch(ctx, sandbox, client.MergeFrom(base)); err != nil {
+		logger.Error(err, "Failed to patch sandbox status")
 		return err
 	}
 
