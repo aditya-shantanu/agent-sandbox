@@ -98,6 +98,11 @@ type PhaseSummary struct {
 
 	Latency LatencyBreakdown `json:"latency"`
 
+	// TimeToAllReadySeconds is first Create call -> last observed Ready, set
+	// only when every record in the phase became Ready. It is the headline
+	// metric for the claims-warm burst (how long until ALL claims are Ready).
+	TimeToAllReadySeconds *float64 `json:"timeToAllReadySeconds,omitempty"`
+
 	CreateThroughput *ThroughputStats `json:"createThroughput,omitempty"`
 	ReadyThroughput  *ThroughputStats `json:"readyThroughput,omitempty"`
 
@@ -147,6 +152,12 @@ type Config struct {
 	// elapsed (0 = count-based only).
 	ThroughputMinSeconds float64 `json:"throughputMinSeconds"`
 
+	// ClaimsWarmCount sizes the claims-warm phase: the SandboxWarmPool replica
+	// count and the number of SandboxClaims fired simultaneously against it.
+	// The cluster needs ClaimsWarmCount spare pod slots for the pool itself,
+	// and up to ~2x transiently while the pool replenishes claimed sandboxes.
+	ClaimsWarmCount int `json:"claimsWarmCount"`
+
 	CollectMetrics  bool          `json:"collectMetrics"`
 	MetricsInterval time.Duration `json:"metricsIntervalNanos"`
 
@@ -176,13 +187,14 @@ func run(ctx context.Context) error {
 	flag.DurationVar(&cfg.Timeout, "timeout", 30*time.Minute, "Timeout for the entire test run")
 	flag.DurationVar(&cfg.PerSandboxTimeout, "per-sandbox-timeout", 5*time.Minute, "Timeout for a single sandbox to become ready / be deleted")
 	flag.IntVar(&cfg.CreateConcurrency, "create-concurrency", 20, "Number of concurrent workers creating Sandboxes (fill and throughput phases)")
-	phasesFlag := flag.String("phases", "probe,throughput-mif50", "Comma-separated phase names to run in order (fill, probe, throughput-mifN). Structured forms like throughput{maxInFlight:N} may be added later")
+	phasesFlag := flag.String("phases", "probe,throughput-mif50", "Comma-separated phase names to run in order (fill, probe, claims-warm, throughput-mifN). Structured forms like throughput{maxInFlight:N} may be added later")
 	flag.IntVar(&cfg.FillPerNode, "fill-per-node", 10, "Number of long-running background Sandboxes per worker node for the fill phase")
 	flag.IntVar(&cfg.ProbeCount, "probe-count", 20, "Number of latency probe Sandboxes for the probe phase")
 	flag.IntVar(&cfg.ProbeConcurrency, "probe-concurrency", 1, "Number of concurrent latency probes; keep low for clean latency numbers")
 	flag.DurationVar(&cfg.ProbeInterval, "probe-interval", 0, "Delay between latency probes")
 	flag.IntVar(&cfg.ThroughputCount, "throughput-count", 200, "Number of Sandboxes to churn per throughput phase (before --throughput-min-seconds)")
 	flag.Float64Var(&cfg.ThroughputMinSeconds, "throughput-min-seconds", 45, "Minimum duration of each throughput phase; levels churn beyond -throughput-count until this much time has elapsed (0 = count-based only)")
+	flag.IntVar(&cfg.ClaimsWarmCount, "claims-warm-count", 300, "Warm pool size and number of simultaneous SandboxClaims for the claims-warm phase (requires the extensions controller)")
 	flag.BoolVar(&cfg.CollectMetrics, "collect-metrics", true, "Whether to scrape Prometheus metrics from the control plane, the sandbox controller, and kubelets to metrics.jsonl.gz")
 	flag.DurationVar(&cfg.MetricsInterval, "metrics-interval", 15*time.Second, "Interval between Prometheus metrics scrapes")
 	flag.BoolVar(&cfg.ProfileAPIServer, "profile-apiserver", true, "Capture a kube-apiserver CPU profile during each throughput level (pprof-apiserver-<phase>.pprof)")
@@ -201,8 +213,8 @@ func run(ctx context.Context) error {
 	if cfg.Timeout <= 0 || cfg.PerSandboxTimeout <= 0 {
 		return fmt.Errorf("timeouts must be > 0: timeout=%v per-sandbox-timeout=%v", cfg.Timeout, cfg.PerSandboxTimeout)
 	}
-	if cfg.FillPerNode < 0 || cfg.ProbeCount < 0 || cfg.ThroughputCount < 0 {
-		return fmt.Errorf("counts must be >= 0: fill-per-node=%d probe=%d throughput=%d", cfg.FillPerNode, cfg.ProbeCount, cfg.ThroughputCount)
+	if cfg.FillPerNode < 0 || cfg.ProbeCount < 0 || cfg.ThroughputCount < 0 || cfg.ClaimsWarmCount < 0 {
+		return fmt.Errorf("counts must be >= 0: fill-per-node=%d probe=%d throughput=%d claims-warm=%d", cfg.FillPerNode, cfg.ProbeCount, cfg.ThroughputCount, cfg.ClaimsWarmCount)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
@@ -293,6 +305,12 @@ func run(ctx context.Context) error {
 		{Group: "", Version: "v1", Resource: "events"},
 		{Group: "agents.x-k8s.io", Version: "v1beta1", Resource: "sandboxes"},
 	}
+	// Only watch SandboxClaims when the claims-warm phase runs: the extensions
+	// CRDs may not be installed otherwise, and a missing CRD would make the
+	// watcher retry-loop for the whole run.
+	if slices.Contains(cfg.Phases, string(PhaseClaimsWarm)) {
+		gvrList = append(gvrList, schema.GroupVersionResource{Group: "extensions.agents.x-k8s.io", Version: "v1beta1", Resource: "sandboxclaims"})
+	}
 
 	for _, gvr := range gvrList {
 		taskRunner.RunAsync(ctx, func(ctx context.Context) error {
@@ -365,6 +383,7 @@ func run(ctx context.Context) error {
 		}
 	}
 
+	extensionsGV := schema.GroupVersion{Group: "extensions.agents.x-k8s.io", Version: "v1beta1"}
 	test := &stressTest{
 		cfg:       cfg,
 		tracker:   tracker,
@@ -375,6 +394,9 @@ func run(ctx context.Context) error {
 			Version:  "v1beta1",
 			Resource: "sandboxes",
 		}).Namespace(cfg.Namespace),
+		templateClient: dynamicClient.Resource(extensionsGV.WithResource("sandboxtemplates")).Namespace(cfg.Namespace),
+		warmPoolClient: dynamicClient.Resource(extensionsGV.WithResource("sandboxwarmpools")).Namespace(cfg.Namespace),
+		claimClient:    dynamicClient.Resource(extensionsGV.WithResource("sandboxclaims")).Namespace(cfg.Namespace),
 	}
 
 	phaseRuns, err := buildPhaseRuns(test)
@@ -478,10 +500,17 @@ func buildPhaseRuns(test *stressTest) ([]phaseRun, error) {
 			runs = append(runs, phaseRun{number, PhaseProbe, func(ctx context.Context) error {
 				return test.runProbePhase(ctx, number)
 			}})
+		case raw == string(PhaseClaimsWarm):
+			if test.cfg.ClaimsWarmCount <= 0 {
+				return nil, fmt.Errorf("phase %q requires --claims-warm-count > 0", raw)
+			}
+			runs = append(runs, phaseRun{number, PhaseClaimsWarm, func(ctx context.Context) error {
+				return test.runClaimsWarmPhase(ctx, number)
+			}})
 		default:
 			maxInFlight, ok := throughputMaxInFlight(raw)
 			if !ok {
-				return nil, fmt.Errorf("unknown phase %q (want fill, probe, or throughput-mifN)", raw)
+				return nil, fmt.Errorf("unknown phase %q (want fill, probe, claims-warm, or throughput-mifN)", raw)
 			}
 			if test.cfg.ThroughputCount <= 0 {
 				return nil, fmt.Errorf("phase %q requires --throughput-count > 0", raw)
@@ -529,11 +558,20 @@ func throughputMaxInFlight(name string) (int, bool) {
 // pipeline, so the run would not test what it claims to test.
 //
 // Phases run sequentially, so peak concurrent test pods is fill plus the
-// larger of the probe/throughput in-flight caps (fill sandboxes stay up).
+// largest of the probe/claims-warm/throughput in-flight caps (fill sandboxes
+// stay up). The claims-warm pool needs its full replica count in pods; on top
+// of that the warm pool controller replenishes claimed sandboxes, so the
+// phase can transiently reach ~2x its count — that overshoot is warned about
+// rather than required, because replenishment pods only queue (they do not
+// delay the claims being measured) and cleanup removes them.
 func checkClusterCapacity(cfg Config, info *ClusterInfo) error {
 	extra := 0
 	if slices.Contains(cfg.Phases, string(PhaseProbe)) && cfg.ProbeConcurrency > extra {
 		extra = cfg.ProbeConcurrency
+	}
+	claimsWarm := slices.Contains(cfg.Phases, string(PhaseClaimsWarm))
+	if claimsWarm && cfg.ClaimsWarmCount > extra {
+		extra = cfg.ClaimsWarmCount
 	}
 	for _, name := range cfg.Phases {
 		if maxInFlight, ok := throughputMaxInFlight(name); ok && maxInFlight > extra {
@@ -551,9 +589,12 @@ func checkClusterCapacity(cfg Config, info *ClusterInfo) error {
 	}
 	switch {
 	case needed > spare:
-		return fmt.Errorf("test needs up to %d concurrent pods but the cluster only has %d spare pod slots; results would measure capacity queueing, not launch performance. Reduce --fill-per-node / throughput-mifN or add nodes", needed, spare)
+		return fmt.Errorf("test needs up to %d concurrent pods but the cluster only has %d spare pod slots; results would measure capacity queueing, not launch performance. Reduce --fill-per-node / --claims-warm-count / throughput-mifN or add nodes", needed, spare)
 	case spare > 0 && needed > spare*9/10:
 		log.Printf("WARNING: test needs up to %d concurrent pods, over 90%% of the %d spare pod slots; scheduling may interfere with measurements.", needed, spare)
+	}
+	if claimsWarm && 2*cfg.ClaimsWarmCount > spare {
+		log.Printf("WARNING: claims-warm pool replenishment can transiently need up to %d pods (2x --claims-warm-count) but only %d spare pod slots exist; replenishment pods will queue on capacity. Consider --sandbox-warm-pool-concurrent-workers=1 on the controller or more nodes.", 2*cfg.ClaimsWarmCount, spare)
 	}
 	return nil
 }
@@ -636,6 +677,8 @@ func buildSummary(runID string, startTime time.Time, cfg Config, clusterInfo *Cl
 			return cfg.FillCount
 		case PhaseProbe:
 			return cfg.ProbeCount
+		case PhaseClaimsWarm:
+			return cfg.ClaimsWarmCount
 		default:
 			// Throughput phases (one per throughput-mifN entry).
 			return cfg.ThroughputCount
@@ -663,12 +706,13 @@ func buildSummary(runID string, startTime time.Time, cfg Config, clusterInfo *Cl
 		// real request.
 		req := max(requested(result.name), len(phaseRecords))
 		ps := &PhaseSummary{
-			Number:             result.number,
-			Name:               string(result.name),
-			Requested:          req,
-			DurationSeconds:    result.duration.Seconds(),
-			StartOffsetSeconds: result.offset.Seconds(),
-			Latency:            computeLatencyBreakdown(phaseRecords),
+			Number:                result.number,
+			Name:                  string(result.name),
+			Requested:             req,
+			DurationSeconds:       result.duration.Seconds(),
+			StartOffsetSeconds:    result.offset.Seconds(),
+			Latency:               computeLatencyBreakdown(phaseRecords),
+			TimeToAllReadySeconds: computeTimeToAllReady(phaseRecords),
 		}
 		var createTimes, readyTimes []time.Time
 		for i := range phaseRecords {
@@ -827,6 +871,19 @@ func printReport(summary *Summary, clusterInfo *ClusterInfo) {
 		case PhaseProbe:
 			fmt.Println("  Launch latency breakdown:")
 			printBreakdown(ps.Latency)
+		case PhaseClaimsWarm:
+			// Claim records have no pod milestones (the pods were pre-warmed),
+			// so only the claim-level intervals are meaningful. CreateAck
+			// isolates the client's Create call from controller binding
+			// latency (both are also in sandboxes.jsonl per claim).
+			fmt.Printf("  claim create ack (apiserver):    %s\n", formatLatency(ps.Latency.CreateAck))
+			fmt.Printf("  claim create -> claim Ready:     %s\n", formatLatency(ps.Latency.EndToEndReady))
+			if ps.TimeToAllReadySeconds != nil {
+				fmt.Printf("  time until ALL claims Ready:     %.2fs\n", *ps.TimeToAllReadySeconds)
+			} else {
+				fmt.Printf("  time until ALL claims Ready:     n/a (not all claims became Ready)\n")
+			}
+			fmt.Printf("  claim ready throughput:          %s\n", formatThroughput(ps.ReadyThroughput))
 		default:
 			fmt.Printf("  end-to-end ready latency:        %s\n", formatLatency(ps.Latency.EndToEndReady))
 			fmt.Printf("  create throughput:               %s\n", formatThroughput(ps.CreateThroughput))
