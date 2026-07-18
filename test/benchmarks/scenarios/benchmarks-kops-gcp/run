@@ -244,9 +244,16 @@ echo "Waiting for controller to be ready..."
 kubectl rollout status deployment agent-sandbox-controller --namespace agent-sandbox-system --timeout=10m
 
 # Run the benchmarks
-echo "Running benchmarks..."
-dev/tools/test-e2e --suite=benchmarks --image-prefix="${IMAGE_PREFIX}"
-echo "Benchmark completed successfully."
+# SKIP_E2E_SUITE=true skips the Go/Python e2e benchmark suite (which requires a
+# working pip index for the Python SDK) and proceeds straight to the stress
+# test, which is pure Go.
+if [[ "${SKIP_E2E_SUITE:-false}" == "true" ]]; then
+  echo "Skipping e2e benchmark suite (SKIP_E2E_SUITE=true)."
+else
+  echo "Running benchmarks..."
+  dev/tools/test-e2e --suite=benchmarks --image-prefix="${IMAGE_PREFIX}"
+  echo "Benchmark completed successfully."
+fi
 
 
 # Run the stress test.
