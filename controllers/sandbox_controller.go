@@ -314,6 +314,18 @@ func (r *SandboxReconciler) computeSuspendedCondition(sandbox *sandboxv1beta1.Sa
 }
 
 func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1beta1.Sandbox, err error, svc *corev1.Service, pod *corev1.Pod) metav1.Condition {
+	// ObservedGeneration deliberately tracks the generation this pass observed,
+	// even when nothing else in the condition changes. Consequence: any spec
+	// change (e.g. the SandboxClaim controller's warm-pool adoption patch, which
+	// merges pod-template metadata and bumps the generation) forces exactly one
+	// status write to refresh ObservedGeneration. That write must stay
+	// synchronous: per Kubernetes API conventions the condition's
+	// observedGeneration asserts which spec generation the condition was
+	// computed against, generation-matching waiters (kstatus-style tooling)
+	// would otherwise see the Sandbox as permanently stale, and the claim
+	// controller forwards this condition verbatim into the SandboxClaim status.
+	// The write is kept cheap instead: updateStatus issues a single merge patch
+	// with no optimistic lock, so it cannot 409 against the adoption patch.
 	readyCondition := metav1.Condition{
 		Type:               string(sandboxv1beta1.SandboxConditionReady),
 		ObservedGeneration: sandbox.Generation,
@@ -451,8 +463,29 @@ func (r *SandboxReconciler) updateStatus(ctx context.Context, oldStatus *sandbox
 		return nil
 	}
 
-	if err := r.Status().Update(ctx, sandbox); err != nil {
-		logger.Error(err, "Failed to update sandbox status")
+	// Write the status via a merge patch WITHOUT optimistic locking rather than
+	// an Update. An Update carries the resourceVersion of the (possibly stale)
+	// cached object and is rejected with a 409 whenever anything else touched
+	// the Sandbox in the meantime — notably the SandboxClaim controller's
+	// warm-pool adoption metadata patch, which races this reconcile by design.
+	// Each 409 costs a full requeue through per-item exponential backoff, which
+	// is pure added latency on the claim-ready critical path.
+	//
+	// Last-writer-wins is safe here because:
+	//   - This controller is the ONLY writer of Sandbox .status in the system
+	//     (the claim/warmpool controllers only patch their own statuses), so
+	//     there is no other writer whose fields a merge patch could clobber.
+	//   - controller-runtime serializes reconciles per object, so this
+	//     controller never races itself on the same Sandbox.
+	//   - Every field written (PodIPs, NodeName, LabelSelector, Service,
+	//     ServiceFQDN, Conditions) is recomputed from observed child state on
+	//     every reconcile; a write from a stale view is corrected by the next
+	//     child-event-driven reconcile (level-based reconciliation), exactly as
+	//     it would have been with Update.
+	base := sandbox.DeepCopy()
+	base.Status = *oldStatus
+	if err := r.Status().Patch(ctx, sandbox, client.MergeFrom(base)); err != nil {
+		logger.Error(err, "Failed to patch sandbox status")
 		return err
 	}
 
@@ -869,6 +902,24 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			// No additional action needed — label applied below.
 		}
 
+		// This pod metadata patch must remain synchronous on the adoption path
+		// (it is always a real patch there: the adoption merge adds the
+		// claim-uid label and drops the warm-pool label/safe-to-evict marker
+		// from the template). Deferring or coalescing it is NOT safe:
+		//   - The warm pool marks its pods with
+		//     cluster-autoscaler.kubernetes.io/safe-to-evict=true; adoption
+		//     removes that from the template, and this patch is what strips it
+		//     from the live Pod. A deferral window would let the cluster
+		//     autoscaler evict a pod that is already backing a claimed,
+		//     in-use sandbox.
+		//   - The claim-uid label (agents.x-k8s.io/claim-uid) propagated here
+		//     is used for discovery and shared-template NetworkPolicy pod
+		//     targeting; delaying it leaves the adopted pod outside its
+		//     claim's network-policy selection.
+		// Nothing on the Sandbox-Ready path gates on these labels (the Service
+		// selector uses the name-hash label, which never changes), and the
+		// patch is a single optimistic-lock-free merge patch, so its
+		// synchronous cost is one API round-trip with no 409/backoff risk.
 		metadataUpdated := r.updatePodMetadata(ctx, pod, sandbox, nameHash)
 		if metadataUpdated || needsUpdate {
 			if err := r.Patch(ctx, pod, patch); err != nil {
