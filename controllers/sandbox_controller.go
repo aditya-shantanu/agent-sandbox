@@ -902,6 +902,24 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			// No additional action needed — label applied below.
 		}
 
+		// This pod metadata patch must remain synchronous on the adoption path
+		// (it is always a real patch there: the adoption merge adds the
+		// claim-uid label and drops the warm-pool label/safe-to-evict marker
+		// from the template). Deferring or coalescing it is NOT safe:
+		//   - The warm pool marks its pods with
+		//     cluster-autoscaler.kubernetes.io/safe-to-evict=true; adoption
+		//     removes that from the template, and this patch is what strips it
+		//     from the live Pod. A deferral window would let the cluster
+		//     autoscaler evict a pod that is already backing a claimed,
+		//     in-use sandbox.
+		//   - The claim-uid label (agents.x-k8s.io/claim-uid) propagated here
+		//     is used for discovery and shared-template NetworkPolicy pod
+		//     targeting; delaying it leaves the adopted pod outside its
+		//     claim's network-policy selection.
+		// Nothing on the Sandbox-Ready path gates on these labels (the Service
+		// selector uses the name-hash label, which never changes), and the
+		// patch is a single optimistic-lock-free merge patch, so its
+		// synchronous cost is one API round-trip with no 409/backoff risk.
 		metadataUpdated := r.updatePodMetadata(ctx, pod, sandbox, nameHash)
 		if metadataUpdated || needsUpdate {
 			if err := r.Patch(ctx, pod, patch); err != nil {
