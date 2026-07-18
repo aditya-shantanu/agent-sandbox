@@ -4009,3 +4009,87 @@ func TestReconcile_StatusWriteSurvivesAdoptionRace(t *testing.T) {
 	assert.Equal(t, "some-claim", got.Labels["extensions.agents.x-k8s.io/claim"],
 		"concurrent metadata patch must not be lost")
 }
+
+// TestReconcile_NoWritesWhenConverged verifies that reconciling a fully
+// converged Ready sandbox (e.g. a resync or a pod event that changed nothing)
+// issues zero mutating API calls of any kind.
+func TestReconcile_NoWritesWhenConverged(t *testing.T) {
+	ctx := t.Context()
+	sb, pod := convergedReadySandboxAndPod(1, 1)
+	key := types.NamespacedName{Name: sb.Name, Namespace: sb.Namespace}
+
+	counters := &writeCounters{}
+	cl := fake.NewClientBuilder().
+		WithScheme(Scheme).
+		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
+		WithIndex(&corev1.Pod{}, podSandboxNameHashIndex, podSandboxNameHashIndexer).
+		WithRuntimeObjects(sb, pod).
+		WithInterceptorFuncs(counters.interceptors()).
+		Build()
+
+	r := SandboxReconciler{
+		Client:        cl,
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	for i := 0; i < 2; i++ {
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+		require.NoError(t, err)
+	}
+	assert.Equal(t, 0, counters.total(),
+		"a converged sandbox reconcile must not issue any writes, got %+v", *counters)
+}
+
+// TestReconcile_GenerationBumpWritesSingleStatusPatch verifies the cost of an
+// adoption-style reconcile where the generation changed but nothing material
+// did (pod metadata already converged): exactly one status patch to refresh
+// the conditions' ObservedGeneration, and nothing else.
+func TestReconcile_GenerationBumpWritesSingleStatusPatch(t *testing.T) {
+	ctx := t.Context()
+	// Spec generation moved 1 -> 2 (e.g. adoption metadata merge), conditions
+	// still carry ObservedGeneration 1; the pod needs no metadata changes.
+	sb, pod := convergedReadySandboxAndPod(2, 1)
+	key := types.NamespacedName{Name: sb.Name, Namespace: sb.Namespace}
+
+	counters := &writeCounters{}
+	cl := fake.NewClientBuilder().
+		WithScheme(Scheme).
+		WithStatusSubresource(&sandboxv1beta1.Sandbox{}).
+		WithIndex(&corev1.Pod{}, podSandboxNameHashIndex, podSandboxNameHashIndexer).
+		WithRuntimeObjects(sb, pod).
+		WithInterceptorFuncs(counters.interceptors()).
+		Build()
+
+	r := SandboxReconciler{
+		Client:        cl,
+		Scheme:        Scheme,
+		Tracer:        asmetrics.NewNoOp(),
+		ClusterDomain: "cluster.local",
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, counters.subResourcePatches, "expected exactly one status patch")
+	assert.Equal(t, 0, counters.subResourceUpdates, "status must be written via patch, not update")
+	assert.Equal(t, 0, counters.patches, "no pod/sandbox metadata patch expected when metadata is converged")
+	assert.Equal(t, 0, counters.updates)
+	assert.Equal(t, 0, counters.creates)
+	assert.Equal(t, 0, counters.deletes)
+
+	got := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, cl.Get(ctx, key, got))
+	cond := meta.FindStatusCondition(got.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	require.NotNil(t, cond)
+	assert.Equal(t, int64(2), cond.ObservedGeneration,
+		"ObservedGeneration must be refreshed synchronously (API conventions; the claim controller forwards this condition)")
+	assert.Equal(t, metav1.ConditionTrue, cond.Status, "Ready must not flap on a generation-only change")
+
+	// A second reconcile over the now-converged state must be write-free.
+	before := counters.total()
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	require.NoError(t, err)
+	assert.Equal(t, before, counters.total(), "second reconcile must not issue writes, got %+v", *counters)
+}

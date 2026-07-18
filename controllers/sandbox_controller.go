@@ -314,6 +314,18 @@ func (r *SandboxReconciler) computeSuspendedCondition(sandbox *sandboxv1beta1.Sa
 }
 
 func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1beta1.Sandbox, err error, svc *corev1.Service, pod *corev1.Pod) metav1.Condition {
+	// ObservedGeneration deliberately tracks the generation this pass observed,
+	// even when nothing else in the condition changes. Consequence: any spec
+	// change (e.g. the SandboxClaim controller's warm-pool adoption patch, which
+	// merges pod-template metadata and bumps the generation) forces exactly one
+	// status write to refresh ObservedGeneration. That write must stay
+	// synchronous: per Kubernetes API conventions the condition's
+	// observedGeneration asserts which spec generation the condition was
+	// computed against, generation-matching waiters (kstatus-style tooling)
+	// would otherwise see the Sandbox as permanently stale, and the claim
+	// controller forwards this condition verbatim into the SandboxClaim status.
+	// The write is kept cheap instead: updateStatus issues a single merge patch
+	// with no optimistic lock, so it cannot 409 against the adoption patch.
 	readyCondition := metav1.Condition{
 		Type:               string(sandboxv1beta1.SandboxConditionReady),
 		ObservedGeneration: sandbox.Generation,
