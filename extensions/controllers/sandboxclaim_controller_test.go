@@ -4161,6 +4161,282 @@ func TestSandboxClaimFreshAdoptionDoesNotRepatchDuringCacheLag(t *testing.T) {
 	}
 }
 
+// TestSandboxClaimObservabilityAnnotationWriteFolding verifies that the
+// controller-first-observed-at annotation no longer costs a dedicated blocking
+// API write on the warm-adoption fast path: it must ride along with the
+// full-object adoption Update, while non-adoption paths persist it with a
+// single deferred merge patch after the status write.
+func TestSandboxClaimObservabilityAnnotationWriteFolding(t *testing.T) {
+	newClaim := func() *extensionsv1beta1.SandboxClaim {
+		return &extensionsv1beta1.SandboxClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default", UID: "claim-uid-123"},
+			Spec:       extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-pool"}},
+		}
+	}
+	newTemplate := func() *extensionsv1beta1.SandboxTemplate {
+		return &extensionsv1beta1.SandboxTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+			Spec: extensionsv1beta1.SandboxTemplateSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+			}}},
+		}
+	}
+	newWarmPool := func() *extensionsv1beta1.SandboxWarmPool {
+		return &extensionsv1beta1.SandboxWarmPool{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default", UID: "warmpool-uid-123"},
+			Spec:       extensionsv1beta1.SandboxWarmPoolSpec{TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: "test-template"}},
+		}
+	}
+	newWarmSandbox := func() *sandboxv1beta1.Sandbox {
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "warm-sb",
+				Namespace: "default",
+				UID:       "warm-sb-uid",
+				Labels: map[string]string{
+					warmPoolSandboxLabel:   sandboxcontrollers.NameHash("test-pool"),
+					sandboxTemplateRefHash: sandboxcontrollers.NameHash("test-template"),
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+					Kind:       "SandboxWarmPool",
+					Name:       "test-pool",
+					UID:        "warmpool-uid-123",
+					Controller: ptr.To(true), // nolint:modernize
+				}},
+			},
+			Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}}}}},
+			Status: sandboxv1beta1.SandboxStatus{
+				Conditions: []metav1.Condition{{
+					Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue, Reason: "Ready",
+				}},
+			},
+		}
+	}
+
+	testCases := []struct {
+		name              string
+		seedWarmSandbox   bool
+		wantClaimPatches  int
+		wantClaimUpdates  int
+		wantAssignedAnnot string
+	}{
+		{
+			// The adoption Update is a full-object write and must carry the
+			// stamped annotation for free: zero standalone claim patches.
+			name:              "warm adoption folds annotation into adoption update",
+			seedWarmSandbox:   true,
+			wantClaimPatches:  0,
+			wantClaimUpdates:  1,
+			wantAssignedAnnot: "warm-sb",
+		},
+		{
+			// No full-object claim write happens on the cold path, so the
+			// annotation is persisted by exactly one deferred merge patch.
+			name:             "cold start persists annotation with a single deferred patch",
+			seedWarmSandbox:  false,
+			wantClaimPatches: 1,
+			wantClaimUpdates: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := newScheme(t)
+			objs := []client.Object{newTemplate(), newWarmPool(), newClaim()}
+			if tc.seedWarmSandbox {
+				objs = append(objs, newWarmSandbox())
+			}
+
+			claimPatches := 0
+			claimUpdates := 0
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				WithStatusSubresource(&extensionsv1beta1.SandboxClaim{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if _, ok := obj.(*extensionsv1beta1.SandboxClaim); ok {
+							claimPatches++
+						}
+						return c.Patch(ctx, obj, patch, opts...)
+					},
+					Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+						if _, ok := obj.(*extensionsv1beta1.SandboxClaim); ok {
+							claimUpdates++
+						}
+						return c.Update(ctx, obj, opts...)
+					},
+				}).
+				Build()
+
+			warmSandboxQueue := queue.NewSimpleSandboxQueue()
+			if tc.seedWarmSandbox {
+				warmSandboxQueue.Add(
+					queue.GetNamespacedWarmPoolName("default", "test-pool"),
+					queue.SandboxKey{Namespace: "default", Name: "warm-sb"},
+				)
+			}
+
+			reconciler := &SandboxClaimReconciler{
+				Client:           fakeClient,
+				Scheme:           scheme,
+				Recorder:         events.NewFakeRecorder(10),
+				Tracer:           asmetrics.NewNoOp(),
+				WarmSandboxQueue: warmSandboxQueue,
+			}
+			req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
+
+			if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("reconcile failed: %v", err)
+			}
+
+			if claimPatches != tc.wantClaimPatches {
+				t.Errorf("expected %d claim patch(es), got %d", tc.wantClaimPatches, claimPatches)
+			}
+			if claimUpdates != tc.wantClaimUpdates {
+				t.Errorf("expected %d claim update(s), got %d", tc.wantClaimUpdates, claimUpdates)
+			}
+
+			// Regardless of the write path, the annotation must be persisted with
+			// a parseable first-observed timestamp.
+			updatedClaim := &extensionsv1beta1.SandboxClaim{}
+			if err := fakeClient.Get(context.Background(), req.NamespacedName, updatedClaim); err != nil {
+				t.Fatalf("failed to get claim: %v", err)
+			}
+			observed := updatedClaim.Annotations[asmetrics.ObservabilityAnnotation]
+			if observed == "" {
+				t.Fatal("expected controller-first-observed-at annotation to be persisted")
+			}
+			if _, err := time.Parse(time.RFC3339Nano, observed); err != nil {
+				t.Errorf("annotation is not a valid RFC3339Nano timestamp: %v", err)
+			}
+			if got := updatedClaim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation]; got != tc.wantAssignedAnnot {
+				t.Errorf("expected assigned-sandbox annotation %q, got %q", tc.wantAssignedAnnot, got)
+			}
+		})
+	}
+}
+
+// TestSandboxClaimAdoptionUpdateConflictUsesBoundedRequeue verifies that a 409
+// on the claim Update that records a warm-pool adoption results in a bounded
+// requeue (nil error, adoptionCacheLagRequeueDelay) instead of routing through
+// the exponential failure backoff, that the candidate is returned to the queue,
+// and that the following pass adopts it with a fresh claim object.
+func TestSandboxClaimAdoptionUpdateConflictUsesBoundedRequeue(t *testing.T) {
+	scheme := newScheme(t)
+
+	claim := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default", UID: "claim-uid-123"},
+		Spec:       extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-pool"}},
+	}
+	template := &extensionsv1beta1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+		Spec: extensionsv1beta1.SandboxTemplateSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+		}}},
+	}
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default", UID: "warmpool-uid-123"},
+		Spec:       extensionsv1beta1.SandboxWarmPoolSpec{TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: "test-template"}},
+	}
+	warmSandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "warm-sb",
+			Namespace: "default",
+			UID:       "warm-sb-uid",
+			Labels: map[string]string{
+				warmPoolSandboxLabel:   sandboxcontrollers.NameHash("test-pool"),
+				sandboxTemplateRefHash: sandboxcontrollers.NameHash("test-template"),
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+				Kind:       "SandboxWarmPool",
+				Name:       "test-pool",
+				UID:        "warmpool-uid-123",
+				Controller: ptr.To(true), // nolint:modernize
+			}},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}}}}},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue, Reason: "Ready",
+			}},
+		},
+	}
+
+	claimUpdateConflicts := 0
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(template, warmPool, claim, warmSandbox).
+		WithStatusSubresource(&extensionsv1beta1.SandboxClaim{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if cl, ok := obj.(*extensionsv1beta1.SandboxClaim); ok && claimUpdateConflicts < 1 {
+					claimUpdateConflicts++
+					return k8errors.NewConflict(extensionsv1beta1.GroupVersion.WithResource("sandboxclaims").GroupResource(), cl.Name, fmt.Errorf("simulated conflict"))
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	warmSandboxQueue := queue.NewSimpleSandboxQueue()
+	warmSandboxQueue.Add(
+		queue.GetNamespacedWarmPoolName("default", "test-pool"),
+		queue.SandboxKey{Namespace: "default", Name: "warm-sb"},
+	)
+
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(10),
+		Tracer:           asmetrics.NewNoOp(),
+		WarmSandboxQueue: warmSandboxQueue,
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
+
+	// Pass 1: the adoption Update conflicts. Expect a bounded requeue with nil
+	// error (no exponential failure backoff) and a benign condition.
+	res, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("pass 1: expected nil error on adoption update conflict, got: %v", err)
+	}
+	if res.RequeueAfter != adoptionCacheLagRequeueDelay {
+		t.Fatalf("pass 1: expected RequeueAfter=%v, got %v", adoptionCacheLagRequeueDelay, res.RequeueAfter)
+	}
+	if claimUpdateConflicts != 1 {
+		t.Fatalf("pass 1: expected exactly 1 simulated conflict, got %d", claimUpdateConflicts)
+	}
+
+	updatedClaim := &extensionsv1beta1.SandboxClaim{}
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, updatedClaim); err != nil {
+		t.Fatalf("pass 1: failed to get claim: %v", err)
+	}
+	cond := meta.FindStatusCondition(updatedClaim.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	if cond == nil || cond.Reason != "AdoptionConflict" {
+		t.Fatalf("pass 1: expected Ready condition with reason 'AdoptionConflict', got %+v", cond)
+	}
+	if updatedClaim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation] != "" {
+		t.Fatalf("pass 1: assigned-sandbox annotation must not be persisted on conflict")
+	}
+
+	// Pass 2: fresh claim object, no conflict. The candidate must have been
+	// returned to the queue and adoption must complete.
+	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("pass 2: expected nil error, got: %v", err)
+	}
+	if err := fakeClient.Get(context.Background(), req.NamespacedName, updatedClaim); err != nil {
+		t.Fatalf("pass 2: failed to get claim: %v", err)
+	}
+	if got := updatedClaim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation]; got != "warm-sb" {
+		t.Fatalf("pass 2: expected adoption of 'warm-sb' after conflict retry, got %q", got)
+	}
+	if updatedClaim.Status.SandboxStatus.Name != "warm-sb" {
+		t.Fatalf("pass 2: expected status finalized with 'warm-sb', got %q", updatedClaim.Status.SandboxStatus.Name)
+	}
+}
+
 func TestSandboxClaimPreventsAdoptionFromWrongWarmPool(t *testing.T) {
 	scheme := newScheme(t)
 
@@ -4363,6 +4639,25 @@ func TestMapWarmPoolToClaims(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "claim-other", Namespace: "default"},
 		Spec:       extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "other-warmpool"}},
 	}
+	// Bound claim: already has a sandbox recorded in status, so pool events must
+	// not re-enqueue it (its reconciles are driven by the claim/sandbox watches).
+	claimBound := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-bound", Namespace: "default"},
+		Spec:       extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: warmPoolName}},
+		Status: extensionsv1beta1.SandboxClaimStatus{
+			SandboxStatus: extensionsv1beta1.SandboxStatus{Name: "adopted-sandbox"},
+		},
+	}
+	// Deleting claim: Reconcile returns immediately for it, so it is skipped too.
+	claimDeleting := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "claim-deleting",
+			Namespace:         "default",
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Finalizers:        []string{"test-finalizer"},
+		},
+		Spec: extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: warmPoolName}},
+	}
 
 	warmPool := &extensionsv1beta1.SandboxWarmPool{
 		ObjectMeta: metav1.ObjectMeta{Name: warmPoolName, Namespace: "default"},
@@ -4375,7 +4670,7 @@ func TestMapWarmPoolToClaims(t *testing.T) {
 	// Let's use the WithIndex option on the fake client builder to support the matchingFields query!
 	fakeClientWithIndex := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(claim1, claim2, claimOther, warmPool).
+		WithObjects(claim1, claim2, claimOther, claimBound, claimDeleting, warmPool).
 		WithIndex(&extensionsv1beta1.SandboxClaim{}, extensionsv1beta1.WarmPoolRefField, func(obj client.Object) []string {
 			c := obj.(*extensionsv1beta1.SandboxClaim)
 			if c.Spec.WarmPoolRef.Name == "" {
@@ -4393,7 +4688,7 @@ func TestMapWarmPoolToClaims(t *testing.T) {
 	requests := reconciler.mapWarmPoolToClaims(context.Background(), warmPool)
 
 	if len(requests) != 2 {
-		t.Fatalf("expected 2 requests, got %d", len(requests))
+		t.Fatalf("expected 2 requests (unbound claims only), got %d: %v", len(requests), requests)
 	}
 
 	expectedNames := map[string]bool{"claim-1": true, "claim-2": true}
