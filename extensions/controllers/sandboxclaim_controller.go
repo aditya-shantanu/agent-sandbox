@@ -242,9 +242,15 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// Initialize trace ID and observation time for active resources missing them.
-	if err := r.initializeAnnotations(ctx, claim); err != nil {
-		return ctrl.Result{}, err
-	}
+	// The annotations are stamped in-memory only (no API write here): on the warm
+	// adoption path they are persisted for free by the full-object claim Update
+	// that records the adoption, and on all other paths they are persisted by a
+	// deferred merge patch after the claim status has been finalized. This removes
+	// one blocking API round-trip from the SandboxClaim->Ready critical path.
+	// The observed-time VALUE is unaffected: it comes from the in-memory
+	// observedTimes map keyed by claim UID, captured at first reconcile.
+	stampedAnnotations := r.stampAnnotations(ctx, claim)
+	rvAtAnnotationStamp := claim.ResourceVersion
 
 	originalClaimStatus := claim.Status.DeepCopy()
 
@@ -317,13 +323,38 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 	}
 
+	// Decide whether the stamped annotations still need their own write BEFORE
+	// updateStatus bumps the local resourceVersion: if the claim object was
+	// persisted since stamping (the adoption Update writes the full object,
+	// annotations included), no extra write is needed. Other intermediate claim
+	// patches also bump the resourceVersion without carrying the stamped
+	// annotations; skipping the flush in those rare cases is safe because the
+	// annotations are re-stamped and flushed on the next reconcile.
+	needsAnnotationFlush := len(stampedAnnotations) > 0 && claim.ResourceVersion == rvAtAnnotationStamp
+
 	if updateErr := r.updateStatus(ctx, originalClaimStatus, claim); updateErr != nil {
 		errs := errors.Join(reconcileErr, updateErr)
 		logger.V(1).Info("Sandboxclaim UpdateStatus error encountered", "errors", errs, "request", req.NamespacedName)
 		return ctrl.Result{}, errs
 	}
 
+	// A successful Status().Patch refreshes the local object from the server
+	// response, which drops annotations stamped in-memory but not yet persisted.
+	// Restore them so metric recording below and the flush patch still see them.
+	restoreStampedAnnotations(claim, stampedAnnotations)
+
 	r.recordCreationLatencyMetric(ctx, claim, originalClaimStatus, sandbox)
+
+	// Persist observability/trace annotations if no earlier full-object write
+	// carried them. Done after the status patch so it never gates the claim's
+	// Ready transition.
+	if needsAnnotationFlush {
+		if flushErr := r.persistStampedAnnotations(ctx, claim, stampedAnnotations); flushErr != nil {
+			errs := errors.Join(reconcileErr, flushErr)
+			logger.V(1).Info("Sandboxclaim annotation persistence error encountered", "errors", errs, "request", req.NamespacedName)
+			return ctrl.Result{}, errs
+		}
+	}
 
 	// Determine Result
 	var result ctrl.Result
@@ -381,29 +412,57 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return result, reconcileErr
 }
 
-// initializeAnnotations initializes trace ID and observation time for active resources missing them.
-func (r *SandboxClaimReconciler) initializeAnnotations(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) error {
+// stampAnnotations sets the trace ID and observation time annotations in-memory on
+// claims missing them, and returns the stamped key/value pairs that still need
+// persisting. It deliberately makes no API call: downstream consumers in the same
+// pass (span attributes, trace-context propagation to the Sandbox, latency metrics)
+// read the in-memory values, and persistence happens either implicitly via the
+// full-object adoption Update or explicitly via persistStampedAnnotations.
+func (r *SandboxClaimReconciler) stampAnnotations(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) map[string]string {
 	traceContext := r.Tracer.GetTraceContext(ctx)
-	needObservabilityPatch := claim.Annotations[asmetrics.ObservabilityAnnotation] == ""
-	needTraceContextPatch := traceContext != "" && (claim.Annotations[asmetrics.TraceContextAnnotation] == "")
 
-	if needObservabilityPatch || needTraceContextPatch {
-		patch := client.MergeFrom(claim.DeepCopy())
-		if claim.Annotations == nil {
-			claim.Annotations = make(map[string]string)
-		}
-		if needObservabilityPatch {
-			timestamp := r.getOrRecordObservedTime(claim)
-			claim.Annotations[asmetrics.ObservabilityAnnotation] = timestamp.Format(time.RFC3339Nano)
-		}
-		if needTraceContextPatch {
-			claim.Annotations[asmetrics.TraceContextAnnotation] = traceContext
-		}
-		if err := r.Patch(ctx, claim, patch); err != nil {
-			return err
+	stamped := make(map[string]string, 2)
+	if claim.Annotations[asmetrics.ObservabilityAnnotation] == "" {
+		stamped[asmetrics.ObservabilityAnnotation] = r.getOrRecordObservedTime(claim).Format(time.RFC3339Nano)
+	}
+	if traceContext != "" && claim.Annotations[asmetrics.TraceContextAnnotation] == "" {
+		stamped[asmetrics.TraceContextAnnotation] = traceContext
+	}
+	if len(stamped) == 0 {
+		return nil
+	}
+
+	restoreStampedAnnotations(claim, stamped)
+	return stamped
+}
+
+// restoreStampedAnnotations (re-)applies stamped annotations to the in-memory
+// claim. Needed after client calls that refresh the local object from a server
+// response that predates their persistence.
+func restoreStampedAnnotations(claim *extensionsv1beta1.SandboxClaim, stamped map[string]string) {
+	if len(stamped) == 0 {
+		return
+	}
+	if claim.Annotations == nil {
+		claim.Annotations = make(map[string]string, len(stamped))
+	}
+	for key, value := range stamped {
+		if claim.Annotations[key] == "" {
+			claim.Annotations[key] = value
 		}
 	}
-	return nil
+}
+
+// persistStampedAnnotations sends a merge patch containing only the annotations
+// stamped in-memory by stampAnnotations that were not persisted by another write
+// during this reconcile.
+func (r *SandboxClaimReconciler) persistStampedAnnotations(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, stamped map[string]string) error {
+	base := claim.DeepCopy()
+	for key := range stamped {
+		delete(base.Annotations, key)
+	}
+	restoreStampedAnnotations(claim, stamped)
+	return r.Patch(ctx, claim, client.MergeFrom(base))
 }
 
 // checkExpiration calculates if the claim is expired and how much time is left.
