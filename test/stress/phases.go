@@ -34,7 +34,13 @@ type stressTest struct {
 	cfg           Config
 	tracker       *Tracker
 	sandboxClient dynamic.ResourceInterface
-	namespace     string
+	// Extensions clients (extensions.agents.x-k8s.io/v1beta1), used by the
+	// claims-warm phase. The extensions controller must be deployed
+	// (deploy-to-kube --extensions) for that phase to work.
+	templateClient dynamic.ResourceInterface
+	warmPoolClient dynamic.ResourceInterface
+	claimClient    dynamic.ResourceInterface
+	namespace      string
 	// profiler captures apiserver CPU profiles during throughput levels
 	// (nil when --profile-apiserver is false).
 	profiler *apiserverProfiler
@@ -297,4 +303,300 @@ func (s *stressTest) runThroughputLevel(ctx context.Context, name Phase, number 
 	counts := s.tracker.Snapshot()[number]
 	log.Printf("[%s#%d] done: %d created, %d ready, %d failed", name, number, counts.Created, counts.Ready, counts.Failed)
 	return nil
+}
+
+// extensionsGroupVersion is the API group/version of the SandboxTemplate,
+// SandboxWarmPool, and SandboxClaim extension resources.
+const extensionsGroupVersion = "extensions.agents.x-k8s.io/v1beta1"
+
+// buildTemplateObject returns a minimal SandboxTemplate wrapping the same
+// long-running pod spec used by the raw-sandbox phases (see buildSandboxObject
+// for why the command traps SIGTERM and the token mount is disabled).
+func buildTemplateObject(id types.NamespacedName, image string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": extensionsGroupVersion,
+			"kind":       "SandboxTemplate",
+			"metadata": map[string]any{
+				"name":      id.Name,
+				"namespace": id.Namespace,
+			},
+			"spec": map[string]any{
+				"podTemplate": map[string]any{
+					"spec": map[string]any{
+						"restartPolicy":                 "Never",
+						"terminationGracePeriodSeconds": int64(1),
+						"automountServiceAccountToken":  false,
+						"containers": []any{
+							map[string]any{
+								"name":            "main",
+								"image":           image,
+								"imagePullPolicy": "IfNotPresent",
+								"command":         []string{"sh", "-c", "trap 'exit 0' TERM INT; sleep infinity & wait"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// buildWarmPoolObject returns a SandboxWarmPool of the given size backed by
+// the given SandboxTemplate.
+func buildWarmPoolObject(id types.NamespacedName, templateName string, replicas int) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": extensionsGroupVersion,
+			"kind":       "SandboxWarmPool",
+			"metadata": map[string]any{
+				"name":      id.Name,
+				"namespace": id.Namespace,
+			},
+			"spec": map[string]any{
+				"replicas": int64(replicas),
+				"sandboxTemplateRef": map[string]any{
+					"name": templateName,
+				},
+			},
+		},
+	}
+}
+
+// buildClaimObject returns a SandboxClaim against the given warm pool.
+func buildClaimObject(id types.NamespacedName, poolName string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": extensionsGroupVersion,
+			"kind":       "SandboxClaim",
+			"metadata": map[string]any{
+				"name":      id.Name,
+				"namespace": id.Namespace,
+			},
+			"spec": map[string]any{
+				"warmPoolRef": map[string]any{
+					"name": poolName,
+				},
+			},
+		},
+	}
+}
+
+// createClaim registers a record and issues the SandboxClaim Create call.
+// Like createSandbox, Create errors are recorded on the record rather than
+// aborting the phase.
+func (s *stressTest) createClaim(ctx context.Context, id types.NamespacedName, poolName string, number PhaseNumber) error {
+	claim := buildClaimObject(id, poolName)
+	s.tracker.Register(id, PhaseClaimsWarm, number)
+	_, err := s.claimClient.Create(ctx, claim, metav1.CreateOptions{})
+	s.tracker.MarkCreateReturned(id, err)
+	if err != nil {
+		log.Printf("[%s] failed to create claim %s: %v", PhaseClaimsWarm, id.Name, err)
+	}
+	return err
+}
+
+// waitWarmPoolReady polls the pool until status.readyReplicas >= want, so the
+// claim burst measures binding latency against a fully provisioned pool
+// rather than sandbox launch latency. Progress-stall detection mirrors the
+// fill phase: if readyReplicas stops advancing for PerSandboxTimeout, fail.
+func (s *stressTest) waitWarmPoolReady(ctx context.Context, poolName string, want int, number PhaseNumber) error {
+	lastReady := int64(-1)
+	lastProgress := time.Now()
+	for {
+		pool, err := s.warmPoolClient.Get(ctx, poolName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("[%s#%d] failed to get warm pool %s: %w", PhaseClaimsWarm, number, poolName, err)
+		}
+		ready, _, err := unstructured.NestedInt64(pool.Object, "status", "readyReplicas")
+		if err != nil {
+			return fmt.Errorf("[%s#%d] failed to read warm pool status: %w", PhaseClaimsWarm, number, err)
+		}
+		if ready >= int64(want) {
+			log.Printf("[%s#%d] warm pool %s ready: %d/%d replicas", PhaseClaimsWarm, number, poolName, ready, want)
+			return nil
+		}
+		if ready != lastReady {
+			lastReady = ready
+			lastProgress = time.Now()
+		}
+		if time.Since(lastProgress) > s.cfg.PerSandboxTimeout {
+			return fmt.Errorf("[%s#%d] warm pool stalled: %d/%d replicas ready with no progress for %v", PhaseClaimsWarm, number, ready, want, s.cfg.PerSandboxTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// runClaimsWarmPhase measures SandboxClaim -> Ready latency against a fully
+// provisioned warm pool: it creates a SandboxTemplate and a SandboxWarmPool of
+// ClaimsWarmCount replicas, waits for every replica to be Ready (pool
+// provisioning is setup, not measurement), then fires ClaimsWarmCount claims
+// as simultaneously as possible (one goroutine per claim, released together)
+// and waits for every claim to be observed Ready.
+//
+// Metrics: the summary's CreateAck stats isolate the claim Create call
+// (apiserver write path) from EndToEndReady (create -> claim Ready=True by
+// watch); TimeToAllReadySeconds is first-create -> last-ready. Each record
+// also carries the claim Ready condition's lastTransitionTime
+// (serverSandboxReady in sandboxes.jsonl) as a server-side cross-check.
+//
+// Capacity: the pool itself needs ClaimsWarmCount pod slots, and the pool
+// controller replenishes claimed sandboxes, so up to ~2x ClaimsWarmCount pods
+// can transiently exist during and after the burst. Size the cluster with
+// headroom (see checkClusterCapacity's warning) or throttle replenishment via
+// --sandbox-warm-pool-concurrent-workers.
+func (s *stressTest) runClaimsWarmPhase(ctx context.Context, number PhaseNumber) error {
+	count := s.cfg.ClaimsWarmCount
+	if count == 0 {
+		return nil
+	}
+
+	templateID := types.NamespacedName{Name: fmt.Sprintf("p%d-claims-template", number), Namespace: s.namespace}
+	poolID := types.NamespacedName{Name: fmt.Sprintf("p%d-claims-pool", number), Namespace: s.namespace}
+
+	log.Printf("[%s#%d] provisioning warm pool %s with %d replicas", PhaseClaimsWarm, number, poolID.Name, count)
+	if _, err := s.templateClient.Create(ctx, buildTemplateObject(templateID, s.cfg.Image), metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("[%s#%d] failed to create sandbox template: %w", PhaseClaimsWarm, number, err)
+	}
+	if _, err := s.warmPoolClient.Create(ctx, buildWarmPoolObject(poolID, templateID.Name, count), metav1.CreateOptions{}); err != nil {
+		return fmt.Errorf("[%s#%d] failed to create warm pool: %w", PhaseClaimsWarm, number, err)
+	}
+
+	ids := make([]types.NamespacedName, 0, count)
+	for i := range count {
+		ids = append(ids, types.NamespacedName{Name: fmt.Sprintf("p%d-claim-%d", number, i), Namespace: s.namespace})
+	}
+
+	// Clean up the claims, the pool, and the template even when the phase
+	// fails partway: later phases assume the cluster's spare capacity is back.
+	defer s.cleanupClaimsWarm(ctx, number, ids, poolID, templateID)
+
+	if err := s.waitWarmPoolReady(ctx, poolID.Name, count, number); err != nil {
+		return err
+	}
+
+	// Fire all claims at once: one goroutine per claim, all released by a
+	// single channel close so the creates hit the apiserver as close to
+	// simultaneously as the client allows (rate limiting is disabled).
+	log.Printf("[%s#%d] firing %d claims simultaneously", PhaseClaimsWarm, number, count)
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Go(func() {
+			<-release
+			// Errors are recorded per-claim; do not abort the phase.
+			_ = s.createClaim(ctx, id, poolID.Name, number)
+		})
+	}
+	close(release)
+	wg.Wait()
+
+	// Wait for all successfully-created claims to be observed Ready, with
+	// the same progress-stall detection as the fill phase.
+	lastReady := -1
+	lastProgress := time.Now()
+	for {
+		counts := s.tracker.Snapshot()[number]
+		if counts.Created == 0 {
+			return fmt.Errorf("[%s#%d] all %d claim creations failed", PhaseClaimsWarm, number, counts.Failed)
+		}
+		if counts.Ready >= counts.Created {
+			log.Printf("[%s#%d] all %d created claims are Ready (%d failed to create)",
+				PhaseClaimsWarm, number, counts.Created, counts.Failed)
+			return nil
+		}
+		if counts.Ready != lastReady {
+			lastReady = counts.Ready
+			lastProgress = time.Now()
+		}
+		if time.Since(lastProgress) > s.cfg.PerSandboxTimeout {
+			return fmt.Errorf("[%s#%d] stalled: %d/%d claims Ready with no progress for %v", PhaseClaimsWarm, number, counts.Ready, counts.Created, s.cfg.PerSandboxTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// cleanupClaimsWarm deletes the claims, the pool, and the template, then
+// waits (best-effort) for the pool- and claim-owned sandboxes to go away so
+// later phases start from the same spare capacity. Failures are logged, not
+// returned: like probe/throughput deletes, cleanup problems should not mask
+// the phase's measurement, and namespace deletion is the backstop.
+func (s *stressTest) cleanupClaimsWarm(ctx context.Context, number PhaseNumber, ids []types.NamespacedName, poolID, templateID types.NamespacedName) {
+	if ctx.Err() != nil {
+		// Shutting down; namespace cleanup will remove remaining objects.
+		return
+	}
+	log.Printf("[%s#%d] cleaning up %d claims, pool %s, template %s", PhaseClaimsWarm, number, len(ids), poolID.Name, templateID.Name)
+
+	_, _ = ForkJoin(ctx, ids, max(s.cfg.CreateConcurrency, 1), func(id types.NamespacedName) (struct{}, error) {
+		if err := s.claimClient.Delete(ctx, id.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			log.Printf("[%s#%d] failed to delete claim %s: %v", PhaseClaimsWarm, number, id.Name, err)
+		}
+		return struct{}{}, nil
+	})
+
+	if err := s.warmPoolClient.Delete(ctx, poolID.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		log.Printf("[%s#%d] failed to delete warm pool %s: %v", PhaseClaimsWarm, number, poolID.Name, err)
+	}
+	if err := s.templateClient.Delete(ctx, templateID.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		log.Printf("[%s#%d] failed to delete template %s: %v", PhaseClaimsWarm, number, templateID.Name, err)
+	}
+
+	// Wait for the sandboxes owned by the pool or the claims to be deleted,
+	// so their pods stop occupying capacity that a later phase counts on.
+	// Best-effort: on timeout we log and move on.
+	lastRemaining := -1
+	lastProgress := time.Now()
+	for {
+		remaining, err := s.countOwnedSandboxes(ctx)
+		if err != nil {
+			log.Printf("[%s#%d] failed to list sandboxes during cleanup: %v", PhaseClaimsWarm, number, err)
+			return
+		}
+		if remaining == 0 {
+			log.Printf("[%s#%d] cleanup complete", PhaseClaimsWarm, number)
+			return
+		}
+		if remaining != lastRemaining {
+			lastRemaining = remaining
+			lastProgress = time.Now()
+		}
+		if time.Since(lastProgress) > s.cfg.PerSandboxTimeout {
+			log.Printf("[%s#%d] WARNING: %d pool/claim-owned sandboxes still present after %v; later phases may see reduced spare capacity", PhaseClaimsWarm, number, remaining, s.cfg.PerSandboxTimeout)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// countOwnedSandboxes counts sandboxes in the test namespace owned by a
+// SandboxWarmPool or SandboxClaim. Fill-phase sandboxes have no owner and are
+// excluded: they are supposed to stay up.
+func (s *stressTest) countOwnedSandboxes(ctx context.Context) (int, error) {
+	list, err := s.sandboxClient.List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for i := range list.Items {
+		for _, ref := range list.Items[i].GetOwnerReferences() {
+			if ref.Kind == "SandboxWarmPool" || ref.Kind == "SandboxClaim" {
+				count++
+				break
+			}
+		}
+	}
+	return count, nil
 }

@@ -127,6 +127,26 @@ trap cleanup EXIT
 CNI="${CNI:-cilium}"
 echo "Using CNI: ${CNI}"
 
+# NODE_COUNT sizes the worker node group. The default 3 n2-standard-8 nodes
+# give ~330 pod slots (110/node) minus system pods — enough for the default
+# stress phases, but VERY tight for claims-warm at 300 (the warm pool needs
+# 300 pods, and pool replenishment can transiently push toward 600). Bump
+# NODE_COUNT (e.g. 6) when running claims-warm at full size.
+NODE_COUNT="${NODE_COUNT:-3}"
+echo "Using node count: ${NODE_COUNT}"
+
+# CONTROLLER_ARGS injects extra agent-sandbox-controller flags via
+# deploy-to-kube --controller-args. Empty by default (stock controller
+# configuration). Recommended flags for claim-burst perf runs:
+#   CONTROLLER_ARGS="--kube-api-qps=1000 --kube-api-burst=2000 \
+#     --sandbox-concurrent-workers=400 --sandbox-claim-concurrent-workers=400 \
+#     --sandbox-warm-pool-concurrent-workers=1 --enable-webhook=false"
+# (high QPS/workers remove client-side throttling from the claim path;
+# warm-pool workers=1 keeps pool replenishment from competing with claim
+# binding during the burst; --enable-webhook=false skips webhook cert
+# bootstrap, safe now that no conversion webhook exists.)
+CONTROLLER_ARGS="${CONTROLLER_ARGS:-}"
+
 echo "Creating kOps cluster configuration..."
 # --gce-service-account=default: needed because boskos doesn't let us configure IAM permissions on the project.
 #
@@ -160,7 +180,7 @@ kops create cluster \
   --project="${PROJECT_ID}" \
   --control-plane-count=1 \
   --control-plane-size=n2-standard-8 \
-  --node-count=3 \
+  --node-count="${NODE_COUNT}" \
   --node-size=n2-standard-8 \
   --set cluster.spec.kubeControllerManager.authorizationAlwaysAllowPaths=/healthz \
   --set cluster.spec.kubeControllerManager.authorizationAlwaysAllowPaths=/readyz \
@@ -212,7 +232,12 @@ fi
 
 # Deploy to cluster
 echo "Deploying to cluster..."
-dev/tools/deploy-to-kube --image-prefix="${IMAGE_PREFIX}" --extensions
+DEPLOY_FLAGS=(--image-prefix="${IMAGE_PREFIX}" --extensions)
+if [[ -n "${CONTROLLER_ARGS}" ]]; then
+  echo "Injecting controller args: ${CONTROLLER_ARGS}"
+  DEPLOY_FLAGS+=(--controller-args "${CONTROLLER_ARGS}")
+fi
+dev/tools/deploy-to-kube "${DEPLOY_FLAGS[@]}"
 
 # Wait for controller to be ready
 echo "Waiting for controller to be ready..."
@@ -229,12 +254,18 @@ echo "Benchmark completed successfully."
 # Phases are a comma-separated list of names (see test/stress/main.go):
 #   fill              long-running background sandboxes (scale)
 #   probe             low-concurrency launch latency
+#   claims-warm       N simultaneous SandboxClaims against a pre-provisioned
+#                     warm pool of N (measures claim -> Ready binding latency;
+#                     needs the extensions controller, deployed above)
 #   throughput-mifN   closed-loop churn capped at N in-flight
 #
-# Keep fill (fill-per-node * nodes) + max(mifN) below spare pod capacity
-# (roughly 3 * 110 minus system pods on the default cluster); the test
-# refuses to run if they don't fit.
-# Defaults below are sized for the default 3-node cluster.
+# Keep fill (fill-per-node * nodes) + max(mifN, claims-warm count) below
+# spare pod capacity (roughly NODE_COUNT * 110 minus system pods); the test
+# refuses to run if they don't fit. claims-warm additionally causes pool
+# replenishment (up to ~2x its count transiently); the tool warns when that
+# overshoots. E.g. STRESS_CLAIMS_WARM=300 wants NODE_COUNT>3.
+# Defaults below are sized for the default 3-node cluster; claims-warm is
+# opt-in via STRESS_PHASES (e.g. STRESS_PHASES=claims-warm STRESS_CLAIMS_WARM=300).
 STRESS_OUTPUT_DIR="${ARTIFACTS:-.}/stress-test/"
 mkdir -p "${STRESS_OUTPUT_DIR}"
 
@@ -257,6 +288,7 @@ go run ./test/stress \
   --probe-count="${STRESS_PROBE_COUNT:-30}" \
   --throughput-count="${STRESS_THROUGHPUT_COUNT:-500}" \
   --throughput-min-seconds="${STRESS_THROUGHPUT_MIN_SECONDS:-45}" \
+  --claims-warm-count="${STRESS_CLAIMS_WARM:-300}" \
   --create-concurrency="${STRESS_CREATE_CONCURRENCY:-50}" \
   --timeout="${STRESS_TIMEOUT:-30m}" \
   --output-dir="${STRESS_OUTPUT_DIR}"
