@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,110 @@ type SandboxWarmPoolReconciler struct {
 	Scheme                 *runtime.Scheme
 	MaxBatchSize           int
 	EnableWarmPoolEviction bool
+
+	// ReplenishDelay defers creation of replacement sandboxes after pool
+	// members drop out of the pool (e.g. a burst of SandboxClaims adopting
+	// warm sandboxes). Deferring lets the claim burst consume the API server
+	// budget first instead of racing it with replacement creates. Zero (the
+	// default) disables deferral and preserves the immediate-refill behavior.
+	ReplenishDelay time.Duration
+
+	// clock returns the current time; tests may override it. nil means time.Now.
+	clock func() time.Time
+
+	// replenishMu guards replenishState. Distinct pools may reconcile
+	// concurrently when MaxConcurrentReconciles > 1.
+	replenishMu sync.Mutex
+	// replenishState tracks, per pool, the last observed member count and any
+	// active replenish hold. Only used when ReplenishDelay > 0.
+	replenishState map[types.NamespacedName]*replenishDeferState
+}
+
+// replenishDeferState is the per-pool bookkeeping behind ReplenishDelay.
+type replenishDeferState struct {
+	// lastMembers is the active member count at the previous observation,
+	// plus any replacements created in that reconcile that may not be visible
+	// in the informer cache yet. A subsequent observation below this value
+	// means members were consumed (adopted/claimed/GC'd/deleted), not that
+	// our own creates are still propagating.
+	lastMembers int32
+	// deferUntil suppresses replacement creation while in the future. It is
+	// re-armed on every observed drop, so replenishment starts only after the
+	// burst that is draining the pool has settled for a full ReplenishDelay.
+	deferUntil time.Time
+}
+
+func (r *SandboxWarmPoolReconciler) now() time.Time {
+	if r.clock != nil {
+		return r.clock()
+	}
+	return time.Now()
+}
+
+// observeMembersForReplenish records the pool's current active member count
+// and returns how long replacement creation should be deferred (zero means
+// create immediately). It must be called exactly once per reconcile so the
+// baseline stays fresh.
+func (r *SandboxWarmPoolReconciler) observeMembersForReplenish(key types.NamespacedName, currentReplicas, desiredReplicas int32, now time.Time) time.Duration {
+	if r.ReplenishDelay <= 0 {
+		return 0
+	}
+
+	r.replenishMu.Lock()
+	defer r.replenishMu.Unlock()
+
+	st, ok := r.replenishState[key]
+	if !ok {
+		// First observation of this pool (new pool or controller restart):
+		// there is no baseline to detect a drop against, so replenish
+		// immediately. Initial pool fill and scale-ups are never deferred.
+		if r.replenishState == nil {
+			r.replenishState = make(map[types.NamespacedName]*replenishDeferState)
+		}
+		r.replenishState[key] = &replenishDeferState{lastMembers: currentReplicas}
+		return 0
+	}
+
+	dropped := currentReplicas < st.lastMembers
+	st.lastMembers = currentReplicas
+
+	if currentReplicas >= desiredReplicas {
+		// Pool is full (or over-provisioned): nothing to defer.
+		st.deferUntil = time.Time{}
+		return 0
+	}
+	if dropped {
+		// Re-arm on every drop: while an adoption burst is still draining the
+		// pool, keep replacement creates out of its window.
+		st.deferUntil = now.Add(r.ReplenishDelay)
+	}
+	if remaining := st.deferUntil.Sub(now); remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
+// noteReplenishCreates raises the pool's member baseline by the number of
+// replacements just created. Until the informer cache catches up, subsequent
+// reconciles may not see these creates; counting them in the baseline makes a
+// stale low count register as a drop (deferring briefly) instead of
+// triggering duplicate creates.
+func (r *SandboxWarmPoolReconciler) noteReplenishCreates(key types.NamespacedName, created int32) {
+	if r.ReplenishDelay <= 0 || created <= 0 {
+		return
+	}
+	r.replenishMu.Lock()
+	defer r.replenishMu.Unlock()
+	if st, ok := r.replenishState[key]; ok {
+		st.lastMembers += created
+	}
+}
+
+// forgetReplenishState drops the per-pool replenish bookkeeping for a deleted pool.
+func (r *SandboxWarmPoolReconciler) forgetReplenishState(key types.NamespacedName) {
+	r.replenishMu.Lock()
+	defer r.replenishMu.Unlock()
+	delete(r.replenishState, key)
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxwarmpools,verbs=get;list;watch;create;update;patch;delete
@@ -77,6 +182,7 @@ func (r *SandboxWarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	if err := r.Get(ctx, req.NamespacedName, warmPool); err != nil {
 		if k8serrors.IsNotFound(err) {
 			logger.Info("SandboxWarmPool resource not found. Ignoring since object must be deleted")
+			r.forgetReplenishState(req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get SandboxWarmPool")
@@ -93,7 +199,8 @@ func (r *SandboxWarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	oldStatus := warmPool.Status.DeepCopy()
 
 	// Reconcile the pool (create or delete Sandboxes as needed)
-	if err := r.reconcilePool(ctx, warmPool); err != nil {
+	requeueAfter, err := r.reconcilePool(ctx, warmPool)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -103,11 +210,13 @@ func (r *SandboxWarmPoolReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // reconcilePool ensures the correct number of pre-allocated sandboxes exist in the pool.
-func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool) error {
+// The returned duration, when positive, asks the caller to requeue: replacement
+// creation is being deferred (ReplenishDelay) until a recent member drop settles.
+func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool) (time.Duration, error) {
 	logger := log.FromContext(ctx)
 
 	// Compute hash of the warm pool name for the pool label
@@ -124,7 +233,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		client.MatchingFields{sandboxWarmPoolLabelIndex: poolNameHash},
 	); err != nil {
 		logger.Error(err, "Failed to list sandboxes")
-		return err
+		return 0, err
 	}
 
 	// Fetch template and compute hash once to avoid repeated expensive operations,
@@ -138,7 +247,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 
 	const warmPoolReadinessGracePeriod = 5 * time.Minute
 
-	now := time.Now()
+	now := r.now()
 	var healthySandboxes []sandboxv1beta1.Sandbox
 	for _, sb := range activeSandboxes {
 		if !isSandboxReady(&sb) && !sb.CreationTimestamp.IsZero() && now.Sub(sb.CreationTimestamp.Time) > warmPoolReadinessGracePeriod {
@@ -181,23 +290,42 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 
 	maxBatchSize := int32(r.MaxBatchSize)
 
+	// Record the observed member count and check whether replacement creation
+	// should yield to a recent member drop (claim adoption burst). No-op when
+	// ReplenishDelay is zero.
+	poolKey := types.NamespacedName{Namespace: warmPool.Namespace, Name: warmPool.Name}
+	replenishHold := r.observeMembersForReplenish(poolKey, currentReplicas, desiredReplicas, now)
+
+	var requeueAfter time.Duration
+
 	// Create new sandboxes if we need more
 	if currentReplicas < desiredReplicas && tmplErr == nil {
-		sandboxesToCreate := min(desiredReplicas-currentReplicas, maxBatchSize)
-		logger.Info("Creating new pool sandboxes", "count", sandboxesToCreate)
-
-		sandboxCR, err := r.buildSandboxCR(warmPool, poolNameHash, template, currentPodTemplateHash, currentSandboxBlueprintHash)
-		if err != nil {
-			logger.Error(err, "Failed to build sandbox CR blueprint")
-			allErrors = errors.Join(allErrors, err)
+		if replenishHold > 0 {
+			// Members recently dropped out of the pool (e.g. adopted by a burst
+			// of claims). Defer replacement creation so the burst gets the API
+			// server budget first; status above still reflects actual counts.
+			logger.Info("Deferring pool replenishment after recent member drop",
+				"deficit", desiredReplicas-currentReplicas,
+				"requeueAfter", replenishHold)
+			requeueAfter = replenishHold
 		} else {
-			// Parallel sandbox creation with adaptive slow-start batching (starts with 1 and doubles on success)
-			_, createErr := slowStartBatch(ctx, int(sandboxesToCreate), 1, func(_ int) error {
-				return r.createPoolSandbox(ctx, warmPool, sandboxCR)
-			})
-			if createErr != nil {
-				logger.Error(createErr, "Failed to create pool sandboxes")
-				allErrors = errors.Join(allErrors, createErr)
+			sandboxesToCreate := min(desiredReplicas-currentReplicas, maxBatchSize)
+			logger.Info("Creating new pool sandboxes", "count", sandboxesToCreate)
+
+			sandboxCR, err := r.buildSandboxCR(warmPool, poolNameHash, template, currentPodTemplateHash, currentSandboxBlueprintHash)
+			if err != nil {
+				logger.Error(err, "Failed to build sandbox CR blueprint")
+				allErrors = errors.Join(allErrors, err)
+			} else {
+				// Parallel sandbox creation with adaptive slow-start batching (starts with 1 and doubles on success)
+				created, createErr := slowStartBatch(ctx, int(sandboxesToCreate), 1, func(_ int) error {
+					return r.createPoolSandbox(ctx, warmPool, sandboxCR)
+				})
+				r.noteReplenishCreates(poolKey, int32(created))
+				if createErr != nil {
+					logger.Error(createErr, "Failed to create pool sandboxes")
+					allErrors = errors.Join(allErrors, createErr)
+				}
 			}
 		}
 	}
@@ -236,7 +364,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		allErrors = errors.Join(allErrors, tmplErr)
 	}
 
-	return allErrors
+	return requeueAfter, allErrors
 }
 
 // adoptSandbox sets this warmpool as the owner of an orphaned sandbox.
