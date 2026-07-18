@@ -4363,6 +4363,25 @@ func TestMapWarmPoolToClaims(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "claim-other", Namespace: "default"},
 		Spec:       extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "other-warmpool"}},
 	}
+	// Bound claim: already has a sandbox recorded in status, so pool events must
+	// not re-enqueue it (its reconciles are driven by the claim/sandbox watches).
+	claimBound := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-bound", Namespace: "default"},
+		Spec:       extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: warmPoolName}},
+		Status: extensionsv1beta1.SandboxClaimStatus{
+			SandboxStatus: extensionsv1beta1.SandboxStatus{Name: "adopted-sandbox"},
+		},
+	}
+	// Deleting claim: Reconcile returns immediately for it, so it is skipped too.
+	claimDeleting := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "claim-deleting",
+			Namespace:         "default",
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Finalizers:        []string{"test-finalizer"},
+		},
+		Spec: extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: warmPoolName}},
+	}
 
 	warmPool := &extensionsv1beta1.SandboxWarmPool{
 		ObjectMeta: metav1.ObjectMeta{Name: warmPoolName, Namespace: "default"},
@@ -4375,7 +4394,7 @@ func TestMapWarmPoolToClaims(t *testing.T) {
 	// Let's use the WithIndex option on the fake client builder to support the matchingFields query!
 	fakeClientWithIndex := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(claim1, claim2, claimOther, warmPool).
+		WithObjects(claim1, claim2, claimOther, claimBound, claimDeleting, warmPool).
 		WithIndex(&extensionsv1beta1.SandboxClaim{}, extensionsv1beta1.WarmPoolRefField, func(obj client.Object) []string {
 			c := obj.(*extensionsv1beta1.SandboxClaim)
 			if c.Spec.WarmPoolRef.Name == "" {
@@ -4393,7 +4412,7 @@ func TestMapWarmPoolToClaims(t *testing.T) {
 	requests := reconciler.mapWarmPoolToClaims(context.Background(), warmPool)
 
 	if len(requests) != 2 {
-		t.Fatalf("expected 2 requests, got %d", len(requests))
+		t.Fatalf("expected 2 requests (unbound claims only), got %d: %v", len(requests), requests)
 	}
 
 	expectedNames := map[string]bool{"claim-1": true, "claim-2": true}
