@@ -80,11 +80,22 @@ var ErrWarmPoolNotFound = errors.New("SandboxWarmPool not found")
 // (#1107).
 var errAdoptionTriggeredRetry = errors.New("triggered adoption completion, retry")
 
+// errAdoptionConflictRetry signals that the optimistic-lock claim Update
+// recording a warm-pool adoption hit a 409 conflict: the in-memory claim is
+// stale (informer cache lag behind a recent claim write, or a concurrent
+// writer). Like errAdoptionTriggeredRetry it is a sentinel so Reconcile can
+// convert it into a bounded requeue with a fresh Get instead of returning an
+// error: under a burst of simultaneous claims, routing 409s through the
+// exponential failure rate limiter compounds per-item backoff (5ms*2^k) and
+// balloons adoption tail latency exactly when conflicts are most likely.
+var errAdoptionConflictRetry = errors.New("adoption update conflicted, retry")
+
 // adoptionCacheLagRequeueDelay is how long to wait before re-checking that a
 // just-completed adoption is visible in the informer cache. Long enough to
 // cover typical watch latency (so most claims converge in one extra pass) and
 // to bound the rate of redundant adoption patches while the cache lags, but
-// far below the multi-second exponential backoff it replaces.
+// far below the multi-second exponential backoff it replaces. Also used to
+// retry the adoption Update after a 409 conflict with a fresh claim object.
 const adoptionCacheLagRequeueDelay = 50 * time.Millisecond
 
 var restrictedDomains = []string{"kubernetes.io", "k8s.io", "agents.x-k8s.io"}
@@ -383,18 +394,18 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: requeueDelay}, nil
 	}
 
-	// Adoption was just triggered for a warm-pool sandbox. The sandbox is now patched
-	// to us, but the informer cache may still show the warm-pool owner. Requeue
-	// with a bounded delay to let the cache converge, WITHOUT returning an
+	// Adoption was just triggered for a warm-pool sandbox (the sandbox is patched to
+	// us but the informer cache may still show the warm-pool owner), or the adoption
+	// Update hit a 409 conflict (our claim copy was stale). Either way, requeue with
+	// a bounded delay so the next pass re-reads fresh objects, WITHOUT returning an
 	// error: returning an error would route through the exponential failure rate
-	// limiter (and, under bursts, the shared 10qps bucket limiter), and because this
-	// same retry recurs on each pass until the cache catches up the backoff compounds
-	// (5ms*(2^k-1)) and adoption tail latency balloons (#1107). The nil error lets the
-	// workqueue Forget the key, resetting the failure counter. Status is intentionally
-	// not finalized with the sandbox on this pass (sandbox is nil here), preserving the
-	// duplicate-adoption protection during cache lag.
-	if errors.Is(reconcileErr, errAdoptionTriggeredRetry) {
-		logger.V(4).Info("Adoption triggered; requeueing to let cache converge", "claim", claim.Name, "error", reconcileErr)
+	// limiter, and because the same retry can recur on consecutive passes the backoff
+	// compounds (5ms*(2^k-1)) and adoption tail latency balloons (#1107). The nil
+	// error lets the workqueue Forget the key, resetting the failure counter. Status
+	// is intentionally not finalized with the sandbox on this pass (sandbox is nil
+	// here), preserving the duplicate-adoption protection during cache lag.
+	if errors.Is(reconcileErr, errAdoptionTriggeredRetry) || errors.Is(reconcileErr, errAdoptionConflictRetry) {
+		logger.V(4).Info("Adoption retry requested; requeueing with bounded delay", "claim", claim.Name, "error", reconcileErr)
 		requeueDelay := adoptionCacheLagRequeueDelay
 		if result.RequeueAfter > 0 && result.RequeueAfter < requeueDelay {
 			requeueDelay = result.RequeueAfter
@@ -681,6 +692,17 @@ func (r *SandboxClaimReconciler) computeReadyCondition(claim *extensionsv1beta1.
 				ObservedGeneration: claim.Generation,
 			}
 		}
+		if errors.Is(err, errAdoptionConflictRetry) {
+			// Benign retry signal: the claim update recording the adoption hit a
+			// write conflict and will be retried shortly with a fresh object.
+			return metav1.Condition{
+				Type:               string(v1beta1.SandboxConditionReady),
+				Status:             metav1.ConditionFalse,
+				Reason:             "AdoptionConflict",
+				Message:            "Claim update for warm-pool adoption conflicted; retrying",
+				ObservedGeneration: claim.Generation,
+			}
+		}
 		if errors.Is(err, ErrInvalidMetadata) {
 			reason = "InvalidMetadata"
 			return metav1.Condition{
@@ -779,11 +801,14 @@ func (r *SandboxClaimReconciler) computeReadyCondition(claim *extensionsv1beta1.
 }
 
 func (r *SandboxClaimReconciler) computeAndSetStatus(claim *extensionsv1beta1.SandboxClaim, sandbox *v1beta1.Sandbox, err error, isClaimExpired bool) {
-	// A cache-lag adoption retry is a benign look-again, not a state change. If the
-	// claim status was already finalized with a sandbox (the adoption pass itself, or
-	// a controller restart racing a stale informer), leave the recorded Name/PodIPs
-	// and existing conditions untouched instead of transiently wiping them.
-	if sandbox == nil && errors.Is(err, errAdoptionTriggeredRetry) && claim.Status.SandboxStatus.Name != "" {
+	// A cache-lag or write-conflict adoption retry is a benign look-again, not a
+	// state change. If the claim status was already finalized with a sandbox (the
+	// adoption pass itself, or a controller restart racing a stale informer), leave
+	// the recorded Name/PodIPs and existing conditions untouched instead of
+	// transiently wiping them.
+	if sandbox == nil &&
+		(errors.Is(err, errAdoptionTriggeredRetry) || errors.Is(err, errAdoptionConflictRetry)) &&
+		claim.Status.SandboxStatus.Name != "" {
 		return
 	}
 	readyCondition := r.computeReadyCondition(claim, sandbox, err, isClaimExpired)
@@ -993,11 +1018,22 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 				claim.Annotations = make(map[string]string)
 			}
 			claim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation] = adopted.Name
+			// A full-object Update (not an optimistic-lock merge patch) is
+			// deliberate: it also persists the observability/trace annotations
+			// stamped in-memory earlier this pass, saving their dedicated write.
+			// A MergeFromWithOptimisticLock patch would give the same
+			// concurrency guarantee with a smaller payload, but its diff base
+			// would already contain the stamped annotations and silently drop
+			// them from the payload.
 			if err := r.Update(ctx, claim); err != nil {
 				r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
 				if k8errors.IsConflict(err) {
-					// Conflict means someone else updated the claim. We fail and retry.
-					return false, err
+					// Conflict means our copy of the claim is stale. Retrying the
+					// Update with the same in-memory object cannot succeed, so
+					// surface a sentinel: Reconcile turns it into a bounded
+					// requeue that re-runs adoption with a freshly read claim,
+					// without exponential failure backoff (#1107 pattern).
+					return false, fmt.Errorf("%w: claim %s", errAdoptionConflictRetry, claim.Name)
 				}
 				logger.Error(err, "Failed to update claim for adoption", "claim", claim.Name, "sandbox", adopted.Name)
 				return false, err
