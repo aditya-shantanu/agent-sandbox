@@ -112,3 +112,21 @@ INSTRUMENT_CLUSTER=true apiserver verbosity+log capture in the kops script.
 - Warm-adopted claims' Ready condition carries the SANDBOX's original
   lastTransitionTime (pre-dates the claim) — server-side condition timestamps
   cannot measure adoption latency.
+
+## Leg-B attribution forensics (round-3 input, 2026-07-19)
+
+Verdict on the remaining 1490ms p50: **(i) ~75-80% fixable in agent-sandbox**
+— watch-ingestion stall behind our own writes on the single shared HTTP/2
+connection (~1.0-1.1s p50, ~60% of e2e; controller informer events arrive
+seconds after an independent client watch got them in 20-305ms), plus
+client-side in-flight write queueing (134ms of each 194ms write RTT = 69%;
+APF 12%, server exec 19%); **(ii) ~15-20% control plane under our own load**
+(APF wait mean 23ms/write p99 434ms in shared workload-low — addressed by the
+merged APF insulation); **(iii) ~5-10% irreducible** (smoke run floor:
+79ms p50). CPU: 45% of one core; `persistStampedAnnotations` full-object
+merge patch = 15.8% of controller CPU (fix candidate); ~33% of CPU is JSON.
+Waste: 3677 post-bind requeues, 1629 teardown 404-PATCHes, 89 409-POSTs.
+Instrumentation bugs found: queueLatMs used CreationTimestamp (1s truncation
+→ ~900ms phantom; true creation→winning-pass p50 1081ms), and 40/300 fastest
+adoptions emit no timing line. Round-3 merge priority: watch/write transport
+separation > write collapse (merged) > APF (merged).
