@@ -201,3 +201,34 @@ Round-3 gains vs round-2: p50 −38%, p90 −30%, all-ready −32%.
 Segment decomposition + rest_client/APF verification: TODO from
 round3/B-round3 artifacts (controller.log, metrics.jsonl.gz) — next session.
 Round-4 agenda: SCALE-ROADMAP.md R4.1-R4.7 + sustained-rate phase at 500/s.
+
+---
+
+## 2026-07-19 — ROUND-4/5 INTEGRATED VERDICT (single image e75295a, tuned n2-standard-16 CP, TUNE_CONTROL_PLANE, client-connections=4 both legs, cluster sandbox-20260719-195815)
+
+Leg A (round-3 flag set): ack p50 101ms; e2e p50 610 / p90 1094 / p99 1130 / all-ready 1.15s.
+Leg B (+ --cache-label-selectors --disable-claim-observability-annotations --disable-claim-events):
+**ack p50 49ms; e2e p50 489 / p90 584 / p99 761 / max 856 / all-ready 0.86s.** Smoke floor 31-40ms.
+300/300 both legs, zero cold starts.
+
+Attribution confirmed: round-4's seat-wall + client-calibration diagnosis was right —
+same code as round-3 gained 1740→1094ms p90 from CP tuning + calibrated client alone;
+the round-4/5 flags then took it to 584ms.
+
+## ALL-ROUNDS COMPARISON (300-claim burst vs 300 warm pool)
+
+| | p50 | p90 | p99 | all-ready |
+|---|---|---|---|---|
+| baseline | 2539ms | 5546ms | 19.1s | 20.25s |
+| round 1 | ~1000ms* | ~1700ms* | 6.5s | 6.74s |
+| round 2 | 1490ms | 3116ms | 3.4s | 3.45s |
+| round 3 | 966ms | 1740ms | 2.58s | 2.62s |
+| **round 4/5** | **489ms** | **584ms** | **761ms** | **0.86s** |
+| vs baseline | **5.2×** | **9.5×** | **25×** | **23.5×** |
+
+*round-1 quantiles were storm-distorted (see earlier notes).
+
+p90 584ms sits just above round-4's 230-340ms prediction: the residual is create-ack
+(49ms) + watch hops + 2 write RTTs at ~100-150ms each under burst — exactly the L1
+(one-write adoption) + create-path territory forecast. Next: L1 prototype + sustained
+500/s runs (multi-pool + max-refill-rate + sharding per SCALE-ROADMAP).
