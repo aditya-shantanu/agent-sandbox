@@ -669,14 +669,25 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 	}
 
 	// Fast path: try to find existing or adopt from warm pool before template lookup.
-	sandbox, err := r.getOrCreateSandbox(ctx, claim, nil)
-	logger.V(1).Info("getOrCreateSandbox result", "sandboxFound", sandbox != nil, "err", err, "claim", claim.Name)
+	sandbox, adoptedThisPass, err := r.getOrCreateSandbox(ctx, claim, nil)
+	logger.V(1).Info("getOrCreateSandbox result", "sandboxFound", sandbox != nil, "adoptedThisPass", adoptedThisPass, "err", err, "claim", claim.Name)
 	if err != nil {
 		return nil, err
 	}
 	if sandbox != nil {
 		// The claim has a sandbox: any cold-start deferral bookkeeping is stale.
 		r.coldStartDeferrals.Delete(types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace})
+
+		if adoptedThisPass {
+			// completeAdoption already fetched the template, computed the merged
+			// pod metadata, forced spec.podTemplate.ObjectMeta to it, and synced
+			// the identity/template-hash/created-by labels in THIS pass. Re-running
+			// the template fetch and mergedMeta DeepEquals below would be pure
+			// duplicate work on the hot adoption path.
+			logger.V(1).Info("Fast path: sandbox adopted this pass, skipping metadata recompute", "claim", claim.Name, "sandbox", sandbox.Name)
+			return sandbox, nil
+		}
+
 		// Found or adopted. Reconcile network policy (best effort, non blocking).
 		logger.V(1).Info("Fast path: sandbox found or adopted, reconciling network policy", "claim", claim.Name)
 		template, templateErr := r.getTemplate(ctx, claim)
@@ -1902,7 +1913,7 @@ func (r *SandboxClaimReconciler) migrateLegacyAssignedSandboxLabel(ctx context.C
 	return r.Patch(ctx, claim, patch)
 }
 
-func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, _ *extensionsv1beta1.SandboxTemplate) (*v1beta1.Sandbox, error) {
+func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, _ *extensionsv1beta1.SandboxTemplate) (*v1beta1.Sandbox, bool, error) {
 	logger := log.FromContext(ctx)
 	logger.V(1).Info("Executing getOrCreateSandbox", "claim", claim.Name)
 
@@ -1921,12 +1932,12 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 					launchType = v1beta1.SandboxLaunchTypeWarm
 				}
 				if err := r.initializeSandboxLaunchTypeLabel(ctx, sandbox, launchType); err != nil {
-					return nil, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
+					return nil, false, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
 				}
-				return sandbox, nil
+				return sandbox, false, nil
 			}
 		} else if !k8errors.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to get sandbox %q from status: %w", statusName, err)
+			return nil, false, fmt.Errorf("failed to get sandbox %q from status: %w", statusName, err)
 		}
 	}
 
@@ -1958,9 +1969,9 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 					}
 				}
 				if err := r.initializeSandboxLaunchTypeLabel(ctx, sandbox, v1beta1.SandboxLaunchTypeWarm); err != nil {
-					return nil, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
+					return nil, false, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
 				}
-				return sandbox, nil
+				return sandbox, false, nil
 			}
 
 			controllerRef := metav1.GetControllerOf(sandbox)
@@ -1976,7 +1987,7 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 						delete(claim.Annotations, extensionsv1beta1.AssignedSandboxNameAnnotation)
 					}
 					if err := r.Patch(ctx, claim, patch); err != nil {
-						return nil, fmt.Errorf("failed to remove invalid sandbox reference: %w", err)
+						return nil, false, fmt.Errorf("failed to remove invalid sandbox reference: %w", err)
 					}
 				} else {
 					// If we already sent the adoption patch for this exact claim+sandbox,
@@ -1985,13 +1996,13 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 					adoptionKey := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
 					if prev, ok := r.triggeredAdoptions.Load(adoptionKey); ok && prev.uid == claim.UID && prev.sandbox == sbName {
 						logger.V(4).Info("Adoption already triggered, waiting for cache to converge", "sandbox", sbName, "claim", claim.Name)
-						return nil, fmt.Errorf("%w: sandbox %s", errAdoptionTriggeredRetry, sbName)
+						return nil, false, fmt.Errorf("%w: sandbox %s", errAdoptionTriggeredRetry, sbName)
 					}
 					if err := r.completeAdoption(ctx, claim, sandbox); err != nil {
 						if k8errors.IsNotFound(err) || k8errors.IsConflict(err) {
 							logger.V(4).Info("Failed to complete adoption (conflict/notfound), falling through", "sandbox", sbName, "claim", claim.Name)
 						} else {
-							return nil, fmt.Errorf("failed to complete adoption of %q: %w", sbName, err)
+							return nil, false, fmt.Errorf("failed to complete adoption of %q: %w", sbName, err)
 						}
 					} else {
 						r.triggeredAdoptions.Store(adoptionKey, triggeredAdoptionEntry{uid: claim.UID, sandbox: sbName})
@@ -2014,7 +2025,7 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 						// Reconcile requeues immediately with a bounded delay rather than routing
 						// through the exponential failure rate limiter (#1107).
 						logger.Info("Triggered adoption completion for sandbox, requeueing", "sandbox", sbName, "claim", claim.Name)
-						return nil, fmt.Errorf("%w: sandbox %s", errAdoptionTriggeredRetry, sbName)
+						return nil, false, fmt.Errorf("%w: sandbox %s", errAdoptionTriggeredRetry, sbName)
 					}
 				}
 			}
@@ -2028,11 +2039,11 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 				delete(claim.Annotations, extensionsv1beta1.AssignedSandboxNameAnnotation)
 			}
 			if err := r.Patch(ctx, claim, patch); err != nil {
-				return nil, fmt.Errorf("failed to remove stale sandbox reference from claim metadata: %w", err)
+				return nil, false, fmt.Errorf("failed to remove stale sandbox reference from claim metadata: %w", err)
 			}
 			logger.Info("Successfully removed stale sandbox reference from claim metadata", "sandbox", sbName, "claim", claim.Name)
 		} else {
-			return nil, fmt.Errorf("failed to get sandbox %q for sandbox name lookup: %w", sbName, err)
+			return nil, false, fmt.Errorf("failed to get sandbox %q for sandbox name lookup: %w", sbName, err)
 		}
 	}
 
@@ -2047,7 +2058,7 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 	if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), sandbox); err != nil {
 		sandbox = nil
 		if !k8errors.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to get sandbox %q: %w", claim.Name, err)
+			return nil, false, fmt.Errorf("failed to get sandbox %q: %w", claim.Name, err)
 		}
 	}
 
@@ -2056,12 +2067,12 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 		if !metav1.IsControlledBy(sandbox, claim) {
 			err := fmt.Errorf("sandbox %q is not controlled by claim %q. Please use a different claim name or delete the sandbox manually", sandbox.Name, claim.Name)
 			logger.Error(err, "Sandbox controller mismatch")
-			return nil, err
+			return nil, false, err
 		}
 		if err := r.initializeSandboxLaunchTypeLabel(ctx, sandbox, v1beta1.SandboxLaunchTypeCold); err != nil {
-			return nil, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
+			return nil, false, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
 		}
-		return sandbox, nil
+		return sandbox, false, nil
 	}
 
 	// Implicit Cold Start Detection (Bypassing the Queue):
@@ -2071,16 +2082,16 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 		if trace := adoptionTraceFrom(ctx); trace != nil {
 			trace.bypassed = true
 		}
-		return nil, nil
+		return nil, false, nil
 	}
 
 	// Go to the custom queue instead of standard r.List()
 	adopted, err := r.adoptSandboxFromCandidates(ctx, claim)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if adopted != nil {
-		return adopted, nil
+		return adopted, true, nil
 	}
 
 	// Cold-start guard: the in-memory adoption queue had no candidate, but the
@@ -2090,11 +2101,11 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 	// a bounded requeue instead of burning a warm sandbox AND paying cold-start
 	// latency; a per-claim attempt cap prevents deferring forever.
 	if claim.Spec.WarmPoolRef.Name != "" && r.shouldDeferColdStart(ctx, claim) {
-		return nil, fmt.Errorf("%w: warm pool %q", errColdStartDeferredRetry, claim.Spec.WarmPoolRef.Name)
+		return nil, false, fmt.Errorf("%w: warm pool %q", errColdStartDeferredRetry, claim.Spec.WarmPoolRef.Name)
 	}
 
 	// No warm pool sandbox available; caller decides whether to create
-	return nil, nil
+	return nil, false, nil
 }
 
 // shouldDeferColdStart reports whether cold start should be deferred because
