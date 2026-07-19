@@ -89,7 +89,33 @@ storms.
 **A/B so far (both VM-measured):** p90 5.55s → 1.49s (3.7×), all-ready
 20.25s → 6.74s (3.0×), steady throughput 48.9/s → 210.8/s (4.3×).
 
-### candidate2 (fresh cluster, started 02:43 UTC): RUNNING
+### candidate2 (`perf-investigation-master`, fresh cluster, 2026-07-19 02:43 UTC start) — COMPLETE
+
+300/300 Ready, 0 failed, phase wall 56.7s. VM client (ack p50 143ms).
+
+| metric | value |
+|---|---|
+| create→Ready | p50 1057ms / **p90 1970ms** / p99 6506ms / max 6742ms |
+| time to ALL 300 Ready | 6.74s |
+| ready throughput | steady 147.7/s, overall 46.3/s |
+
+Reproduces candidate1 (p90 1.49s vs 1.97s; all-ready identical 6.74s). The
+p99 ~6.5s tail matches candidate1's cold-start signature — the cold-start
+anomaly likely recurred (forensics in progress).
+
+## FINAL A/B (in-region client, like-for-like; controller-internal histograms
+## unusable for absolute quantiles per the re-record pollution note above)
+
+| metric | baseline (pre-opt) | candidate (optimized, 2 runs) | gain |
+|---|---|---|---|
+| create→Ready p50 | 2.54s | 0.95-1.06s | ~2.5× |
+| create→Ready **p90** | **5.55s** | **1.49-1.97s** | **~3.2×** |
+| create→Ready p99 | 19.1s | 5.6-6.5s | ~3× |
+| time to ALL 300 Ready | 20.25s | 6.74s (both runs) | 3.0× |
+| steady throughput | 48.9/s | 148-211/s | 3-4.3× |
+
+Remaining known issues driving the candidate tail: ~16 cold-started claims
+per candidate run (should be 0). Round 2 targets the ~1s median and this tail.
 
 Artifacts: `gs://kops-state-142966328212/perf-bench-results/latest/`.
 
