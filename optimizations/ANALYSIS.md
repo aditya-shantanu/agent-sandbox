@@ -100,6 +100,69 @@ create-ack separately from create→Ready (p50/p90/p95/p99/max) and
 time-to-all-Ready; controller metrics scraped throughout. kops script gains
 `NODE_COUNT`, `STRESS_CLAIMS_WARM`, `CONTROLLER_ARGS`, `SKIP_E2E_SUITE`.
 
+## Control-plane insulation via APF (branch `…-apf`)
+
+Directive: claim latency must never be attributable to the control plane or
+anything outside agent-sandbox. Two exposures existed:
+
+1. **Cross-tenant queuing.** Every non-kube-system ServiceAccount — the
+   agent-sandbox controller included — matches the built-in
+   `service-accounts` FlowSchema (precedence 9000) and shares the
+   `workload-low` priority level (100 of the 245 default nominal concurrency
+   shares). Any other tenant flooding workload-low queues the adoption writes
+   behind its traffic, and APF wait time is invisible in controller-side
+   latency accounting — it shows up only as "the API was slow".
+2. **Self-interference.** The claim burst's latency-critical writes (~3-4
+   writes/claim) share seats with the controller's own replenishment storm
+   (~300 sandbox + pod + service creates fired immediately after adoption).
+
+`k8s/apf-insulation.yaml` (applied automatically by deploy-to-kube; deliberately
+NOT in `k8s/kustomization.yaml`, so the release drift guard blocks accidental
+upstream release) adds two dedicated priority levels + three FlowSchemas for
+the `agent-sandbox-system/agent-sandbox-controller` ServiceAccount:
+
+| Level / schema | Shares (of new 310 total) | Traffic |
+|---|---|---|
+| `agent-sandbox-critical` (FS precedence 900) | 40 ≈ 13% → ~77 of the kops apiserver's 600 seats; lendable 25% | sandboxclaims + status (all verbs); sandboxes update/patch/get + status/finalizers (adoption + Ready forwarding); pod update/patch (synchronous adoption patch); coordination leases (leader election must not starve mid-burst) |
+| `agent-sandbox-bulk` (FS precedence 1000) | 25 ≈ 8% → ~48 seats; lendable 75% | catch-rest for the SA: sandbox/pod/service/PVC creates+deletes (replenishment), informer list/watch, discovery |
+| `agent-sandbox-events` (FS precedence 950) | — routes to existing `workload-low` | controller events, sacrificial by design |
+
+Both levels queue rather than 429 (queues=16, handSize=4,
+queueLengthLimit=100; single-flow levels make shuffle-shard width moot).
+Sandbox *creates* are intentionally bulk, not critical: on the warm path
+adoption never creates, and classifying creates as critical would let refill
+crowd out adoption.
+
+**Stress client:** needs no FlowSchema. `kops export kubeconfig --admin`
+issues a client cert with `O=system:masters`, which matches the mandatory
+`exempt` FlowSchema — the benchmark's claim creates bypass APF entirely.
+Verify per-run: `kubectl auth whoami` must list `system:masters`.
+
+**Post-run verification** (scrape `/metrics` on the apiserver, or check the
+captured metrics.jsonl):
+
+- `apiserver_flowcontrol_request_wait_duration_seconds_bucket{priority_level="agent-sandbox-critical"}`
+  — the insulation claim holds iff this stays ~0 (sub-millisecond) through
+  the burst. Any wait here is control-plane-attributable latency.
+- `apiserver_flowcontrol_current_executing_seats` / `_demand_seats` per
+  priority_level — shows whether bulk (refill) saturated its level while
+  critical stayed clear, i.e. the split did real work.
+- `apiserver_flowcontrol_dispatched_requests_total{flow_schema=~"agent-sandbox.*"}`
+  — confirms requests actually classified into the new schemas (a typo'd
+  subject silently falls through to `service-accounts`).
+- `apiserver_flowcontrol_rejected_requests_total{priority_level=~"agent-sandbox.*"}`
+  — must be 0; non-zero means queueLengthLimit needs raising.
+- Point-in-time: `kubectl get --raw /debug/api_priority_and_fairness/dump_priority_levels`.
+
+**A/B protocol:** same cluster size / phases, one run with the manifest, one
+with `kubectl delete -f k8s/apf-insulation.yaml` (built-ins reconcile
+instantly; no apiserver restart). Compare
+`agent_sandbox_claim_controller_startup_latency_ms` and client-observed
+create→Ready; on an otherwise-idle benchmark cluster expect ≈no change (the
+manifest is insurance, not a speedup) — the interesting A/B is with induced
+background load on workload-low (e.g. a busy default-SA lister), where the
+un-insulated run should show wait-duration > 0 and inflated claim tails.
+
 ## Measurement policy (user decision 2026-07-18)
 
 Primary metric: **`agent_sandbox_claim_controller_startup_latency_ms`**
