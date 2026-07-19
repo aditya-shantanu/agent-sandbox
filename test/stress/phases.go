@@ -336,6 +336,12 @@ func buildTemplateObject(id types.NamespacedName, image string) *unstructured.Un
 				"namespace": id.Namespace,
 			},
 			"spec": map[string]any{
+				// Explicitly service-free: no per-sandbox headless Service,
+				// so pool churn costs no Service/EndpointSlice writes. This
+				// pins the current default (unset spec.service also skips
+				// creation) so the benchmark stays service-free even if the
+				// field's defaulting ever changes.
+				"service": false,
 				"podTemplate": map[string]any{
 					"spec": map[string]any{
 						"restartPolicy":                 "Never",
