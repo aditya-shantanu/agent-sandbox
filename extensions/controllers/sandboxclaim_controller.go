@@ -843,6 +843,26 @@ func (r *SandboxClaimReconciler) hasWrittenReadyStatus(claim *extensionsv1beta1.
 	return ready != nil && ready.Status == metav1.ConditionTrue
 }
 
+// claimAlreadyBound reports whether this controller already bound the claim
+// (same UID) to a sandbox in this process: either an adoption patch was sent
+// and is awaiting informer convergence (triggeredAdoptions), or the last
+// status successfully written recorded a bound sandbox (lastWrittenStatuses).
+// It is the stale-pass guard for reconciles that read a PRE-adoption view of
+// the claim from a lagging cache: such passes must wait for convergence, not
+// re-enter adoption (burning warm candidates and 409-ing on the claim Update)
+// or the cold path (creating duplicate sandboxes for already-bound claims).
+func (r *SandboxClaimReconciler) claimAlreadyBound(claim *extensionsv1beta1.SandboxClaim) bool {
+	key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+	if entry, ok := r.triggeredAdoptions.Load(key); ok && entry.uid == claim.UID {
+		return true
+	}
+	if entry, ok := r.lastWrittenStatuses.Load(key); ok && entry.uid == claim.UID &&
+		entry.status.SandboxStatus.Name != "" {
+		return true
+	}
+	return false
+}
+
 func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *extensionsv1beta1.SandboxClaimStatus, claim *extensionsv1beta1.SandboxClaim) error {
 	logger := log.FromContext(ctx)
 
@@ -1065,11 +1085,16 @@ func (r *SandboxClaimReconciler) computeAndSetStatus(claim *extensionsv1beta1.Sa
 	// state change. If the claim status was already finalized with a sandbox (the
 	// adoption pass itself, or a controller restart racing a stale informer), leave
 	// the recorded Name/PodIPs and existing conditions untouched instead of
-	// transiently wiping them.
+	// transiently wiping them. The in-memory hasWrittenReadyStatus check covers
+	// stale passes whose cached view predates even the Ready status write:
+	// without it, a retry pass on a bound-and-Ready claim would regress the
+	// persisted status to a transient AdoptionPending/AdoptionConflict and flap
+	// back to Ready when the cache converges (161 of 300 claims flapped this
+	// way per burst before the guard).
 	if sandbox == nil &&
 		(errors.Is(err, errAdoptionTriggeredRetry) || errors.Is(err, errAdoptionConflictRetry) ||
 			errors.Is(err, errColdStartDeferredRetry)) &&
-		claim.Status.SandboxStatus.Name != "" {
+		(claim.Status.SandboxStatus.Name != "" || r.hasWrittenReadyStatus(claim)) {
 		return
 	}
 	readyCondition := r.computeReadyCondition(claim, sandbox, err, isClaimExpired)
@@ -1809,6 +1834,14 @@ func (r *SandboxClaimReconciler) createSandbox(ctx context.Context, claim *exten
 	}
 
 	logger.Info("Created sandbox for claim", "claim", claim.Name, "sandbox", sandbox.Name, "isReady", false, "duration", time.Since(claim.CreationTimestamp.Time))
+	if claim.Spec.WarmPoolRef.Name != "" {
+		// Cold binding is sticky: once status.sandboxStatus.name is written,
+		// later passes take the name-lookup fast path and never reconsider the
+		// warm pool for this claim. Called out explicitly so cold starts under
+		// warm-pool pressure are easy to spot and count in logs.
+		logger.Info("Cold-start binding is sticky: claim will keep this sandbox and not reconsider the warm pool",
+			"claim", claim.Name, "sandbox", sandbox.Name, "warmPool", claim.Spec.WarmPoolRef.Name)
+	}
 
 	if r.Recorder != nil {
 		r.Recorder.Eventf(claim, nil, corev1.EventTypeNormal, "SandboxProvisioned", "Provisioning", "Created Sandbox %q", sandbox.Name)
@@ -1989,6 +2022,12 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 					if err := r.Patch(ctx, claim, patch); err != nil {
 						return nil, false, fmt.Errorf("failed to remove invalid sandbox reference: %w", err)
 					}
+					// Drop any in-memory adoption record pointing at the unusable
+					// sandbox so the stale-pass guard cannot pin the claim to it.
+					refKey := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+					if prev, ok := r.triggeredAdoptions.Load(refKey); ok && prev.uid == claim.UID && prev.sandbox == sbName {
+						r.triggeredAdoptions.Delete(refKey)
+					}
 				} else {
 					// If we already sent the adoption patch for this exact claim+sandbox,
 					// the cache just hasn't converged yet — keep waiting via the bounded
@@ -2041,6 +2080,12 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 			if err := r.Patch(ctx, claim, patch); err != nil {
 				return nil, false, fmt.Errorf("failed to remove stale sandbox reference from claim metadata: %w", err)
 			}
+			// Drop any in-memory adoption record pointing at the vanished sandbox
+			// so the stale-pass guard cannot pin the claim to it.
+			refKey := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+			if prev, ok := r.triggeredAdoptions.Load(refKey); ok && prev.uid == claim.UID && prev.sandbox == sbName {
+				r.triggeredAdoptions.Delete(refKey)
+			}
 			logger.Info("Successfully removed stale sandbox reference from claim metadata", "sandbox", sbName, "claim", claim.Name)
 		} else {
 			return nil, false, fmt.Errorf("failed to get sandbox %q for sandbox name lookup: %w", sbName, err)
@@ -2073,6 +2118,25 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 			return nil, false, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
 		}
 		return sandbox, false, nil
+	}
+
+	// Stale-pass re-adoption guard: reaching this point with a claim view that
+	// carries NO bound status, NO assigned-sandbox annotation and NO legacy
+	// label means either the claim is genuinely new, or the informer cache
+	// served a PRE-adoption view of a claim this controller already bound
+	// (the adoption Update persists the annotation, so a converged view always
+	// carries it). Only the in-memory maps can tell the two apart. Without
+	// this guard such stale passes re-entered adoption — checking out warm
+	// queue keys for whole doomed attempts whose claim Update can only 409
+	// (the adoption Update bumped the resourceVersion) — or, with the queue
+	// momentarily empty, fell through to createSandbox and produced duplicate
+	// cold sandboxes for already-warm-bound claims.
+	if claim.Status.SandboxStatus.Name == "" &&
+		claim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation] == "" &&
+		claim.Labels[extensionsv1beta1.DeprecatedAssignedSandboxNameLabel] == "" &&
+		r.claimAlreadyBound(claim) {
+		logger.V(1).Info("Stale cache view of an already-bound claim; waiting for convergence instead of re-entering adoption or cold start", "claim", claim.Name)
+		return nil, false, fmt.Errorf("%w: claim %s already bound, stale cache view", errAdoptionTriggeredRetry, claim.Name)
 	}
 
 	// Implicit Cold Start Detection (Bypassing the Queue):
