@@ -35,6 +35,7 @@ import (
 	"github.com/felixge/fgprof"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	extensionscontrollers "sigs.k8s.io/agent-sandbox/extensions/controllers"
@@ -75,6 +76,7 @@ func main() {
 	var sandboxWarmPoolMaxBatchSize int
 	var sandboxWarmPoolReplenishDelay time.Duration
 	var enableWarmPoolEviction bool
+	var disableClaimEvents bool
 	var printVersion bool
 	var webhookPort int
 	var webhookCertDir string
@@ -122,6 +124,9 @@ func main() {
 			"(e.g. a burst of SandboxClaims adopting warm sandboxes), so the burst gets API server priority. "+
 			"The hold re-arms while members keep dropping. 0 (default) replenishes immediately.")
 	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
+	flag.BoolVar(&disableClaimEvents, "disable-claim-events", false,
+		"Disable Kubernetes Event emission from the SandboxClaim controller (hot-path Eventf calls become no-ops), "+
+			"reducing API server writes during large claim bursts.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -354,11 +359,20 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Every Eventf site in the claim controller is nil-guarded on the
+		// recorder, so a nil recorder cleanly disables event emission.
+		var claimRecorder events.EventRecorder
+		if disableClaimEvents {
+			setupLog.Info("SandboxClaim controller event emission disabled (--disable-claim-events)")
+		} else {
+			claimRecorder = mgr.GetEventRecorder("sandboxclaim-controller")
+		}
+
 		if err = (&extensionscontrollers.SandboxClaimReconciler{
 			Client:              mgr.GetClient(),
 			Scheme:              mgr.GetScheme(),
 			WarmSandboxQueue:    warmSandboxQueue,
-			Recorder:            mgr.GetEventRecorder("sandboxclaim-controller"),
+			Recorder:            claimRecorder,
 			Tracer:              instrumenter,
 			AllowedLabelDomains: allowedDomains,
 		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
