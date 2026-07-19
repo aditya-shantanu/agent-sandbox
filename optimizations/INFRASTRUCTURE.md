@@ -59,6 +59,31 @@ test/benchmarks/scenarios/benchmarks-kops-gcp/run
 ```
 
 Candidate runs add `--sandbox-warm-pool-replenish-delay=20s` to `CONTROLLER_ARGS`.
+
+### Cluster reuse + smoke testing (preferred A/B workflow)
+
+Cluster bring-up is ~20 min of every run; reusing one cluster for a
+baseline/candidate pair halves wall time AND removes cluster-to-cluster
+variance from the comparison. Env knobs on the run script:
+
+- `KEEP_CLUSTER=true` — cleanup leaves the cluster running (delete manually
+  when done: `KOPS_STATE_STORE=gs://kops-state-142966328212 kops delete
+  cluster --name <name> --yes`).
+- `EXISTING_CLUSTER=<name>` — skip create/validate/cilium tuning; export
+  kubeconfig and go straight to deploy + stress. Controller redeploys with
+  the current tree's image, so switching branches between invocations is the
+  A/B mechanism.
+- `STRESS_SMOKE_COUNT=20` — run a 20-claim claims-warm smoke first; aborts
+  before the full-size run if the pipeline is broken.
+
+Sequential A/B on one cluster:
+```
+# 1. baseline: creates cluster, keeps it
+KEEP_CLUSTER=true STRESS_SMOKE_COUNT=20 ... (baseline tree)/run
+# 2. candidate: reuses it
+EXISTING_CLUSTER=sandbox-<ts> STRESS_SMOKE_COUNT=20 ... (candidate tree)/run
+# 3. delete the cluster manually
+```
 `SKIP_E2E_SUITE=true` exists because laptop/VM pip mirrors could not install the
 Python SDK deps (setuptools/duckdb unavailable on `us-python.pkg.dev` mirror);
 the stress phase is pure Go and unaffected. The post-run HTML report generator
