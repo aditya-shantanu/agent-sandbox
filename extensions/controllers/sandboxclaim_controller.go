@@ -229,6 +229,13 @@ type adoptionTrace struct {
 	lastReject string // reason of the last rejection
 	attempts   int    // adoption transactions attempted (candidate found)
 	bypassed   bool   // warm pool bypassed due to claim env/volumeClaimTemplates
+
+	// coldStartDeferrals / deferralsExhausted record the cold-start guard's
+	// decision: how many bounded requeues the claim spent waiting for cached
+	// adoptable pool members to reach the adoption queue, and whether this
+	// pass cold-starts because that deferral cap was exhausted.
+	coldStartDeferrals int
+	deferralsExhausted bool
 }
 
 type adoptionTraceKey struct{}
@@ -772,6 +779,10 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 		switch {
 		case trace.bypassed:
 			reason = "claim env/volumeClaimTemplates set; warm pool bypassed"
+		case trace.deferralsExhausted:
+			// The cold-start guard saw adoptable members in the cache but the
+			// adoption queue never yielded one within the deferral cap.
+			reason = "adoptable members exhausted after deferrals"
 		case trace.popped == 0:
 			reason = "warm pool queue empty"
 		case trace.attempts > 0:
@@ -787,6 +798,7 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 			"candidatesRejected", trace.rejected,
 			"lastRejectionReason", trace.lastReject,
 			"adoptionAttempts", trace.attempts,
+			"coldStartDeferrals", trace.coldStartDeferrals,
 		)
 	}
 
@@ -2213,6 +2225,12 @@ func (r *SandboxClaimReconciler) shouldDeferColdStart(ctx context.Context, claim
 		logger.Info("Warm pool still shows adoptable sandboxes but none could be adopted after the deferral cap; falling back to cold start",
 			"claim", claim.Name, "warmPool", claim.Spec.WarmPoolRef.Name,
 			"adoptableMembers", adoptable, "deferrals", entry.attempts-1)
+		// Surface the decision to the instrumentation's cold-start
+		// fallthrough line so its reason field reflects the deferral cap.
+		if trace := adoptionTraceFrom(ctx); trace != nil {
+			trace.coldStartDeferrals = entry.attempts - 1
+			trace.deferralsExhausted = true
+		}
 		r.coldStartDeferrals.Delete(key)
 		return false
 	}
