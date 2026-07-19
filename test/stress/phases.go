@@ -31,12 +31,22 @@ import (
 
 // stressTest bundles the shared state used by the test phases.
 type stressTest struct {
-	cfg           Config
-	tracker       *Tracker
+	cfg     Config
+	tracker *Tracker
+	// mutateClient issues all of the harness's mutating requests (creates
+	// and deletes). With --client-connections=1 it shares the watch client's
+	// single HTTP/2 connection (historical behavior); with N>1 its requests
+	// are sharded over N dedicated connections so create bursts neither
+	// queue on the ~100-stream per-connection cap nor congest the watches
+	// (see clientconns.go).
+	mutateClient dynamic.Interface
+	// nsClient creates/deletes the extra namespaces of the multi-namespace
+	// sustained phase (cluster-scoped).
+	nsClient      dynamic.ResourceInterface
 	sandboxClient dynamic.ResourceInterface
 	// Extensions clients (extensions.agents.x-k8s.io/v1beta1), used by the
-	// claims-warm phase. The extensions controller must be deployed
-	// (deploy-to-kube --extensions) for that phase to work.
+	// claims-warm phases. The extensions controller must be deployed
+	// (deploy-to-kube --extensions) for those phases to work.
 	templateClient dynamic.ResourceInterface
 	warmPoolClient dynamic.ResourceInterface
 	claimClient    dynamic.ResourceInterface
@@ -386,38 +396,39 @@ func buildClaimObject(id types.NamespacedName, poolName string) *unstructured.Un
 	}
 }
 
-// createClaim registers a record and issues the SandboxClaim Create call.
-// Like createSandbox, Create errors are recorded on the record rather than
-// aborting the phase.
-func (s *stressTest) createClaim(ctx context.Context, id types.NamespacedName, poolName string, number PhaseNumber) error {
+// createClaim registers a record and issues the SandboxClaim Create call via
+// the given (namespace-bound) client. Like createSandbox, Create errors are
+// recorded on the record rather than aborting the phase.
+func (s *stressTest) createClaim(ctx context.Context, claimClient dynamic.ResourceInterface, id types.NamespacedName, poolName string, phase Phase, number PhaseNumber) error {
 	claim := buildClaimObject(id, poolName)
-	s.tracker.Register(id, PhaseClaimsWarm, number)
-	_, err := s.claimClient.Create(ctx, claim, metav1.CreateOptions{})
+	s.tracker.Register(id, phase, number)
+	_, err := claimClient.Create(ctx, claim, metav1.CreateOptions{})
 	s.tracker.MarkCreateReturned(id, err)
 	if err != nil {
-		log.Printf("[%s] failed to create claim %s: %v", PhaseClaimsWarm, id.Name, err)
+		log.Printf("[%s] failed to create claim %s: %v", phase, id.Name, err)
 	}
 	return err
 }
 
-// waitWarmPoolReady polls the pool until status.readyReplicas >= want, so the
-// claim burst measures binding latency against a fully provisioned pool
-// rather than sandbox launch latency. Progress-stall detection mirrors the
-// fill phase: if readyReplicas stops advancing for PerSandboxTimeout, fail.
-func (s *stressTest) waitWarmPoolReady(ctx context.Context, poolName string, want int, number PhaseNumber) error {
+// waitWarmPoolReady polls the pool (via the given namespace-bound client)
+// until status.readyReplicas >= want, so the claim phases measure binding
+// latency against a fully provisioned pool rather than sandbox launch
+// latency. Progress-stall detection mirrors the fill phase: if readyReplicas
+// stops advancing for PerSandboxTimeout, fail.
+func (s *stressTest) waitWarmPoolReady(ctx context.Context, poolClient dynamic.ResourceInterface, phase Phase, poolName string, want int, number PhaseNumber) error {
 	lastReady := int64(-1)
 	lastProgress := time.Now()
 	for {
-		pool, err := s.warmPoolClient.Get(ctx, poolName, metav1.GetOptions{})
+		pool, err := poolClient.Get(ctx, poolName, metav1.GetOptions{})
 		if err != nil {
-			return fmt.Errorf("[%s#%d] failed to get warm pool %s: %w", PhaseClaimsWarm, number, poolName, err)
+			return fmt.Errorf("[%s#%d] failed to get warm pool %s: %w", phase, number, poolName, err)
 		}
 		ready, _, err := unstructured.NestedInt64(pool.Object, "status", "readyReplicas")
 		if err != nil {
-			return fmt.Errorf("[%s#%d] failed to read warm pool status: %w", PhaseClaimsWarm, number, err)
+			return fmt.Errorf("[%s#%d] failed to read warm pool status: %w", phase, number, err)
 		}
 		if ready >= int64(want) {
-			log.Printf("[%s#%d] warm pool %s ready: %d/%d replicas", PhaseClaimsWarm, number, poolName, ready, want)
+			log.Printf("[%s#%d] warm pool %s ready: %d/%d replicas", phase, number, poolName, ready, want)
 			return nil
 		}
 		if ready != lastReady {
@@ -425,7 +436,7 @@ func (s *stressTest) waitWarmPoolReady(ctx context.Context, poolName string, wan
 			lastProgress = time.Now()
 		}
 		if time.Since(lastProgress) > s.cfg.PerSandboxTimeout {
-			return fmt.Errorf("[%s#%d] warm pool stalled: %d/%d replicas ready with no progress for %v", PhaseClaimsWarm, number, ready, want, s.cfg.PerSandboxTimeout)
+			return fmt.Errorf("[%s#%d] warm pool stalled: %d/%d replicas ready with no progress for %v", phase, number, ready, want, s.cfg.PerSandboxTimeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -479,7 +490,7 @@ func (s *stressTest) runClaimsWarmPhase(ctx context.Context, number PhaseNumber)
 	// fails partway: later phases assume the cluster's spare capacity is back.
 	defer s.cleanupClaimsWarm(ctx, number, ids, poolID, templateID)
 
-	if err := s.waitWarmPoolReady(ctx, poolID.Name, count, number); err != nil {
+	if err := s.waitWarmPoolReady(ctx, s.warmPoolClient, PhaseClaimsWarm, poolID.Name, count, number); err != nil {
 		return err
 	}
 
@@ -507,7 +518,7 @@ func (s *stressTest) runClaimsWarmPhase(ctx context.Context, number PhaseNumber)
 		wg.Go(func() {
 			<-release
 			// Errors are recorded per-claim; do not abort the phase.
-			_ = s.createClaim(ctx, id, poolID.Name, number)
+			_ = s.createClaim(ctx, s.claimClient, id, poolID.Name, PhaseClaimsWarm, number)
 		})
 	}
 	close(release)
