@@ -23,7 +23,6 @@ import atexit
 import asyncio
 import logging
 import sys
-import time
 import uuid
 from typing import Generic, TypeVar
 
@@ -200,15 +199,14 @@ class AsyncSandboxClient(Generic[T]):
                 volume_claim_templates=volume_claim_templates,
                 pod_metadata=pod_metadata
             )
-            start_time = time.monotonic()
-            sandbox_id = await self.k8s_helper.resolve_sandbox_name(
+            # Wait for the claim to be bound and Ready in a single watch.
+            # The claim status carries the sandbox name (which differs from
+            # the claim name with warm pools) and the forwarded Ready
+            # condition in the same status update, so no second watch on the
+            # Sandbox resource is needed.
+            sandbox_id = await self._wait_for_claim_ready(
                 claim_name, namespace, sandbox_ready_timeout
             )
-            elapsed_time = time.monotonic() - start_time
-            remaining_timeout = max(0, int(sandbox_ready_timeout - elapsed_time))
-            if remaining_timeout <= 0:
-                raise TimeoutError("Sandbox resolution exceeded the ready timeout.")
-            await self._wait_for_sandbox_ready(sandbox_id, namespace, remaining_timeout)
 
             sandbox = self.sandbox_class(
                 claim_name=claim_name,
@@ -441,8 +439,15 @@ class AsyncSandboxClient(Generic[T]):
             pod_metadata=pod_metadata
         )
 
+    @async_trace_span("wait_for_claim_ready")
+    async def _wait_for_claim_ready(self, claim_name: str, namespace: str, timeout: int) -> str:
+        """Waits for the SandboxClaim to be bound and Ready, returning the sandbox name."""
+        return await self.k8s_helper.wait_for_claim_ready(claim_name, namespace, timeout)
+
     @async_trace_span("wait_for_sandbox_ready")
     async def _wait_for_sandbox_ready(self, sandbox_id: str, namespace: str, timeout: int):
+        """Retained for API compatibility; ``create_sandbox`` now uses the
+        single-watch ``_wait_for_claim_ready`` path instead."""
         await self.k8s_helper.wait_for_sandbox_ready(sandbox_id, namespace, timeout)
 
     @async_trace_span("delete_claim")

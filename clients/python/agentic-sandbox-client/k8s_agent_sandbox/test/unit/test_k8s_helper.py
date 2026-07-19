@@ -183,8 +183,110 @@ class TestK8sHelperResolveSandboxName(unittest.TestCase):
         
         with self.assertRaises(SandboxMetadataError) as context:
             helper.resolve_sandbox_name("test-claim", "default", timeout=5)
-            
+
         self.assertIn("SandboxClaim 'test-claim' was deleted while resolving sandbox name", str(context.exception))
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_single_event(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """Warm-pool fast path: name + Ready arrive in one claim status update."""
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1", "podIPs": ["10.0.0.5"]},
+                },
+            },
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
+        self.assertEqual(name, "warm-sandbox-1")
+        # Only the claim is watched; no call against the Sandbox resource.
+        self.assertEqual(mock_watch_class.call_count, 1)
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_name_before_ready(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """Cold-start path: the name lands first, Ready arrives on a later event."""
+        mock_watch = MagicMock()
+        name_only_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "False", "reason": "SandboxNotReady"}],
+                    "sandbox": {"name": "cold-sandbox-1"},
+                },
+            },
+        }
+        ready_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "cold-sandbox-1", "podIPs": ["10.0.0.9"]},
+                },
+            },
+        }
+        mock_watch.stream.return_value = [name_only_event, ready_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(name, "cold-sandbox-1")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_wait_for_claim_ready_template_not_found(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "TemplateNotFound",
+                            "message": "Template 'non-existent-template' not found",
+                        }
+                    ]
+                },
+            },
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        with self.assertRaises(SandboxTemplateNotFoundError):
+            helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_resolve_sandbox_name_returns_before_ready(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """resolve_sandbox_name keeps its legacy semantics: name alone suffices."""
+        mock_watch = MagicMock()
+        mock_event = {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "False", "reason": "SandboxNotReady"}],
+                    "sandbox": {"name": "pending-sandbox"},
+                },
+            },
+        }
+        mock_watch.stream.return_value = [mock_event]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.resolve_sandbox_name("test-claim", "default", timeout=5)
+        self.assertEqual(name, "pending-sandbox")
 
 
 @patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
