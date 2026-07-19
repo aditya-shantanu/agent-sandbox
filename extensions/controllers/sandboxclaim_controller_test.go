@@ -2612,6 +2612,7 @@ func TestRecordCreationLatencyMetric(t *testing.T) {
 		claim                          *extensionsv1beta1.SandboxClaim
 		oldStatus                      *extensionsv1beta1.SandboxClaimStatus
 		sandbox                        *sandboxv1beta1.Sandbox
+		readyAlreadyWritten            bool
 		expectedObservations           int
 		expectedControllerObservations int
 		setupReconciler                func(r *SandboxClaimReconciler)
@@ -2669,6 +2670,26 @@ func TestRecordCreationLatencyMetric(t *testing.T) {
 			oldStatus: &extensionsv1beta1.SandboxClaimStatus{
 				Conditions: []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}},
 			},
+			expectedObservations: 0,
+		},
+		{
+			name: "ignores success if ready status was already written by this controller (stale-cache echo pass)",
+			claim: &extensionsv1beta1.SandboxClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "echo-pass",
+					CreationTimestamp: pastTime,
+					Annotations: map[string]string{
+						asmetrics.WebhookAnnotation: time.Now().Add(-5 * time.Second).Format(time.RFC3339Nano),
+					},
+				},
+				Spec: extensionsv1beta1.SandboxClaimSpec{WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-warmpool"}},
+				Status: extensionsv1beta1.SandboxClaimStatus{
+					Conditions: []metav1.Condition{{Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue}},
+				},
+			},
+			// Stale cache view: the pre-Ready status, even though Ready was already written.
+			oldStatus:            &extensionsv1beta1.SandboxClaimStatus{},
+			readyAlreadyWritten:  true,
 			expectedObservations: 0,
 		},
 		{
@@ -2753,7 +2774,7 @@ func TestRecordCreationLatencyMetric(t *testing.T) {
 				tc.setupReconciler(r)
 			}
 
-			r.recordCreationLatencyMetric(ctx, tc.claim, tc.oldStatus, tc.sandbox)
+			r.recordCreationLatencyMetric(ctx, tc.claim, tc.oldStatus, tc.sandbox, tc.readyAlreadyWritten)
 
 			// Verify the metric was observed in the Prometheus registry
 			count := testutil.CollectAndCount(asmetrics.ClaimStartupLatency)
@@ -5589,4 +5610,172 @@ func TestReconcile_TracingNormalization(t *testing.T) {
 
 	require.NotNil(t, mt.capturedAttrs)
 	require.Equal(t, "unknown", mt.capturedAttrs[sandboxv1beta1.CreatedByLabel], "created-by label must be normalized in span attributes")
+}
+
+// TestSandboxClaimEchoPassSkipsRedundantStatusPatch verifies that a reconcile pass
+// that reads a STALE claim from the informer cache AFTER this controller already
+// wrote the final (Ready) status issues ZERO additional claim status patches and
+// does not re-record the Ready-latency metric. Without the last-written-status
+// fingerprint, every such echo pass recomputes the status against the stale view,
+// re-sends the (server-side no-op) status patch, and each patch spawns yet another
+// watch event/echo pass — the "echo storm" observed under 300-claim bursts.
+func TestSandboxClaimEchoPassSkipsRedundantStatusPatch(t *testing.T) {
+	asmetrics.ClaimStartupLatency.Reset()
+	asmetrics.ClaimControllerStartupLatency.Reset()
+
+	scheme := newScheme(t)
+	templateHash := sandboxcontrollers.NameHash("test-template")
+
+	claim := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+			UID:       "claim-uid-123",
+			Annotations: map[string]string{
+				asmetrics.WebhookAnnotation: time.Now().Add(-5 * time.Second).Format(time.RFC3339Nano),
+			},
+		},
+		Spec: extensionsv1beta1.SandboxClaimSpec{
+			WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-pool"},
+		},
+	}
+
+	template := &extensionsv1beta1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+		Spec: extensionsv1beta1.SandboxTemplateSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+		}}},
+	}
+
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default", UID: "warmpool-uid-123"},
+		Spec:       extensionsv1beta1.SandboxWarmPoolSpec{TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: "test-template"}},
+	}
+
+	// Sandbox already owned by the claim and Ready with a FIXED transition time,
+	// so recomputing the claim status is deterministic across passes. Labels are
+	// pre-synced so the metadata fast path has nothing to patch.
+	readyLTT := metav1.NewTime(time.Now().Add(-3 * time.Second).Truncate(time.Second))
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+			UID:       "sb-uid",
+			Labels: map[string]string{
+				sandboxv1beta1.SandboxLaunchTypeLabel: sandboxv1beta1.SandboxLaunchTypeCold,
+				sandboxTemplateRefHash:                templateHash,
+			},
+			Annotations: map[string]string{
+				sandboxv1beta1.SandboxTemplateRefAnnotation: "test-template",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+				Kind:       "SandboxClaim",
+				Name:       "test-claim",
+				UID:        "claim-uid-123",
+				Controller: ptr.To(true), // nolint:modernize
+			}},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			ObjectMeta: sandboxv1beta1.PodMetadata{
+				Labels: map[string]string{
+					extensionsv1beta1.SandboxIDLabel: "claim-uid-123",
+					sandboxTemplateRefHash:           templateHash,
+				},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+		}}},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:               string(sandboxv1beta1.SandboxConditionReady),
+				Status:             metav1.ConditionTrue,
+				Reason:             "Ready",
+				Message:            "Sandbox is ready",
+				LastTransitionTime: readyLTT,
+			}},
+		},
+	}
+
+	serveStaleClaim := false
+	staleClaim := &extensionsv1beta1.SandboxClaim{}
+	claimStatusPatches := 0
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(template, warmPool, claim, sandbox).
+		WithStatusSubresource(claim).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if cl, ok := obj.(*extensionsv1beta1.SandboxClaim); ok && serveStaleClaim && key.Name == "test-claim" {
+					staleClaim.DeepCopyInto(cl)
+					return nil
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if _, ok := obj.(*extensionsv1beta1.SandboxClaim); ok && subResourceName == "status" {
+					claimStatusPatches++
+				}
+				return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+
+	// Snapshot the pre-write server view of the claim: this is the stale view the
+	// informer cache keeps serving during the echo passes.
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, staleClaim); err != nil {
+		t.Fatalf("failed to snapshot pre-write claim view: %v", err)
+	}
+
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(10),
+		Tracer:           asmetrics.NewNoOp(),
+		WarmSandboxQueue: queue.NewSimpleSandboxQueue(),
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
+
+	// Pass 1: genuine Ready transition — writes the status and records the metric.
+	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("pass 1: expected nil error, got: %v", err)
+	}
+	if claimStatusPatches != 1 {
+		t.Fatalf("pass 1: expected exactly 1 claim status patch, got %d", claimStatusPatches)
+	}
+	if got := testutil.CollectAndCount(asmetrics.ClaimStartupLatency); got != 1 {
+		t.Fatalf("pass 1: expected 1 ClaimStartupLatency observation, got %d", got)
+	}
+
+	written := &extensionsv1beta1.SandboxClaim{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, written); err != nil {
+		t.Fatalf("failed to get claim after pass 1: %v", err)
+	}
+	if written.Status.SandboxStatus.Name != "test-claim" {
+		t.Fatalf("pass 1: expected status to be finalized with the sandbox, got %q", written.Status.SandboxStatus.Name)
+	}
+
+	// Passes 2 and 3: the cache serves the STALE (pre-write) claim. The recomputed
+	// status equals what was already written — no patch, no metric re-record.
+	serveStaleClaim = true
+	for pass := 2; pass <= 3; pass++ {
+		if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+			t.Fatalf("pass %d: expected nil error, got: %v", pass, err)
+		}
+		if claimStatusPatches != 1 {
+			t.Fatalf("pass %d: expected ZERO additional claim status patches on stale-cache echo pass, got %d total", pass, claimStatusPatches)
+		}
+		if got := testutil.CollectAndCount(asmetrics.ClaimStartupLatency); got != 1 {
+			t.Fatalf("pass %d: expected ClaimStartupLatency to stay at 1 observation, got %d", pass, got)
+		}
+	}
+
+	// The persisted status must be untouched.
+	serveStaleClaim = false
+	final := &extensionsv1beta1.SandboxClaim{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, final); err != nil {
+		t.Fatalf("failed to get claim after echo passes: %v", err)
+	}
+	if final.Status.SandboxStatus.Name != "test-claim" {
+		t.Errorf("expected persisted status to remain finalized, got %q", final.Status.SandboxStatus.Name)
+	}
 }

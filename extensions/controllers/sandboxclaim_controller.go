@@ -229,6 +229,43 @@ func durationMs(d time.Duration) float64 {
 	return float64(d.Nanoseconds()) / 1e6
 }
 
+// lastWrittenStatusEntry records the last claim status this controller
+// successfully WROTE (the server response of the status patch), keyed by claim
+// UID to guard against delete/recreate with the same name. It lets echo
+// reconcile passes that read a STALE claim from the informer cache recognize
+// that the recomputed status is identical to what is already persisted and
+// skip the redundant status patch (each such patch spawns another watch event
+// and thus another echo pass) and the duplicate Ready-latency metric record.
+type lastWrittenStatusEntry struct {
+	uid    types.UID
+	status *extensionsv1beta1.SandboxClaimStatus
+}
+
+// lastWrittenStatusMap is a type-safe wrapper around sync.Map that only stores
+// lastWrittenStatusEntry values. Growth is bounded by the number of live
+// claims: entries are evicted by the delete predicate and by the
+// claim-not-found fallback in Reconcile, mirroring observedTimes and
+// triggeredAdoptions.
+type lastWrittenStatusMap struct {
+	inner sync.Map
+}
+
+func (m *lastWrittenStatusMap) Load(key types.NamespacedName) (lastWrittenStatusEntry, bool) {
+	val, ok := m.inner.Load(key)
+	if !ok {
+		return lastWrittenStatusEntry{}, false
+	}
+	return val.(lastWrittenStatusEntry), true
+}
+
+func (m *lastWrittenStatusMap) Store(key types.NamespacedName, entry lastWrittenStatusEntry) {
+	m.inner.Store(key, entry)
+}
+
+func (m *lastWrittenStatusMap) Delete(key types.NamespacedName) {
+	m.inner.Delete(key)
+}
+
 // SandboxClaimReconciler reconciles a SandboxClaim object.
 type SandboxClaimReconciler struct {
 	client.Client
@@ -239,6 +276,7 @@ type SandboxClaimReconciler struct {
 	MaxConcurrentReconciles int
 	observedTimes           observedTimeMap
 	triggeredAdoptions      triggeredAdoptionMap
+	lastWrittenStatuses     lastWrittenStatusMap
 	AllowedLabelDomains     []string
 }
 
@@ -264,6 +302,7 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			// Fallback cleanup to prevent memory leaks if the delete predicate was missed or a stale request is processed.
 			r.observedTimes.Delete(req.NamespacedName)
 			r.triggeredAdoptions.Delete(req.NamespacedName)
+			r.lastWrittenStatuses.Delete(req.NamespacedName)
 			logger.V(1).Info("SandboxClaim not found, ignoring", "request", req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
@@ -337,6 +376,13 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	rvAtAnnotationStamp := claim.ResourceVersion
 
 	originalClaimStatus := claim.Status.DeepCopy()
+
+	// Snapshot BEFORE any status write of this pass whether this controller
+	// already wrote a Ready=True status for this claim. On an echo pass that
+	// read a stale (pre-Ready) claim from the cache, originalClaimStatus alone
+	// cannot tell a genuine Ready transition from a replay, and using it would
+	// re-record the Ready-latency histograms on every echo pass.
+	readyStatusAlreadyWritten := r.hasWrittenReadyStatus(claim)
 
 	// Check Expiration
 	// We calculate this upfront to decide the flow.
@@ -427,7 +473,7 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// Restore them so metric recording below and the flush patch still see them.
 	restoreStampedAnnotations(claim, stampedAnnotations)
 
-	r.recordCreationLatencyMetric(ctx, claim, originalClaimStatus, sandbox)
+	r.recordCreationLatencyMetric(ctx, claim, originalClaimStatus, sandbox, readyStatusAlreadyWritten)
 
 	// Persist observability/trace annotations if no earlier full-object write
 	// carried them. Done after the status patch so it never gates the claim's
@@ -720,6 +766,17 @@ func (r *SandboxClaimReconciler) reconcileExpired(ctx context.Context, claim *ex
 	return sandbox, nil
 }
 
+// hasWrittenReadyStatus reports whether the last status this controller
+// successfully wrote for the claim (same UID) already had Ready=True.
+func (r *SandboxClaimReconciler) hasWrittenReadyStatus(claim *extensionsv1beta1.SandboxClaim) bool {
+	entry, ok := r.lastWrittenStatuses.Load(types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace})
+	if !ok || entry.uid != claim.UID {
+		return false
+	}
+	ready := meta.FindStatusCondition(entry.status.Conditions, string(v1beta1.SandboxConditionReady))
+	return ready != nil && ready.Status == metav1.ConditionTrue
+}
+
 func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *extensionsv1beta1.SandboxClaimStatus, claim *extensionsv1beta1.SandboxClaim) error {
 	logger := log.FromContext(ctx)
 
@@ -740,6 +797,22 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 		return nil
 	}
 
+	// Echo-pass suppression: when the reconcile read a STALE claim from the
+	// informer cache (oldStatus predates our own last write), the recomputed
+	// status can differ from oldStatus while being identical to what this
+	// controller already persisted. Re-issuing the patch would be a no-op on
+	// the server but still spawns another watch event and thus another echo
+	// pass (observed as an echo storm of ~600 redundant status writes per
+	// 300-claim burst). Skip the patch when the computed status semantically
+	// equals the last status we successfully wrote for this claim UID.
+	key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+	if entry, ok := r.lastWrittenStatuses.Load(key); ok && entry.uid == claim.UID &&
+		equality.Semantic.DeepEqual(entry.status, &claim.Status) {
+		logger.V(4).Info("Skipping redundant sandboxclaim status patch: computed status equals last written status (stale cache echo)",
+			"name", claim.Name, "namespace", claim.Namespace)
+		return nil
+	}
+
 	oldClaim := claim.DeepCopy()
 	oldClaim.Status = *oldStatus
 
@@ -754,6 +827,10 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 		logger.Error(err, "Failed to patch sandboxclaim status")
 		return err
 	}
+
+	// Remember what was actually persisted (the patch refreshed claim.Status
+	// from the server response) so stale-cache echo passes can be recognized.
+	r.lastWrittenStatuses.Store(key, lastWrittenStatusEntry{uid: claim.UID, status: claim.Status.DeepCopy()})
 
 	logger.V(4).Info("Successfully patched sandboxclaim status",
 		"name", claim.Name,
@@ -2029,6 +2106,9 @@ func (r *SandboxClaimReconciler) getTimingPredicate() predicate.Funcs {
 			if ok && entry.uid == e.Object.GetUID() {
 				r.observedTimes.Delete(key)
 			}
+			if lastWritten, ok := r.lastWrittenStatuses.Load(key); ok && lastWritten.uid == e.Object.GetUID() {
+				r.lastWrittenStatuses.Delete(key)
+			}
 			return true
 		},
 	}
@@ -2210,11 +2290,17 @@ func (r *SandboxClaimReconciler) recordSandboxCreationLatency(sandbox *v1beta1.S
 }
 
 // recordCreationLatencyMetric detects and records transitions to Ready state.
+// readyAlreadyWritten must reflect whether this controller had already written
+// a Ready=True status for the claim BEFORE this reconcile pass: on echo passes
+// that read a stale (pre-Ready) claim from the cache, oldStatus alone would
+// misdetect a fresh Ready transition and re-record the latency histograms
+// (observed as ~3x observations per claim under a 300-claim burst).
 func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 	ctx context.Context,
 	claim *extensionsv1beta1.SandboxClaim,
 	oldStatus *extensionsv1beta1.SandboxClaimStatus,
 	sandbox *v1beta1.Sandbox,
+	readyAlreadyWritten bool,
 ) {
 	logger := log.FromContext(ctx)
 
@@ -2226,7 +2312,7 @@ func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 
 	// Do not record creation metric if we have already seen the ready state.
 	oldReady := meta.FindStatusCondition(oldStatus.Conditions, string(v1beta1.SandboxConditionReady))
-	if oldReady != nil && oldReady.Status == metav1.ConditionTrue {
+	if readyAlreadyWritten || (oldReady != nil && oldReady.Status == metav1.ConditionTrue) {
 		// Already Ready before this reconcile; drain any entry re-added by a post-Ready UpdateFunc.
 		key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
 		if entry, ok := r.observedTimes.Load(key); ok && entry.uid == claim.UID {
