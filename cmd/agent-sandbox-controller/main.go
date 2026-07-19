@@ -33,7 +33,10 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/felixge/fgprof"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/agent-sandbox/controllers"
@@ -43,6 +46,7 @@ import (
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	"sigs.k8s.io/agent-sandbox/internal/version"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -79,6 +83,8 @@ func main() {
 	var sandboxWarmPoolReplenishDelay time.Duration
 	var enableWarmPoolEviction bool
 	var disableClaimEvents bool
+	var disableClaimObservabilityAnnotations bool
+	var cacheLabelSelectors bool
 	var printVersion bool
 	var webhookPort int
 	var webhookCertDir string
@@ -139,6 +145,19 @@ func main() {
 	flag.BoolVar(&disableClaimEvents, "disable-claim-events", false,
 		"Disable Kubernetes Event emission from the SandboxClaim controller (hot-path Eventf calls become no-ops), "+
 			"reducing API server writes during large claim bursts.")
+	flag.BoolVar(&disableClaimObservabilityAnnotations, "disable-claim-observability-annotations", false,
+		"Skip the deferred SandboxClaim annotation flush (observability first-observed timestamp, trace context, "+
+			"assigned-sandbox hint). Removes one API write per claim; the annotations remain available in-memory for "+
+			"same-process metrics and trace propagation, and adoption crash recovery is unaffected (it uses the "+
+			"claim-UID label index on Sandboxes, not the annotation). Costs the on-object debugging breadcrumbs and, "+
+			"after a controller restart, the startup-latency metric for claims first observed by the previous process.")
+	flag.BoolVar(&cacheLabelSelectors, "cache-label-selectors", false,
+		"Scope the manager's Pod and Service informer caches to objects carrying the sandbox tracking label ("+
+			controllers.SandboxNameHashLabel+"). The controller only ever creates/looks up pods and Services it "+
+			"labeled itself, so on shared or high-churn clusters this cuts informer list/watch volume, JSON decode "+
+			"CPU, and cache memory from O(cluster) to O(sandboxes). CAVEAT: externally pre-provisioned resources "+
+			"that rely on the "+"agents.x-k8s.io/adoptable=true adoption path MUST also carry the tracking label "+
+			"(value = the owning sandbox's name hash) to remain visible to the controller when this flag is enabled.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -344,6 +363,34 @@ func main() {
 		LeaderElectionNamespace: leaderElectionNamespace,
 		LeaderElectionID:        "a3317529.agent-sandbox.x-k8s.io",
 	}
+	// Strip metadata.managedFields from every cached object (CRs included).
+	// Nothing in this repo reads managedFields, other writers inflate it (the
+	// kubelet server-side-applies pod status on every update), and every
+	// write here is either a merge patch diffed between two equally-stripped
+	// copies (managedFields can never appear in the diff) or an
+	// update/create, where an absent managedFields means "leave server-side
+	// field management unchanged". Pure decode-CPU/memory win.
+	mgrOpts.Cache.DefaultTransform = cache.TransformStripManagedFields()
+	// The Pod cache additionally drops the pod spec except spec.nodeName —
+	// the only spec field any controller reads (see PodCacheTransform).
+	mgrOpts.Cache.ByObject = map[client.Object]cache.ByObject{
+		&corev1.Pod{}: {Transform: controllers.PodCacheTransform},
+	}
+	if cacheLabelSelectors {
+		trackedOnly, err := labels.NewRequirement(controllers.SandboxNameHashLabel, selection.Exists, nil)
+		if err != nil {
+			setupLog.Error(err, "unable to build cache label selector")
+			os.Exit(1)
+		}
+		sel := labels.NewSelector().Add(*trackedOnly)
+		mgrOpts.Cache.ByObject[&corev1.Pod{}] = cache.ByObject{
+			Label:     sel,
+			Transform: controllers.PodCacheTransform,
+		}
+		mgrOpts.Cache.ByObject[&corev1.Service{}] = cache.ByObject{Label: sel}
+		setupLog.Info("informer caches for Pods and Services scoped to the sandbox tracking label (--cache-label-selectors)",
+			"label", controllers.SandboxNameHashLabel)
+	}
 	if watchHTTPClient != nil {
 		// The manager cache builds its list/watch REST clients from this
 		// http.Client (RESTClientForConfigAndClient), bypassing restConfig's
@@ -412,13 +459,18 @@ func main() {
 			claimRecorder = mgr.GetEventRecorder("sandboxclaim-controller")
 		}
 
+		if disableClaimObservabilityAnnotations {
+			setupLog.Info("SandboxClaim observability annotation flush disabled (--disable-claim-observability-annotations)")
+		}
+
 		if err = (&extensionscontrollers.SandboxClaimReconciler{
-			Client:              mgr.GetClient(),
-			Scheme:              mgr.GetScheme(),
-			WarmSandboxQueue:    warmSandboxQueue,
-			Recorder:            claimRecorder,
-			Tracer:              instrumenter,
-			AllowedLabelDomains: allowedDomains,
+			Client:                          mgr.GetClient(),
+			Scheme:                          mgr.GetScheme(),
+			WarmSandboxQueue:                warmSandboxQueue,
+			Recorder:                        claimRecorder,
+			Tracer:                          instrumenter,
+			AllowedLabelDomains:             allowedDomains,
+			DisableObservabilityAnnotations: disableClaimObservabilityAnnotations,
 		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
 			os.Exit(1)

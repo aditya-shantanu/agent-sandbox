@@ -48,12 +48,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	uberzap "go.uber.org/zap"
 	v1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	"sigs.k8s.io/agent-sandbox/internal/lifecycle"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
+	"sigs.k8s.io/agent-sandbox/internal/rawpatch"
 )
 
 const ObservabilityAnnotation = "agents.x-k8s.io/controller-first-observed-at"
@@ -224,8 +226,26 @@ func (m *triggeredAdoptionMap) Delete(key types.NamespacedName) {
 // can record their segments without signature changes, and Reconcile can emit
 // a single debug summary line per adoption.
 type adoptionTrace struct {
-	start    time.Time
-	queueLat time.Duration // claim creationTimestamp -> reconcile entry
+	start time.Time
+	// queueLat is the wait between the controller first RECEIVING the claim
+	// on its watch stream (recorded by getTimingPredicate ->
+	// getOrRecordObservedTime, monotonic clock) and entry into the pass that
+	// performs the adoption. It therefore includes workqueue wait plus any
+	// earlier non-adopting passes and bounded requeues — the full
+	// "controller saw it -> winning pass" gap.
+	//
+	// HISTORY (round-3 instrumentation bug): this used to be computed from
+	// claim.CreationTimestamp, which the API server truncates to 1-SECOND
+	// resolution — burst claims created at t+0.85s reported ~850ms of
+	// phantom queue latency (round-3 leg B: reported queueLat p50 1025ms vs
+	// 33ms true wait from watch-stream forensics). CreationTimestamp-based
+	// latency is kept separately in sinceCreation, clearly labeled.
+	queueLat time.Duration
+	// sinceCreation is claim CreationTimestamp -> pass entry. Server clock,
+	// 1-SECOND resolution: up to ±1s of error. Only useful as a coarse
+	// cross-check against client-side end-to-end numbers; never subtract
+	// segments from it.
+	sinceCreation time.Duration
 
 	popDur time.Duration // cumulative candidate pop+verify (getCandidate)
 	// updateDur was the claim Update that recorded the adoption before the
@@ -356,6 +376,15 @@ type SandboxClaimReconciler struct {
 	lastWrittenStatuses     lastWrittenStatusMap
 	coldStartDeferrals      coldStartDeferralMap
 	AllowedLabelDomains     []string
+	// DisableObservabilityAnnotations skips the deferred post-status
+	// annotation flush write (observability first-observed timestamp, trace
+	// context, assigned-sandbox hint), removing one API write per claim.
+	// Annotations are still stamped in-memory for same-pass consumers (span
+	// attributes, trace propagation to the Sandbox, latency metrics via the
+	// observedTimes map); crash recovery of the adoption binding never used
+	// the annotation (it uses the claim-UID label index). Wired to
+	// --disable-claim-observability-annotations.
+	DisableObservabilityAnnotations bool
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;update;patch;delete
@@ -394,30 +423,44 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// allocates its zap fields when V(1) is enabled. The cold-start
 	// fallthrough line (see reconcileActive) reads the same trace so its
 	// reason/counters are available at any log level.
+	reconcileEntry := time.Now()
 	trace := &adoptionTrace{
-		start:    time.Now(),
-		queueLat: time.Since(claim.CreationTimestamp.Time),
+		start: reconcileEntry,
+		// Watch-receive -> pass entry (see the adoptionTrace field docs;
+		// getTimingPredicate recorded the watch-receive instant before the
+		// key was enqueued, so this is a pure monotonic-clock delta).
+		queueLat:      reconcileEntry.Sub(r.getOrRecordObservedTime(claim)),
+		sinceCreation: reconcileEntry.Sub(claim.CreationTimestamp.Time),
 	}
 	ctx = withAdoptionTrace(ctx, trace)
 	defer func() {
 		// One summary line per completed adoption transaction:
 		// grep '"adoption timing"' | jq for post-run analysis.
+		// Emitted through adoptionTimingLog — a dedicated NON-SAMPLED zap
+		// core — because the controller-runtime production logger samples
+		// each message to 100/second: round-3 leg B silently dropped 76/300
+		// timing lines at the burst peak (~2100 log lines/s), biasing every
+		// log-derived quantile toward the fast cohort. Gated on the same
+		// V(1) debug enablement as before.
 		if trace.adopted == "" || !logger.V(1).Enabled() {
 			return
 		}
-		logger.V(1).Info("adoption timing",
-			"claim", req.NamespacedName.String(),
-			"sandbox", trace.adopted,
-			"queueLatMs", durationMs(trace.queueLat),
-			"popMs", durationMs(trace.popDur),
-			"updateMs", durationMs(trace.updateDur),
-			"patchMs", durationMs(trace.completeDur),
-			"statusMs", durationMs(trace.statusDur),
-			"annotationFlushMs", durationMs(trace.flushDur),
-			"totalMs", durationMs(time.Since(trace.start)),
-			"candidatesPopped", trace.popped,
-			"candidatesRejected", trace.rejected,
-			"attempts", trace.attempts,
+		adoptionTimingLog.Info("adoption timing",
+			uberzap.String("claim", req.NamespacedName.String()),
+			uberzap.String("namespace", req.Namespace),
+			uberzap.String("name", req.Name),
+			uberzap.String("sandbox", trace.adopted),
+			uberzap.Float64("queueLatMs", durationMs(trace.queueLat)),
+			uberzap.Float64("sinceCreationMs", durationMs(trace.sinceCreation)),
+			uberzap.Float64("popMs", durationMs(trace.popDur)),
+			uberzap.Float64("updateMs", durationMs(trace.updateDur)),
+			uberzap.Float64("patchMs", durationMs(trace.completeDur)),
+			uberzap.Float64("statusMs", durationMs(trace.statusDur)),
+			uberzap.Float64("annotationFlushMs", durationMs(trace.flushDur)),
+			uberzap.Float64("totalMs", durationMs(time.Since(trace.start))),
+			uberzap.Int("candidatesPopped", trace.popped),
+			uberzap.Int("candidatesRejected", trace.rejected),
+			uberzap.Int("attempts", trace.attempts),
 		)
 	}()
 
@@ -544,11 +587,13 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// transition (crash recovery of the binding is covered by the claim-UID
 	// label List in getOrCreateSandbox).
 	flushAnnotations := make(map[string]string, len(stampedAnnotations)+1)
-	if len(stampedAnnotations) > 0 && claim.ResourceVersion == rvAtAnnotationStamp {
-		maps.Copy(flushAnnotations, stampedAnnotations)
-	}
-	if trace.assignedPending != "" {
-		flushAnnotations[extensionsv1beta1.AssignedSandboxNameAnnotation] = trace.assignedPending
+	if !r.DisableObservabilityAnnotations {
+		if len(stampedAnnotations) > 0 && claim.ResourceVersion == rvAtAnnotationStamp {
+			maps.Copy(flushAnnotations, stampedAnnotations)
+		}
+		if trace.assignedPending != "" {
+			flushAnnotations[extensionsv1beta1.AssignedSandboxNameAnnotation] = trace.assignedPending
+		}
 	}
 
 	if updateErr := r.updateStatus(ctx, originalClaimStatus, claim); updateErr != nil {
@@ -680,13 +725,20 @@ func restoreStampedAnnotations(claim *extensionsv1beta1.SandboxClaim, stamped ma
 // persistStampedAnnotations sends a merge patch containing only the annotations
 // stamped in-memory by stampAnnotations that were not persisted by another write
 // during this reconcile.
+//
+// The payload is built directly with rawpatch instead of the historical
+// DeepCopy+MergeFrom pattern: MergeFrom serialized the whole claim twice and
+// diffed the two documents to emit this exact same
+// {"metadata":{"annotations":{...}}} body (measured at 15.8% of controller
+// CPU in the round-2 burst profile). rawpatch's unit tests pin
+// byte-equivalence with MergeFrom for metadata-only set mutations.
 func (r *SandboxClaimReconciler) persistStampedAnnotations(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, stamped map[string]string) error {
-	base := claim.DeepCopy()
-	for key := range stamped {
-		delete(base.Annotations, key)
+	patch, err := rawpatch.Annotations(stamped)
+	if err != nil {
+		return err
 	}
 	restoreStampedAnnotations(claim, stamped)
-	return r.Patch(ctx, claim, client.MergeFrom(base))
+	return r.Patch(ctx, claim, patch)
 }
 
 // checkExpiration calculates if the claim is expired and how much time is left.
@@ -2320,7 +2372,13 @@ func (r *SandboxClaimReconciler) initializeSandboxLaunchTypeLabel(ctx context.Co
 		}
 	}
 
-	patch := client.MergeFrom(sandbox.DeepCopy())
+	// Raw single-label merge patch: byte-identical to what
+	// DeepCopy+MergeFrom computed here, without serializing the whole
+	// sandbox twice to diff out one label (see internal/rawpatch).
+	patch, err := rawpatch.Labels(map[string]string{v1beta1.SandboxLaunchTypeLabel: launchType})
+	if err != nil {
+		return err
+	}
 	if sandbox.Labels == nil {
 		sandbox.Labels = make(map[string]string)
 	}

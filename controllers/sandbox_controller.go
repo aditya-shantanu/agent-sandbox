@@ -44,16 +44,50 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
+	"sigs.k8s.io/agent-sandbox/internal/rawpatch"
 )
 
 const (
 	sandboxLabel = "agents.x-k8s.io/sandbox-name-hash"
+	// SandboxNameHashLabel is the tracking label the controller stamps on
+	// every Pod and Service it creates or adopts. Exported so the manager
+	// setup (cmd/agent-sandbox-controller) can scope the pod/Service informer
+	// caches to labeled objects (--cache-label-selectors).
+	SandboxNameHashLabel = sandboxLabel
 	// podSandboxNameHashIndex is the cache field index over the sandboxLabel
 	// value on Pods, so per-reconcile pod lookups are O(1).
 	podSandboxNameHashIndex     = ".metadata.labels[" + sandboxLabel + "]"
 	sandboxControllerFieldOwner = "sandbox-controller"
 	immediateRequeueDelay       = time.Millisecond
 )
+
+// PodCacheTransform is a client-go informer transform for the manager's Pod
+// cache. It strips fields the controllers never read, before the object is
+// stored, so cache memory and per-event JSON decode garbage stay O(what we
+// use) instead of O(pod spec):
+//
+//   - metadata.managedFields: written via server-side apply by the kubelet on
+//     every status update and never read by any controller here.
+//   - spec: the only spec field any controller reads is spec.nodeName
+//     (Sandbox status propagation). The pod spec the controller WRITES is
+//     built from the Sandbox's PodTemplate (newPodForCR), never from the
+//     cached pod, and every pod write in this repo is a metadata-only merge
+//     patch diffed against the same transformed cache object — stripped
+//     fields appear on neither side of the diff, so they can never leak into
+//     (or be deleted by) a patch. See TestPodCacheTransformMergePatchUnaffected.
+//
+// metadata (labels/annotations/ownerRefs) and status are kept in full.
+// Non-pod inputs (e.g. cache.DeletedFinalStateUnknown tombstones) pass
+// through unchanged.
+func PodCacheTransform(obj any) (any, error) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return obj, nil
+	}
+	pod.ManagedFields = nil
+	pod.Spec = corev1.PodSpec{NodeName: pod.Spec.NodeName}
+	return pod, nil
+}
 
 // resourceOwnership represents the ownership state of a Kubernetes resource relative to a Sandbox.
 type resourceOwnership int
@@ -844,7 +878,13 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			return nil
 		}
 
-		patch := client.MergeFrom(sandbox.DeepCopy())
+		// Raw single-annotation merge patch: byte-identical to what
+		// DeepCopy+MergeFrom computed here, without serializing the whole
+		// sandbox twice to diff out one annotation (see internal/rawpatch).
+		patch, err := rawpatch.Annotations(map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: podName})
+		if err != nil {
+			return fmt.Errorf("failed to build pod name annotation patch: %w", err)
+		}
 		if sandbox.Annotations == nil {
 			sandbox.Annotations = make(map[string]string)
 		}
