@@ -44,6 +44,10 @@ type stressTest struct {
 	// profiler captures apiserver CPU profiles during throughput levels
 	// (nil when --profile-apiserver is false).
 	profiler *apiserverProfiler
+	// ctrlProfiler captures controller CPU/heap profiles during the
+	// claims-warm burst (nil when --profile-controller is false or the
+	// phase does not run).
+	ctrlProfiler *controllerProfiler
 }
 
 // buildSandboxObject returns a minimal long-running Sandbox.
@@ -483,6 +487,20 @@ func (s *stressTest) runClaimsWarmPhase(ctx context.Context, number PhaseNumber)
 	// single channel close so the creates hit the apiserver as close to
 	// simultaneously as the client allows (rate limiting is disabled).
 	log.Printf("[%s#%d] firing %d claims simultaneously", PhaseClaimsWarm, number, count)
+
+	// Profile the burst itself, not the aftermath: the controller CPU
+	// profile window opens right as claim creation begins (the adoption
+	// transaction is over within the first seconds), with heap snapshots
+	// bracketing the burst. The apiserver profile runs over the same window
+	// to correlate server-side cost. All best-effort.
+	if s.ctrlProfiler != nil {
+		go s.ctrlProfiler.CaptureCPUProfile(ctx, PhaseClaimsWarm, 0, 15*time.Second)
+		go s.ctrlProfiler.CaptureHeapProfile(ctx, PhaseClaimsWarm, "burst-start")
+	}
+	if s.profiler != nil {
+		go s.profiler.CaptureCPUProfile(ctx, PhaseClaimsWarm, 0, 15*time.Second)
+	}
+
 	release := make(chan struct{})
 	var wg sync.WaitGroup
 	for _, id := range ids {
@@ -507,6 +525,11 @@ func (s *stressTest) runClaimsWarmPhase(ctx context.Context, number PhaseNumber)
 		if counts.Ready >= counts.Created {
 			log.Printf("[%s#%d] all %d created claims are Ready (%d failed to create)",
 				PhaseClaimsWarm, number, counts.Created, counts.Failed)
+			if s.ctrlProfiler != nil {
+				// Post-burst heap snapshot: diff against burst-start to see
+				// what the adoption path allocated/retained.
+				s.ctrlProfiler.CaptureHeapProfile(ctx, PhaseClaimsWarm, "burst-end")
+			}
 			return nil
 		}
 		if counts.Ready != lastReady {
