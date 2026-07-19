@@ -41,6 +41,25 @@
 # single flow (one ServiceAccount), so shuffle-sharding width is irrelevant;
 # deep queueLengthLimit absorbs the write storm without rejections.
 #
+# ROUND-4 MEASUREMENT + RESIZING NOTE: the "order of magnitude above the
+# adoption path's needs" claim above did NOT hold at 300 simultaneous claims.
+# Round-3 leg B (e77ad2e) measured, during the burst window:
+#   - agent-sandbox-critical: nominal 78 seats, demand high-watermark 272
+#     seats, APF wait p50 3.2ms / p90 63ms / p99 359ms (4,362 requests);
+#   - agent-sandbox-bulk: nominal 49 seats, demand high-watermark 100,
+#     wait p90 210ms / p99 471ms.
+# i.e. our own priority levels were the queueing point. The shares are
+# fractions of the server-wide seat total (--max-requests-inflight +
+# --max-mutating-requests-inflight), so the fix is raising the SERVER limits,
+# not editing this file: with the benchmark harness's TUNE_CONTROL_PLANE=true
+# (3000 read + 1000 mutating = 4000 seats), critical scales to
+# 40/310 x 4000 ~= 516 seats and bulk to ~322 — both above the measured
+# demand watermarks with 2x headroom. Re-derive whenever the server limits
+# change: seats(level) = shares(level) / sum(all levels' shares) x
+# (max-requests-inflight + max-mutating-requests-inflight); keep
+# seats(critical) >= ~2x the demand-seats high watermark observed at the
+# target claim rate (apiserver_flowcontrol_demand_seats_high_watermark).
+#
 # The BENCHMARK CLIENT (test/stress) needs no FlowSchema: the kops-exported
 # admin kubeconfig (`kops export kubeconfig --admin`) carries a client cert
 # with O=system:masters, which matches the mandatory `exempt` FlowSchema —

@@ -177,6 +177,41 @@ CONTROLLER_ARGS="${CONTROLLER_ARGS:-}"
 # verbosity raised above.
 INSTRUMENT_CLUSTER="${INSTRUMENT_CLUSTER:-false}"
 
+# CP_MACHINE_TYPE (default n2-standard-8) sets the control-plane instance
+# size. Round-3 forensics measured the apiserver's own request EXECUTION time
+# inflating ~3-10x during the 300-claim burst (apf execution p50 86ms / p90
+# 321ms for the agent-sandbox-critical priority level vs ~30ms quiescent etcd
+# commits) — the control-plane box is CPU-bound at burst peak. Larger types
+# (n2-standard-16/32) are needed for the 500-1000 claims/s targets.
+CP_MACHINE_TYPE="${CP_MACHINE_TYPE:-n2-standard-8}"
+
+# TUNE_CONTROL_PLANE=true (default false, INSTRUMENT_CLUSTER-style opt-in)
+# raises the control-plane component limits that round-3 identified as the
+# burst throughput governors. Applied only at cluster CREATION time (same
+# limitation as INSTRUMENT_CLUSTER: reused clusters keep their settings).
+#
+#   kube-apiserver seats: --max-mutating-requests-inflight defaults to 200
+#     and --max-requests-inflight to 400 → 600 APF seats total. Our two
+#     dedicated priority levels (k8s/apf-insulation.yaml) get shares of that
+#     total: agent-sandbox-critical 40/310 ≈ 78 seats — and round-3 leg B
+#     measured a demand high-watermark of 272 seats against those 78 during
+#     the burst (APF wait p90 63ms / p99 359ms on our own PL). Raising to
+#     1000 mutating / 3000 read-only gives 4000 seats; the PL shares are
+#     FRACTIONS, so critical scales to ~516 seats and bulk to ~322 with no
+#     manifest change (see the sizing note in k8s/apf-insulation.yaml).
+#   kube-scheduler QPS: default 50/100 caps pod-refill throughput; 800/1600
+#     keeps the scheduler off the critical path at 1000 pods/s of pool churn.
+#   kube-controller-manager QPS: default 20 makes the EndpointSlice and GC
+#     controllers fall behind per-sandbox Service churn by design; 200/400
+#     keeps teardown/refill from backlogging into the next burst.
+#
+# etcd note: kops already provisions SEPARATE main and events etcd clusters
+# by default (etcd-events), so the "--etcd-servers-overrides=/events#..."
+# split from the scale roadmap is in place without extra flags here. Further
+# splits (pods / our CR groups onto more etcd clusters) need cluster-spec
+# surgery and are deliberately out of scope for this knob.
+TUNE_CONTROL_PLANE="${TUNE_CONTROL_PLANE:-false}"
+
 if [[ -z "${EXISTING_CLUSTER:-}" ]]; then
 
 echo "Creating kOps cluster configuration..."
@@ -211,6 +246,19 @@ if [[ "${INSTRUMENT_CLUSTER}" == "true" ]]; then
     echo "INSTRUMENT_CLUSTER=true: raising kube-apiserver log verbosity to 3"
     INSTRUMENT_KOPS_FLAGS+=("--set" "cluster.spec.kubeAPIServer.logLevel=3")
 fi
+TUNE_KOPS_FLAGS=()
+if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
+    # See the TUNE_CONTROL_PLANE comment above for the sizing rationale.
+    echo "TUNE_CONTROL_PLANE=true: raising apiserver inflight limits and scheduler/KCM client QPS"
+    TUNE_KOPS_FLAGS+=(
+      "--set" "cluster.spec.kubeAPIServer.maxRequestsInflight=3000"
+      "--set" "cluster.spec.kubeAPIServer.maxMutatingRequestsInflight=1000"
+      "--set" "cluster.spec.kubeScheduler.kubeAPIQPS=800"
+      "--set" "cluster.spec.kubeScheduler.kubeAPIBurst=1600"
+      "--set" "cluster.spec.kubeControllerManager.kubeAPIQPS=200"
+      "--set" "cluster.spec.kubeControllerManager.kubeAPIBurst=400"
+    )
+fi
 kops create cluster \
   --cloud=gce \
   --gce-service-account=default \
@@ -219,7 +267,7 @@ kops create cluster \
   --zones="${ZONE}" \
   --project="${PROJECT_ID}" \
   --control-plane-count=1 \
-  --control-plane-size=n2-standard-8 \
+  --control-plane-size="${CP_MACHINE_TYPE}" \
   --node-count="${NODE_COUNT}" \
   --node-size=n2-standard-8 \
   --set cluster.spec.kubeControllerManager.authorizationAlwaysAllowPaths=/healthz \
@@ -231,7 +279,8 @@ kops create cluster \
   --set cluster.spec.kubeScheduler.authorizationAlwaysAllowPaths=/livez \
   --set cluster.spec.kubeScheduler.authorizationAlwaysAllowPaths=/metrics \
   ${CNI_KOPS_FLAGS[@]+"${CNI_KOPS_FLAGS[@]}"} \
-  ${INSTRUMENT_KOPS_FLAGS[@]+"${INSTRUMENT_KOPS_FLAGS[@]}"}
+  ${INSTRUMENT_KOPS_FLAGS[@]+"${INSTRUMENT_KOPS_FLAGS[@]}"} \
+  ${TUNE_KOPS_FLAGS[@]+"${TUNE_KOPS_FLAGS[@]}"}
 
 echo "Applying cluster configuration..."
 kops update cluster --name "${CLUSTER_NAME}" --yes
@@ -276,6 +325,10 @@ else
   if [[ "${INSTRUMENT_CLUSTER}" == "true" ]]; then
     echo "NOTE: INSTRUMENT_CLUSTER=true only raises apiserver verbosity at cluster creation;"
     echo "the reused cluster keeps whatever verbosity it was created with (apiserver log capture still runs)."
+  fi
+  if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
+    echo "NOTE: TUNE_CONTROL_PLANE=true only applies at cluster creation; the reused cluster"
+    echo "keeps its original apiserver inflight limits and scheduler/KCM QPS settings."
   fi
   kops export kubeconfig --name "${CLUSTER_NAME}" --admin
 fi
