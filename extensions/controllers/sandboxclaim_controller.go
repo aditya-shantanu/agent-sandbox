@@ -188,6 +188,47 @@ func (m *triggeredAdoptionMap) Delete(key types.NamespacedName) {
 	m.inner.Delete(key)
 }
 
+// adoptionTrace accumulates per-segment durations and candidate-selection
+// counters for the warm-pool adoption transaction of a single reconcile pass.
+// It is carried through the reconcile call chain via the context (one struct
+// per reconcile, never shared across goroutines) so the deep adoption helpers
+// can record their segments without signature changes, and Reconcile can emit
+// a single debug summary line per adoption.
+type adoptionTrace struct {
+	start    time.Time
+	queueLat time.Duration // claim creationTimestamp -> reconcile entry
+
+	popDur      time.Duration // cumulative candidate pop+verify (getCandidate)
+	updateDur   time.Duration // claim Update recording the adoption
+	completeDur time.Duration // completeAdoption sandbox Patch
+	statusDur   time.Duration // claim status Patch
+
+	adopted    string // sandbox name once an adoption patch was sent this pass
+	popped     int    // candidates popped from the warm queue
+	rejected   int    // candidates rejected (ghost / failed verification)
+	lastReject string // reason of the last rejection
+	attempts   int    // adoption transactions attempted (candidate found)
+	bypassed   bool   // warm pool bypassed due to claim env/volumeClaimTemplates
+}
+
+type adoptionTraceKey struct{}
+
+func withAdoptionTrace(ctx context.Context, t *adoptionTrace) context.Context {
+	return context.WithValue(ctx, adoptionTraceKey{}, t)
+}
+
+// adoptionTraceFrom returns the reconcile's adoptionTrace, or nil when the
+// helper is called outside Reconcile (e.g. directly from tests).
+func adoptionTraceFrom(ctx context.Context) *adoptionTrace {
+	t, _ := ctx.Value(adoptionTraceKey{}).(*adoptionTrace)
+	return t
+}
+
+// durationMs renders a duration as fractional milliseconds for log fields.
+func durationMs(d time.Duration) float64 {
+	return float64(d.Nanoseconds()) / 1e6
+}
+
 // SandboxClaimReconciler reconciles a SandboxClaim object.
 type SandboxClaimReconciler struct {
 	client.Client
@@ -228,6 +269,38 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to get sandbox claim %q: %w", req.NamespacedName, err)
 	}
+
+	// Per-reconcile adoption phase timing. The trace struct is a single small
+	// allocation and the segment timers are bare time.Now() reads, so the cost
+	// is negligible when debug logging is off; the summary line below only
+	// allocates its zap fields when V(1) is enabled. The cold-start
+	// fallthrough line (see reconcileActive) reads the same trace so its
+	// reason/counters are available at any log level.
+	trace := &adoptionTrace{
+		start:    time.Now(),
+		queueLat: time.Since(claim.CreationTimestamp.Time),
+	}
+	ctx = withAdoptionTrace(ctx, trace)
+	defer func() {
+		// One summary line per completed adoption transaction:
+		// grep '"adoption timing"' | jq for post-run analysis.
+		if trace.adopted == "" || !logger.V(1).Enabled() {
+			return
+		}
+		logger.V(1).Info("adoption timing",
+			"claim", req.NamespacedName.String(),
+			"sandbox", trace.adopted,
+			"queueLatMs", durationMs(trace.queueLat),
+			"popMs", durationMs(trace.popDur),
+			"updateMs", durationMs(trace.updateDur),
+			"patchMs", durationMs(trace.completeDur),
+			"statusMs", durationMs(trace.statusDur),
+			"totalMs", durationMs(time.Since(trace.start)),
+			"candidatesPopped", trace.popped,
+			"candidatesRejected", trace.rejected,
+			"attempts", trace.attempts,
+		)
+	}()
 
 	// Unconditionally clean up legacy per-claim NetworkPolicies.
 	// We log the error but do not block the main reconcile flow so
@@ -578,6 +651,33 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 	// Cold path: no existing sandbox or warm pool candidate.
 	// Need template to create from scratch.
 	logger.V(1).Info("Cold path: no sandbox found, creating from template", "claim", claim.Name)
+
+	// A single, always-on line explaining WHY this claim fell through to a
+	// cold start; grep '"falling through to cold start"' post-run. Warm-pool
+	// misses during a claims burst are otherwise hard to diagnose.
+	if trace := adoptionTraceFrom(ctx); trace != nil {
+		reason := "no adoptable candidate"
+		switch {
+		case trace.bypassed:
+			reason = "claim env/volumeClaimTemplates set; warm pool bypassed"
+		case trace.popped == 0:
+			reason = "warm pool queue empty"
+		case trace.attempts > 0:
+			reason = "adoption attempts exhausted (conflict/notfound races)"
+		case trace.rejected > 0:
+			reason = "all candidates rejected"
+		}
+		logger.Info("claim falling through to cold start",
+			"claim", claim.Name,
+			"warmPool", claim.Spec.WarmPoolRef.Name,
+			"reason", reason,
+			"candidatesPopped", trace.popped,
+			"candidatesRejected", trace.rejected,
+			"lastRejectionReason", trace.lastReject,
+			"adoptionAttempts", trace.attempts,
+		)
+	}
+
 	template, templateErr := r.getTemplate(ctx, claim)
 	if templateErr != nil {
 		return nil, templateErr
@@ -645,7 +745,12 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 
 	patch := client.MergeFrom(oldClaim)
 
-	if err := r.Status().Patch(ctx, claim, patch); err != nil {
+	statusStart := time.Now()
+	err := r.Status().Patch(ctx, claim, patch)
+	if trace := adoptionTraceFrom(ctx); trace != nil {
+		trace.statusDur += time.Since(statusStart)
+	}
+	if err != nil {
 		logger.Error(err, "Failed to patch sandboxclaim status")
 		return err
 	}
@@ -937,6 +1042,8 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 		return unscheduledKeys[0], true
 	}
 
+	trace := adoptionTraceFrom(ctx)
+
 	for {
 		adoptedKey, ok := r.WarmSandboxQueue.GetWithStrategy(namespacedWarmPoolName, pickSmart)
 		if !ok {
@@ -947,6 +1054,9 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 			}
 			return nil, queue.SandboxKey{}, nil
 		}
+		if trace != nil {
+			trace.popped++
+		}
 
 		adopted := &v1beta1.Sandbox{}
 		err := r.Get(ctx, client.ObjectKey{Namespace: adoptedKey.Namespace, Name: adoptedKey.Name}, adopted)
@@ -954,6 +1064,10 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 			if k8errors.IsNotFound(err) {
 				// Ghost Pod detected: It was deleted from the cluster but was still in our queue.
 				// Ignore it and instantly pop the next one.
+				if trace != nil {
+					trace.rejected++
+					trace.lastReject = "sandbox no longer exists (ghost queue entry)"
+				}
 				continue
 			}
 			// For real errors, put the key back in line and error out
@@ -963,6 +1077,10 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 
 		if err := verifySandboxCandidate(adopted, claim); err != nil {
 			logger.V(1).Info("sandbox candidate can't be adopted", "sandbox", adopted.Name, "warmPool", claim.Spec.WarmPoolRef.Name, "reason", err.Error())
+			if trace != nil {
+				trace.rejected++
+				trace.lastReject = err.Error()
+			}
 			// If it is a good sandbox in the wrong namespace, put it back.
 			// (Though pickSmart makes this impossible, we keep it for safety).
 			if errors.Is(err, ErrCrossNamespaceAdoption) {
@@ -991,17 +1109,25 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 
 func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) (*v1beta1.Sandbox, error) {
 	logger := log.FromContext(ctx)
+	trace := adoptionTraceFrom(ctx)
 	namespacedWarmPoolNameForQueue := queue.GetNamespacedWarmPoolName(claim.Namespace, claim.Spec.WarmPoolRef.Name)
 
 	// Keep trying until we successfully adopt a sandbox, or run out of candidates
 	for range 3 {
+		popStart := time.Now()
 		adopted, adoptedKey, err := r.getCandidate(ctx, claim)
+		if trace != nil {
+			trace.popDur += time.Since(popStart)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if adopted == nil {
 			logger.Info("Failed to adopt any sandbox after checking all candidates", "claim", claim.Name)
 			return nil, nil // Warm pool is truly empty, fall completely to cold start
+		}
+		if trace != nil {
+			trace.attempts++
 		}
 
 		// Wrap the API logic in a closure
@@ -1025,7 +1151,12 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			// concurrency guarantee with a smaller payload, but its diff base
 			// would already contain the stamped annotations and silently drop
 			// them from the payload.
-			if err := r.Update(ctx, claim); err != nil {
+			updateStart := time.Now()
+			err := r.Update(ctx, claim)
+			if trace != nil {
+				trace.updateDur += time.Since(updateStart)
+			}
+			if err != nil {
 				r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
 				if k8errors.IsConflict(err) {
 					// Conflict means our copy of the claim is stale. Retrying the
@@ -1053,6 +1184,9 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			}
 
 			logger.Info("Successfully adopted sandbox from warm pool", "sandbox", adopted.Name, "claim", claim.Name)
+			if trace != nil {
+				trace.adopted = adopted.Name
+			}
 
 			// Record the completed adoption so a later pass that still sees the
 			// stale warm-pool-owned view (informer cache lag) waits via the
@@ -1184,7 +1318,12 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 		}
 	}
 
-	if err := r.Patch(ctx, adopted, client.MergeFrom(originalAdopted)); err != nil {
+	patchStart := time.Now()
+	err := r.Patch(ctx, adopted, client.MergeFrom(originalAdopted))
+	if trace := adoptionTraceFrom(ctx); trace != nil {
+		trace.completeDur += time.Since(patchStart)
+	}
+	if err != nil {
 		return err
 	}
 
@@ -1705,6 +1844,12 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 						}
 					} else {
 						r.triggeredAdoptions.Store(adoptionKey, triggeredAdoptionEntry{uid: claim.UID, sandbox: sbName})
+						if trace := adoptionTraceFrom(ctx); trace != nil {
+							// Adoption completed via the assigned-sandbox
+							// annotation (claim Update happened on an earlier
+							// pass, so updateMs is 0 on this pass).
+							trace.adopted = sbName
+						}
 						if fromLabel {
 							if err := r.migrateLegacyAssignedSandboxLabel(ctx, claim, sbName); err != nil {
 								logger.Error(err, "Failed to migrate legacy sandbox label to annotation during adoption completion", "claim", claim.Name)
@@ -1772,6 +1917,9 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 	// If len(claim.Spec.Env) > 0 or len(claim.Spec.VolumeClaimTemplates) > 0, the controller immediately bypasses the warm pool queue.
 	if len(claim.Spec.Env) > 0 || len(claim.Spec.VolumeClaimTemplates) > 0 {
 		logger.Info("Bypassing warm pool adoption because custom configuration is provided (env or volume claim templates)", "claim", claim.Name)
+		if trace := adoptionTraceFrom(ctx); trace != nil {
+			trace.bypassed = true
+		}
 		return nil, nil
 	}
 
