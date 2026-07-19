@@ -187,3 +187,17 @@ Round-3 levers (design items from ROUND2-FINDINGS.md, now data-confirmed):
 2. Raise the in-flight ceiling (HTTP/2 transport sharding / MaxConcurrentStreams).
 Both attack the 617ms in-pass cost and the pipeline depth directly.
 Full-pool A vs B artifacts: gs://kops-state-142966328212/perf-bench-results/round2/
+
+## 2026-07-19 — ROUND-3 A/B VERDICT (same cluster sandbox-20260719-053456)
+
+Leg A (round-2 stack @838427e): p50 1554 / p90 2479 / p99 2940 / all-ready 3.85s.
+Leg B (round-3 @e77ad2e: watch/write split + 4-way sharding + 2-write adoption
++ APF): **p50 966 / p90 1740 / p99 2582 / max 2624 / all-ready 2.62s**,
+300/300, smoke floor 57ms. Overall ready throughput 124.8/s.
+
+Round-3 gains vs round-2: p50 −38%, p90 −30%, all-ready −32%.
+**Cumulative vs original baseline: p90 5.55s→1.74s (3.2×), p99 19.1s→2.58s
+(7.4×), all-ready 20.25s→2.62s (7.7×), zero cold starts / conflicts / waste.**
+Segment decomposition + rest_client/APF verification: TODO from
+round3/B-round3 artifacts (controller.log, metrics.jsonl.gz) — next session.
+Round-4 agenda: SCALE-ROADMAP.md R4.1-R4.7 + sustained-rate phase at 500/s.
