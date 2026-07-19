@@ -426,7 +426,8 @@ go run ./test/stress \
   --claims-warm-count="${STRESS_CLAIMS_WARM:-300}" \
   --create-concurrency="${STRESS_CREATE_CONCURRENCY:-50}" \
   --timeout="${STRESS_TIMEOUT:-30m}" \
-  --output-dir="${STRESS_OUTPUT_DIR}"
+  --output-dir="${STRESS_OUTPUT_DIR}" \
+  ${STRESS_EXTRA_ARGS:-}
 stress_status=$?
 set -o errexit
 capture_stress_diagnostics
