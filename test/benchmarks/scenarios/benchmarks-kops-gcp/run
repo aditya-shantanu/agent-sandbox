@@ -98,14 +98,23 @@ fi
 
 export KOPS_STATE_STORE="gs://${BUCKET_NAME}"
 
-# Compute a relatively unique identifier for this run to allow concurrent runs
-CLUSTER_NAME="sandbox-${UNIQUE_SUFFIX}"
+# Compute a relatively unique identifier for this run to allow concurrent runs.
+# EXISTING_CLUSTER reuses a cluster left behind by a previous KEEP_CLUSTER=true
+# run: cluster creation, validation, and the cilium tuning are skipped (they
+# are one-time per cluster), and only deploy + stress run.
+CLUSTER_NAME="${EXISTING_CLUSTER:-sandbox-${UNIQUE_SUFFIX}}"
 ZONE="us-central1-a"
 
 cleanup() {
   echo "Cleaning up..."
 
-  kops delete cluster --name="${CLUSTER_NAME}" --yes || true
+  # KEEP_CLUSTER=true leaves the cluster running for reuse by a subsequent
+  # run (pass its name via EXISTING_CLUSTER). Remember to delete it manually.
+  if [[ "${KEEP_CLUSTER:-false}" == "true" ]]; then
+    echo "KEEP_CLUSTER=true: leaving cluster ${CLUSTER_NAME} running."
+  else
+    kops delete cluster --name="${CLUSTER_NAME}" --yes || true
+  fi
   # By default we don't delete the bucket, so that we can run parallel tests.
   if [[ "${CLEANUP_BUCKET:-false}" == "true" ]]; then
     echo "Deleting bucket gs://${BUCKET_NAME}..."
@@ -146,6 +155,8 @@ echo "Using node count: ${NODE_COUNT}"
 # binding during the burst; --enable-webhook=false skips webhook cert
 # bootstrap, safe now that no conversion webhook exists.)
 CONTROLLER_ARGS="${CONTROLLER_ARGS:-}"
+
+if [[ -z "${EXISTING_CLUSTER:-}" ]]; then
 
 echo "Creating kOps cluster configuration..."
 # --gce-service-account=default: needed because boskos doesn't let us configure IAM permissions on the project.
@@ -230,6 +241,11 @@ if [[ "${CNI}" == "cilium" ]]; then
   kops validate cluster --wait 10m
 fi
 
+else
+  echo "Reusing existing cluster ${CLUSTER_NAME} (skipping create/validate/cilium tuning)..."
+  kops export kubeconfig --name "${CLUSTER_NAME}" --admin
+fi
+
 # Deploy to cluster
 echo "Deploying to cluster..."
 DEPLOY_FLAGS=(--image-prefix="${IMAGE_PREFIX}" --extensions)
@@ -283,6 +299,19 @@ capture_stress_diagnostics() {
   kubectl get nodes -o wide > "${STRESS_OUTPUT_DIR}/nodes.txt" || true
   kubectl top nodes > "${STRESS_OUTPUT_DIR}/top-nodes.txt" 2>/dev/null || true
 }
+
+# STRESS_SMOKE_COUNT (default 0 = off) runs a small claims-warm first as a
+# pipeline smoke test; under errexit a smoke failure aborts before the
+# expensive full-size run.
+if [[ "${STRESS_SMOKE_COUNT:-0}" -gt 0 ]]; then
+  echo "Running smoke claims-warm (count=${STRESS_SMOKE_COUNT})..."
+  go run ./test/stress \
+    --phases=claims-warm \
+    --claims-warm-count="${STRESS_SMOKE_COUNT}" \
+    --timeout=10m \
+    --output-dir="${STRESS_OUTPUT_DIR}/smoke"
+  echo "Smoke test passed."
+fi
 
 echo "Running stress test"
 # Prometheus metrics from the apiserver, kube-controller-manager,
