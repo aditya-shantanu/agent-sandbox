@@ -59,14 +59,19 @@ func TestCreateSandboxClaimVolumeClaimTemplates(t *testing.T) {
 			claimVCTs:    nil,
 			verifySuccess: func(t *testing.T, tc *framework.TestContext, namespace string, claim *extensionsv1beta1.SandboxClaim) {
 				claimUpdated := &extensionsv1beta1.SandboxClaim{}
-				err := tc.Get(t.Context(), types.NamespacedName{Name: claim.Name, Namespace: namespace}, claimUpdated)
-				require.NoError(t, err)
-
-				require.NotEmpty(t, claimUpdated.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation])
+				// The assigned-sandbox annotation is flushed by a deferred
+				// patch AFTER the claim status write, so it can land a beat
+				// after Ready=True becomes observable.
+				require.Eventually(t, func() bool {
+					if err := tc.Get(t.Context(), types.NamespacedName{Name: claim.Name, Namespace: namespace}, claimUpdated); err != nil {
+						return false
+					}
+					return claimUpdated.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation] != ""
+				}, 30*time.Second, 250*time.Millisecond, "assigned-sandbox annotation was not persisted")
 				assignedSandboxName := claimUpdated.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation]
 
 				sandbox := &sandboxv1beta1.Sandbox{}
-				err = tc.Get(t.Context(), types.NamespacedName{Name: assignedSandboxName, Namespace: namespace}, sandbox)
+				err := tc.Get(t.Context(), types.NamespacedName{Name: assignedSandboxName, Namespace: namespace}, sandbox)
 				require.NoError(t, err)
 
 				require.Equal(t, string(sandboxv1beta1.SandboxLaunchTypeWarm), sandbox.Labels[sandboxv1beta1.SandboxLaunchTypeLabel])
