@@ -127,3 +127,20 @@ Artifacts: `gs://kops-state-142966328212/perf-bench-results/latest/`.
 CL2-paced 300 QPS × 2 bursts. ControllerStartupLatency p50=154ms / p90=245ms /
 p99=478ms (thresholds 300/300/500 — passed). PodStartupLatency p90=872ms.
 Claim throughput max 54.2/s.
+
+---
+
+## 2026-07-19 — Round-2 A/B (launched, one reused cluster, both legs instrumented)
+
+Quick-wins branch merged at 838427e (stale-pass guard, echo suppression,
+cold-start deferral guard, instant key return, adoption optimistic lock,
+duplicate-recompute removal, --disable-claim-events flag; see
+ROUND2-FINDINGS.md). A/B on the runner VM via the reuse+smoke workflow:
+
+- Leg A (pre-quickwins): perf-investigation-master @ 6ca3422 — creates+keeps cluster
+- Leg B (+quickwins): @ 838427e — reuses the same cluster
+- Both: NODE_COUNT=6, smoke 20 first, 300-claim burst, INSTRUMENT_CLUSTER=true,
+  identical CONTROLLER_ARGS (debug logging + pprof + 20s replenish delay)
+- Artifacts: gs://kops-state-142966328212/perf-bench-results/round2/
+
+Results: PENDING (legs A then B, sequential).
