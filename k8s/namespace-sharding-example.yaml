@@ -1,0 +1,161 @@
+# Static namespace-sharded multi-controller deployment (SCALE-ROADMAP.md R4.4).
+#
+# WHY (perf-investigation branch): a single controller process serializes all
+# watch ingestion, JSON decode, and write concurrency for the whole cluster.
+# Running N controller instances with disjoint --watch-namespaces lists
+# partitions that load BY NAMESPACE with no coordination component:
+#   - each shard's informers list/watch only its namespaces (server-side
+#     scoping via cache DefaultNamespaces — the apiserver filters in the
+#     watch cache, so bytes and encode work shrink too);
+#   - each shard suffixes its leader-election Lease ID with a stable hash of
+#     its namespace list, so shards elect leaders independently (and each
+#     shard can run 2 replicas active/standby for HA);
+#   - adoption correctness is untouched: exclusivity rests on the
+#     optimistic-lock sandbox patch, not the in-memory warm queue, and
+#     adoption is namespace-local by construction (a claim can only adopt a
+#     sandbox in its own namespace), so shards can never race for the same
+#     candidate — each pool's warm queue lives on exactly one shard.
+#
+# RBAC IS UNAFFECTED: the controller's permissions are granted by
+# CLUSTER-scoped ClusterRoles/ClusterRoleBindings (k8s/rbac.generated.yaml,
+# k8s/extensions-rbac.generated.yaml) to the single agent-sandbox-controller
+# ServiceAccount, which both shard Deployments reuse below. Namespace
+# scoping happens purely client-side in each shard's list/watch requests; no
+# per-namespace Roles are needed and nothing in RBAC has to know the shard
+# layout. (The namespaced Role in k8s/controller.yaml covers the webhook
+# cert Secret and is likewise shared.)
+#
+# COVERAGE CAUTION: sharding is static. A namespace that appears in NO
+# shard's --watch-namespaces list is silently NOT reconciled; a namespace in
+# MORE THAN ONE list is reconciled by multiple shards (safe — the optimistic
+# lock resolves races as 409s — but wasteful). Keep the lists disjoint and
+# exhaustive for the namespaces that host Sandboxes/Claims/Pools.
+#
+# WEBHOOK: this example runs every shard with --enable-webhook=false. The
+# stock CRDs are single-version (v1beta1, conversion.strategy=None) and no
+# admission webhooks are registered, so the webhook server is not required
+# (see the --enable-webhook flag notes in cmd/agent-sandbox-controller); this
+# also keeps N shards from racing to generate the webhook cert Secret and
+# patch CRD caBundles at startup. If you do need the webhook subsystem, leave
+# it enabled on exactly ONE shard and set --enable-webhook=false on the rest.
+#
+# PREREQUISITE: apply the stock manifests first (Namespace, ServiceAccount,
+# RBAC, CRDs — e.g. k8s/controller.yaml + extensions RBAC, or the release
+# sandbox.yaml + extensions.yaml), then DELETE or scale to 0 the stock
+# cluster-wide `agent-sandbox-controller` Deployment before applying this
+# file: a leftover cluster-wide instance holds the stock Lease and would
+# double-reconcile every shard's namespaces.
+#
+# DEPLOYMENT: dev/tools/deploy-to-kube applies every k8s/**/*.yaml on
+# benchmark clusters. This file is INTENTIONALLY not listed in
+# k8s/kustomization.yaml (same precedent as k8s/apf-insulation.yaml): the
+# release tool's drift guard (dev/tools/release check_install_manifest_drift)
+# will fail loudly if this branch is ever released, forcing an explicit
+# upstream decision on whether a sharded topology belongs in release assets.
+# NOTE for benchmark clusters: because deploy-to-kube applies this file
+# automatically, the example namespace lists below (team-a-*/team-b-*) match
+# no benchmark namespaces; the shard Deployments idle at replicas: 0 unless
+# you scale them up and point --watch-namespaces at real namespaces.
+#
+# Example topology: 2 shards x 2 namespaces. Scale-out recipe: copy a
+# Deployment block, give it a unique name/shard label, and assign it a
+# disjoint namespace list. Lease IDs are derived automatically from the list.
+---
+# Shard A: namespaces team-a-1, team-a-2.
+# Leader-election Lease: a3317529.agent-sandbox.x-k8s.io-shard-<fnv64a(list)>
+# (derived automatically; check the "namespace sharding enabled" startup log
+# line for the exact name, or `kubectl get lease -n agent-sandbox-system`).
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: agent-sandbox-controller-shard-a
+  namespace: agent-sandbox-system
+  labels:
+    app: agent-sandbox-controller
+    sharding.agent-sandbox.x-k8s.io/shard: shard-a
+spec:
+  replicas: 0 # scale to 1 (or 2 for active/standby HA) after editing the namespace list
+  selector:
+    matchLabels:
+      app: agent-sandbox-controller
+      sharding.agent-sandbox.x-k8s.io/shard: shard-a
+  template:
+    metadata:
+      labels:
+        app: agent-sandbox-controller
+        sharding.agent-sandbox.x-k8s.io/shard: shard-a
+    spec:
+      serviceAccountName: agent-sandbox-controller
+      containers:
+      - name: agent-sandbox-controller
+        image: ko://sigs.k8s.io/agent-sandbox/cmd/agent-sandbox-controller # placeholder value, replaced by deployment scripts
+        args:
+        - "--leader-elect=true"
+        - "--extensions"
+        - "--enable-webhook=false"
+        - "--watch-namespaces=team-a-1,team-a-2"
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: healthz
+          containerPort: 8081
+          protocol: TCP
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/sandbox-config
+          readOnly: true
+      volumes:
+      - name: config-volume
+        configMap:
+          name: agent-sandbox-config
+          optional: true
+---
+# Shard B: namespaces team-b-1, team-b-2. Identical to shard A except for the
+# name, the shard label, and the namespace list (which also yields a distinct
+# leader-election Lease automatically).
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: agent-sandbox-controller-shard-b
+  namespace: agent-sandbox-system
+  labels:
+    app: agent-sandbox-controller
+    sharding.agent-sandbox.x-k8s.io/shard: shard-b
+spec:
+  replicas: 0 # scale to 1 (or 2 for active/standby HA) after editing the namespace list
+  selector:
+    matchLabels:
+      app: agent-sandbox-controller
+      sharding.agent-sandbox.x-k8s.io/shard: shard-b
+  template:
+    metadata:
+      labels:
+        app: agent-sandbox-controller
+        sharding.agent-sandbox.x-k8s.io/shard: shard-b
+    spec:
+      serviceAccountName: agent-sandbox-controller
+      containers:
+      - name: agent-sandbox-controller
+        image: ko://sigs.k8s.io/agent-sandbox/cmd/agent-sandbox-controller # placeholder value, replaced by deployment scripts
+        args:
+        - "--leader-elect=true"
+        - "--extensions"
+        - "--enable-webhook=false"
+        - "--watch-namespaces=team-b-1,team-b-2"
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: healthz
+          containerPort: 8081
+          protocol: TCP
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/sandbox-config
+          readOnly: true
+      volumes:
+      - name: config-volume
+        configMap:
+          name: agent-sandbox-config
+          optional: true

@@ -79,6 +79,7 @@ func main() {
 	var sandboxWarmPoolReplenishDelay time.Duration
 	var enableWarmPoolEviction bool
 	var disableClaimEvents bool
+	var watchNamespaces string
 	var printVersion bool
 	var webhookPort int
 	var webhookCertDir string
@@ -139,6 +140,13 @@ func main() {
 	flag.BoolVar(&disableClaimEvents, "disable-claim-events", false,
 		"Disable Kubernetes Event emission from the SandboxClaim controller (hot-path Eventf calls become no-ops), "+
 			"reducing API server writes during large claim bursts.")
+	flag.StringVar(&watchNamespaces, "watch-namespaces", "",
+		"Comma-separated list of namespaces this controller instance watches (static namespace sharding). "+
+			"Empty (default) watches all namespaces, exactly the stock single-instance behavior. When set, informer "+
+			"list/watch traffic is scoped server-side to the listed namespaces and the leader-election Lease ID is "+
+			"suffixed with a stable hash of the namespace list, so N instances with disjoint namespace lists elect "+
+			"leaders independently and partition the cluster's load. Namespaces outside every shard's list are NOT "+
+			"reconciled. See k8s/namespace-sharding-example.yaml.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -343,6 +351,15 @@ func main() {
 		LeaderElection:          enableLeaderElection,
 		LeaderElectionNamespace: leaderElectionNamespace,
 		LeaderElectionID:        "a3317529.agent-sandbox.x-k8s.io",
+	}
+	// Static namespace sharding (SCALE-ROADMAP.md R4.4, see sharding.go):
+	// scope the cache's watches server-side to this shard's namespaces and
+	// give the shard its own leader-election Lease. No-op when the flag is
+	// unset.
+	if shardNamespaces := configureNamespaceSharding(&mgrOpts, watchNamespaces); shardNamespaces != nil {
+		setupLog.Info("namespace sharding enabled (--watch-namespaces): informer watches scoped server-side, shard-specific leader-election Lease",
+			"watchNamespaces", shardNamespaces,
+			"leaderElectionID", mgrOpts.LeaderElectionID)
 	}
 	if watchHTTPClient != nil {
 		// The manager cache builds its list/watch REST clients from this
