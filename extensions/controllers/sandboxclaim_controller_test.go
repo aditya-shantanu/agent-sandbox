@@ -5779,3 +5779,189 @@ func TestSandboxClaimEchoPassSkipsRedundantStatusPatch(t *testing.T) {
 		t.Errorf("expected persisted status to remain finalized, got %q", final.Status.SandboxStatus.Name)
 	}
 }
+
+// TestSandboxClaimColdStartDeferredWhilePoolHasAdoptableMembers verifies the
+// cold-start guard: when the in-memory adoption queue is empty but the informer
+// cache still shows adoptable members of the claim's warm pool, the claim is
+// requeued with the bounded delay instead of cold-starting — and after the
+// per-claim deferral cap it falls back to a cold start so it cannot loop forever.
+func TestSandboxClaimColdStartDeferredWhilePoolHasAdoptableMembers(t *testing.T) {
+	scheme := newScheme(t)
+	poolNameHash := sandboxcontrollers.NameHash("test-pool")
+
+	claim := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default", UID: "claim-uid-123"},
+		Spec: extensionsv1beta1.SandboxClaimSpec{
+			WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-pool"},
+		},
+	}
+
+	template := &extensionsv1beta1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+		Spec: extensionsv1beta1.SandboxTemplateSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+		}}},
+	}
+
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default", UID: "warmpool-uid-123"},
+		Spec:       extensionsv1beta1.SandboxWarmPoolSpec{TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: "test-template"}},
+	}
+
+	// Adoptable, Ready pool member visible in the cache but NOT in the adoption queue.
+	warmSandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "warm-sb",
+			Namespace: "default",
+			UID:       "warm-sb-uid",
+			Labels: map[string]string{
+				warmPoolSandboxLabel:   poolNameHash,
+				sandboxTemplateRefHash: sandboxcontrollers.NameHash("test-template"),
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+				Kind:       "SandboxWarmPool",
+				Name:       "test-pool",
+				UID:        "warmpool-uid-123",
+				Controller: ptr.To(true), // nolint:modernize
+			}},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}}}}},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue, Reason: "Ready",
+			}},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(template, warmPool, claim, warmSandbox).
+		WithStatusSubresource(claim).
+		// Same field index the SandboxWarmPool controller registers on the manager.
+		WithIndex(&sandboxv1beta1.Sandbox{}, sandboxWarmPoolLabelIndex, sandboxWarmPoolLabelIndexer).
+		Build()
+
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(100),
+		Tracer:           asmetrics.NewNoOp(),
+		WarmSandboxQueue: queue.NewSimpleSandboxQueue(), // deliberately EMPTY
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
+	ctx := context.Background()
+
+	// Passes 1..maxColdStartDeferrals: cold start must be deferred with the
+	// bounded requeue, and NO sandbox may be created for the claim.
+	for pass := 1; pass <= maxColdStartDeferrals; pass++ {
+		res, err := reconciler.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("pass %d: expected nil error while deferring cold start, got: %v", pass, err)
+		}
+		if res.RequeueAfter != adoptionCacheLagRequeueDelay {
+			t.Fatalf("pass %d: expected bounded requeue %v while pool has adoptable members, got %v", pass, adoptionCacheLagRequeueDelay, res.RequeueAfter)
+		}
+		coldSb := &sandboxv1beta1.Sandbox{}
+		if err := fakeClient.Get(ctx, types.NamespacedName{Name: "test-claim", Namespace: "default"}, coldSb); !k8errors.IsNotFound(err) {
+			t.Fatalf("pass %d: expected NO cold-start sandbox while pool has adoptable members, get err=%v", pass, err)
+		}
+	}
+
+	// The deferral is reported as a benign AdoptionPending condition, not an error.
+	deferredClaim := &extensionsv1beta1.SandboxClaim{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "test-claim", Namespace: "default"}, deferredClaim); err != nil {
+		t.Fatalf("failed to get claim: %v", err)
+	}
+	readyCondition := meta.FindStatusCondition(deferredClaim.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	if readyCondition == nil {
+		t.Fatal("expected Ready condition to be set while cold start is deferred")
+	}
+	if readyCondition.Reason != "AdoptionPending" {
+		t.Errorf("expected Ready condition reason %q while cold start is deferred, got %q (message: %q)", "AdoptionPending", readyCondition.Reason, readyCondition.Message)
+	}
+
+	// Next pass exceeds the deferral cap: the claim must cold-start (loudly) so it
+	// cannot spin forever on a queue that never yields the cached members.
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("post-cap pass: expected nil error, got: %v", err)
+	}
+	coldSb := &sandboxv1beta1.Sandbox{}
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "test-claim", Namespace: "default"}, coldSb); err != nil {
+		t.Fatalf("post-cap pass: expected a cold-start sandbox to be created, got: %v", err)
+	}
+	if got := coldSb.Labels[sandboxv1beta1.SandboxLaunchTypeLabel]; got != sandboxv1beta1.SandboxLaunchTypeCold {
+		t.Errorf("expected cold-start sandbox launch type %q, got %q", sandboxv1beta1.SandboxLaunchTypeCold, got)
+	}
+}
+
+// TestSandboxClaimColdStartsWhenPoolHasNoAdoptableMembers verifies the guard does
+// not defer when the cache shows no adoptable members (empty pool): the claim
+// must cold-start on the first pass, exactly as before.
+func TestSandboxClaimColdStartsWhenPoolHasNoAdoptableMembers(t *testing.T) {
+	scheme := newScheme(t)
+
+	claim := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-claim", Namespace: "default", UID: "claim-uid-123"},
+		Spec: extensionsv1beta1.SandboxClaimSpec{
+			WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-pool"},
+		},
+	}
+	template := &extensionsv1beta1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+		Spec: extensionsv1beta1.SandboxTemplateSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+		}}},
+	}
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default", UID: "warmpool-uid-123"},
+		Spec:       extensionsv1beta1.SandboxWarmPoolSpec{TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: "test-template"}},
+	}
+
+	// A sandbox that carries the pool label but is being deleted (not adoptable):
+	// it must not hold the claim back from cold-starting.
+	deletedSandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "dying-sb",
+			Namespace:         "default",
+			DeletionTimestamp: ptr.To(metav1.Now()), // nolint:modernize
+			Finalizers:        []string{"test.finalizer/keep"},
+			Labels: map[string]string{
+				warmPoolSandboxLabel:   sandboxcontrollers.NameHash("test-pool"),
+				sandboxTemplateRefHash: sandboxcontrollers.NameHash("test-template"),
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+				Kind:       "SandboxWarmPool",
+				Name:       "test-pool",
+				UID:        "warmpool-uid-123",
+				Controller: ptr.To(true), // nolint:modernize
+			}},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}}}}},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(template, warmPool, claim, deletedSandbox).
+		WithStatusSubresource(claim).
+		WithIndex(&sandboxv1beta1.Sandbox{}, sandboxWarmPoolLabelIndex, sandboxWarmPoolLabelIndexer).
+		Build()
+
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(10),
+		Tracer:           asmetrics.NewNoOp(),
+		WarmSandboxQueue: queue.NewSimpleSandboxQueue(),
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
+
+	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+	coldSb := &sandboxv1beta1.Sandbox{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, coldSb); err != nil {
+		t.Fatalf("expected a cold-start sandbox on the first pass when the pool has no adoptable members, got: %v", err)
+	}
+}

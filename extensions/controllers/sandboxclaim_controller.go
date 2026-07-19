@@ -49,6 +49,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	"sigs.k8s.io/agent-sandbox/internal/lifecycle"
@@ -90,13 +91,32 @@ var errAdoptionTriggeredRetry = errors.New("triggered adoption completion, retry
 // balloons adoption tail latency exactly when conflicts are most likely.
 var errAdoptionConflictRetry = errors.New("adoption update conflicted, retry")
 
+// errColdStartDeferredRetry signals that the in-memory warm-pool adoption
+// queue was empty for the claim, but the informer cache still shows adoptable
+// members of the referenced warm pool: the queue is simply lagging behind the
+// cache (e.g. sandbox watch events still in flight during a claim burst, or a
+// controller restart that lost the queue). Cold-starting now would burn a
+// warm candidate AND pay the full cold-start latency. Like
+// errAdoptionTriggeredRetry it is a sentinel so Reconcile converts it into a
+// bounded fixed-delay requeue instead of an exponentially rate-limited error.
+var errColdStartDeferredRetry = errors.New("adoptable warm pool members pending, deferring cold start")
+
 // adoptionCacheLagRequeueDelay is how long to wait before re-checking that a
 // just-completed adoption is visible in the informer cache. Long enough to
 // cover typical watch latency (so most claims converge in one extra pass) and
 // to bound the rate of redundant adoption patches while the cache lags, but
 // far below the multi-second exponential backoff it replaces. Also used to
-// retry the adoption Update after a 409 conflict with a fresh claim object.
+// retry the adoption Update after a 409 conflict with a fresh claim object,
+// and to poll the adoption queue while cold start is deferred because the
+// cache still shows adoptable warm-pool members.
 const adoptionCacheLagRequeueDelay = 50 * time.Millisecond
+
+// maxColdStartDeferrals bounds how many consecutive reconcile passes a claim
+// may defer cold start while the cache reports adoptable warm-pool members
+// that never become available through the adoption queue (~2s at the 50ms
+// requeue delay). After the cap the claim cold-starts so it cannot loop
+// forever on e.g. a stuck queue or members that are perpetually contended.
+const maxColdStartDeferrals = 40
 
 var restrictedDomains = []string{"kubernetes.io", "k8s.io", "agents.x-k8s.io"}
 var exemptedMetadataKeys = []string{autoscalerSafeToEvictAnnotation}
@@ -266,6 +286,36 @@ func (m *lastWrittenStatusMap) Delete(key types.NamespacedName) {
 	m.inner.Delete(key)
 }
 
+// coldStartDeferralEntry counts how many consecutive passes a claim (by UID)
+// deferred cold start because the cache still showed adoptable pool members.
+type coldStartDeferralEntry struct {
+	uid      types.UID
+	attempts int
+}
+
+// coldStartDeferralMap is a type-safe wrapper around sync.Map that only
+// stores coldStartDeferralEntry values. Entries are removed as soon as a
+// claim obtains a sandbox, when cold start is allowed, and on claim deletion.
+type coldStartDeferralMap struct {
+	inner sync.Map
+}
+
+func (m *coldStartDeferralMap) Load(key types.NamespacedName) (coldStartDeferralEntry, bool) {
+	val, ok := m.inner.Load(key)
+	if !ok {
+		return coldStartDeferralEntry{}, false
+	}
+	return val.(coldStartDeferralEntry), true
+}
+
+func (m *coldStartDeferralMap) Store(key types.NamespacedName, entry coldStartDeferralEntry) {
+	m.inner.Store(key, entry)
+}
+
+func (m *coldStartDeferralMap) Delete(key types.NamespacedName) {
+	m.inner.Delete(key)
+}
+
 // SandboxClaimReconciler reconciles a SandboxClaim object.
 type SandboxClaimReconciler struct {
 	client.Client
@@ -277,6 +327,7 @@ type SandboxClaimReconciler struct {
 	observedTimes           observedTimeMap
 	triggeredAdoptions      triggeredAdoptionMap
 	lastWrittenStatuses     lastWrittenStatusMap
+	coldStartDeferrals      coldStartDeferralMap
 	AllowedLabelDomains     []string
 }
 
@@ -303,6 +354,7 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			r.observedTimes.Delete(req.NamespacedName)
 			r.triggeredAdoptions.Delete(req.NamespacedName)
 			r.lastWrittenStatuses.Delete(req.NamespacedName)
+			r.coldStartDeferrals.Delete(req.NamespacedName)
 			logger.V(1).Info("SandboxClaim not found, ignoring", "request", req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
@@ -523,7 +575,8 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// error lets the workqueue Forget the key, resetting the failure counter. Status
 	// is intentionally not finalized with the sandbox on this pass (sandbox is nil
 	// here), preserving the duplicate-adoption protection during cache lag.
-	if errors.Is(reconcileErr, errAdoptionTriggeredRetry) || errors.Is(reconcileErr, errAdoptionConflictRetry) {
+	if errors.Is(reconcileErr, errAdoptionTriggeredRetry) || errors.Is(reconcileErr, errAdoptionConflictRetry) ||
+		errors.Is(reconcileErr, errColdStartDeferredRetry) {
 		logger.V(4).Info("Adoption retry requested; requeueing with bounded delay", "claim", claim.Name, "error", reconcileErr)
 		requeueDelay := adoptionCacheLagRequeueDelay
 		if result.RequeueAfter > 0 && result.RequeueAfter < requeueDelay {
@@ -622,6 +675,8 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 		return nil, err
 	}
 	if sandbox != nil {
+		// The claim has a sandbox: any cold-start deferral bookkeeping is stale.
+		r.coldStartDeferrals.Delete(types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace})
 		// Found or adopted. Reconcile network policy (best effort, non blocking).
 		logger.V(1).Info("Fast path: sandbox found or adopted, reconciling network policy", "claim", claim.Name)
 		template, templateErr := r.getTemplate(ctx, claim)
@@ -874,6 +929,18 @@ func (r *SandboxClaimReconciler) computeReadyCondition(claim *extensionsv1beta1.
 				ObservedGeneration: claim.Generation,
 			}
 		}
+		if errors.Is(err, errColdStartDeferredRetry) {
+			// Benign retry signal: the adoption queue was empty but the cache
+			// still shows adoptable warm-pool members; cold start is deferred
+			// briefly so a warm sandbox is not wasted.
+			return metav1.Condition{
+				Type:               string(v1beta1.SandboxConditionReady),
+				Status:             metav1.ConditionFalse,
+				Reason:             "AdoptionPending",
+				Message:            "Warm pool has adoptable sandboxes not yet available for adoption; deferring cold start",
+				ObservedGeneration: claim.Generation,
+			}
+		}
 		if errors.Is(err, errAdoptionConflictRetry) {
 			// Benign retry signal: the claim update recording the adoption hit a
 			// write conflict and will be retried shortly with a fresh object.
@@ -989,7 +1056,8 @@ func (r *SandboxClaimReconciler) computeAndSetStatus(claim *extensionsv1beta1.Sa
 	// the recorded Name/PodIPs and existing conditions untouched instead of
 	// transiently wiping them.
 	if sandbox == nil &&
-		(errors.Is(err, errAdoptionTriggeredRetry) || errors.Is(err, errAdoptionConflictRetry)) &&
+		(errors.Is(err, errAdoptionTriggeredRetry) || errors.Is(err, errAdoptionConflictRetry) ||
+			errors.Is(err, errColdStartDeferredRetry)) &&
 		claim.Status.SandboxStatus.Name != "" {
 		return
 	}
@@ -2009,8 +2077,69 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 		return adopted, nil
 	}
 
+	// Cold-start guard: the in-memory adoption queue had no candidate, but the
+	// queue can lag the informer cache (sandbox watch events still in flight
+	// during a burst, controller restart, requeue races). If the cache still
+	// shows adoptable members of the referenced pool, defer the cold start via
+	// a bounded requeue instead of burning a warm sandbox AND paying cold-start
+	// latency; a per-claim attempt cap prevents deferring forever.
+	if claim.Spec.WarmPoolRef.Name != "" && r.shouldDeferColdStart(ctx, claim) {
+		return nil, fmt.Errorf("%w: warm pool %q", errColdStartDeferredRetry, claim.Spec.WarmPoolRef.Name)
+	}
+
 	// No warm pool sandbox available; caller decides whether to create
 	return nil, nil
+}
+
+// shouldDeferColdStart reports whether cold start should be deferred because
+// the informer cache still shows adoptable members of the claim's warm pool.
+// It lists pool members from the cache via the warm-pool label field index
+// (registered by the SandboxWarmPool controller) so the check is O(pool
+// members), not O(sandboxes-in-namespace).
+func (r *SandboxClaimReconciler) shouldDeferColdStart(ctx context.Context, claim *extensionsv1beta1.SandboxClaim) bool {
+	logger := log.FromContext(ctx)
+	key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+
+	var members v1beta1.SandboxList
+	if err := r.List(ctx, &members, client.InNamespace(claim.Namespace),
+		client.MatchingFields{sandboxWarmPoolLabelIndex: sandboxcontrollers.NameHash(claim.Spec.WarmPoolRef.Name)}); err != nil {
+		// Best-effort guard: without the labeled cache List (e.g. the field
+		// index is not registered), preserve the previous behavior and let the
+		// claim cold-start rather than blocking it.
+		logger.Error(err, "Failed to list warm pool members for cold-start guard; falling back to cold start",
+			"claim", claim.Name, "warmPool", claim.Spec.WarmPoolRef.Name)
+		r.coldStartDeferrals.Delete(key)
+		return false
+	}
+
+	adoptable := 0
+	for i := range members.Items {
+		if verifySandboxCandidate(&members.Items[i], claim) == nil {
+			adoptable++
+		}
+	}
+	if adoptable == 0 {
+		r.coldStartDeferrals.Delete(key)
+		return false
+	}
+
+	entry, ok := r.coldStartDeferrals.Load(key)
+	if !ok || entry.uid != claim.UID {
+		entry = coldStartDeferralEntry{uid: claim.UID}
+	}
+	entry.attempts++
+	if entry.attempts > maxColdStartDeferrals {
+		logger.Info("Warm pool still shows adoptable sandboxes but none could be adopted after the deferral cap; falling back to cold start",
+			"claim", claim.Name, "warmPool", claim.Spec.WarmPoolRef.Name,
+			"adoptableMembers", adoptable, "deferrals", entry.attempts-1)
+		r.coldStartDeferrals.Delete(key)
+		return false
+	}
+	r.coldStartDeferrals.Store(key, entry)
+	logger.V(1).Info("Deferring cold start: warm pool has adoptable sandboxes not yet available through the adoption queue",
+		"claim", claim.Name, "warmPool", claim.Spec.WarmPoolRef.Name,
+		"adoptableMembers", adoptable, "attempt", entry.attempts, "maxAttempts", maxColdStartDeferrals)
+	return true
 }
 
 func (r *SandboxClaimReconciler) initializeSandboxLaunchTypeLabel(ctx context.Context, sandbox *v1beta1.Sandbox, launchType string) error {
