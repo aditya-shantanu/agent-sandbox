@@ -149,12 +149,33 @@ echo "Using node count: ${NODE_COUNT}"
 # configuration). Recommended flags for claim-burst perf runs:
 #   CONTROLLER_ARGS="--kube-api-qps=1000 --kube-api-burst=2000 \
 #     --sandbox-concurrent-workers=400 --sandbox-claim-concurrent-workers=400 \
-#     --sandbox-warm-pool-concurrent-workers=1 --enable-webhook=false"
+#     --sandbox-warm-pool-concurrent-workers=1 --enable-webhook=false \
+#     --enable-pprof-debug --zap-log-level=debug"
 # (high QPS/workers remove client-side throttling from the claim path;
 # warm-pool workers=1 keeps pool replenishment from competing with claim
 # binding during the burst; --enable-webhook=false skips webhook cert
-# bootstrap, safe now that no conversion webhook exists.)
+# bootstrap, safe now that no conversion webhook exists;
+# --enable-pprof-debug exposes the heap/goroutine/block/mutex pprof
+# endpoints the stress tool captures during claims-warm; --zap-log-level=debug
+# enables the per-claim "adoption timing" debug lines in controller.log.)
 CONTROLLER_ARGS="${CONTROLLER_ARGS:-}"
+
+# INSTRUMENT_CLUSTER=true (default false) trades some apiserver overhead for
+# diagnostic signal on perf-investigation runs: it raises kube-apiserver log
+# verbosity to 3 (per-request handler timing lines) at cluster CREATION time,
+# and captures the apiserver container logs into $ARTIFACTS at the end.
+#
+# NOTE on audit logging: kops v1.35 only supports audit via
+# cluster.spec.kubeAPIServer.auditPolicyFile, which must point at a policy
+# file already present on the control-plane host, provisioned through
+# cluster.spec.fileAssets (a list of structured objects that cannot be
+# expressed reliably through repeated `kops create cluster --set key=value`
+# flags). A malformed audit wiring prevents kube-apiserver from starting at
+# all, so audit capture is deliberately NOT attempted here: the risk to
+# cluster bring-up outweighs the extra signal. Write-path timing is covered
+# instead by apiserver_request_duration_seconds (already scraped) plus the
+# verbosity raised above.
+INSTRUMENT_CLUSTER="${INSTRUMENT_CLUSTER:-false}"
 
 if [[ -z "${EXISTING_CLUSTER:-}" ]]; then
 
@@ -182,6 +203,14 @@ CNI_KOPS_FLAGS=()
 if [[ "${CNI}" == "cilium" ]]; then
     CNI_KOPS_FLAGS+=("--set" "cluster.spec.networking.cilium.enablePrometheusMetrics=true")
 fi
+INSTRUMENT_KOPS_FLAGS=()
+if [[ "${INSTRUMENT_CLUSTER}" == "true" ]]; then
+    # kube-apiserver -v=3 logs per-request completion lines (verb, URI,
+    # latency, status) without the firehose of -v=4+. See INSTRUMENT_CLUSTER
+    # comment above for why audit logging is not enabled.
+    echo "INSTRUMENT_CLUSTER=true: raising kube-apiserver log verbosity to 3"
+    INSTRUMENT_KOPS_FLAGS+=("--set" "cluster.spec.kubeAPIServer.logLevel=3")
+fi
 kops create cluster \
   --cloud=gce \
   --gce-service-account=default \
@@ -201,7 +230,8 @@ kops create cluster \
   --set cluster.spec.kubeScheduler.authorizationAlwaysAllowPaths=/readyz \
   --set cluster.spec.kubeScheduler.authorizationAlwaysAllowPaths=/livez \
   --set cluster.spec.kubeScheduler.authorizationAlwaysAllowPaths=/metrics \
-  ${CNI_KOPS_FLAGS[@]+"${CNI_KOPS_FLAGS[@]}"}
+  ${CNI_KOPS_FLAGS[@]+"${CNI_KOPS_FLAGS[@]}"} \
+  ${INSTRUMENT_KOPS_FLAGS[@]+"${INSTRUMENT_KOPS_FLAGS[@]}"}
 
 echo "Applying cluster configuration..."
 kops update cluster --name "${CLUSTER_NAME}" --yes
@@ -243,6 +273,10 @@ fi
 
 else
   echo "Reusing existing cluster ${CLUSTER_NAME} (skipping create/validate/cilium tuning)..."
+  if [[ "${INSTRUMENT_CLUSTER}" == "true" ]]; then
+    echo "NOTE: INSTRUMENT_CLUSTER=true only raises apiserver verbosity at cluster creation;"
+    echo "the reused cluster keeps whatever verbosity it was created with (apiserver log capture still runs)."
+  fi
   kops export kubeconfig --name "${CLUSTER_NAME}" --admin
 fi
 
@@ -298,6 +332,18 @@ capture_stress_diagnostics() {
   kubectl get pods -A -o wide > "${STRESS_OUTPUT_DIR}/pods.txt" || true
   kubectl get nodes -o wide > "${STRESS_OUTPUT_DIR}/nodes.txt" || true
   kubectl top nodes > "${STRESS_OUTPUT_DIR}/top-nodes.txt" 2>/dev/null || true
+
+  # Headless apiserver log capture: kubectl logs on the static apiserver
+  # pod(s) works with just the admin kubeconfig (no SSH to the control-plane
+  # node needed, unlike kops toolbox dump). At logLevel=3 the interesting
+  # content is per-request completion lines; kubelet log rotation bounds the
+  # size, so this is the tail of the run, which covers the stress phases.
+  if [[ "${INSTRUMENT_CLUSTER}" == "true" ]]; then
+    echo "Capturing kube-apiserver logs (INSTRUMENT_CLUSTER=true)..."
+    for pod in $(kubectl get pods --namespace kube-system --selector=k8s-app=kube-apiserver -o name); do
+      kubectl logs --namespace kube-system "${pod}" --tail=-1 > "${STRESS_OUTPUT_DIR}/${pod#pod/}.log" || true
+    done
+  fi
 }
 
 # STRESS_SMOKE_COUNT (default 0 = off) runs a small claims-warm first as a
