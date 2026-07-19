@@ -3847,6 +3847,9 @@ func TestSandboxClaimAdoptionCacheLagDoesNotRepatch(t *testing.T) {
 	// Frozen warm-pool-owned view: served on every Get to simulate an informer
 	// cache that has not converged yet, no matter what was patched.
 	staleSandbox := adoptedSandbox.DeepCopy()
+	// The stale view must carry the resourceVersion the informer cache saw so the
+	// optimistic-lock adoption patch has a base RV (the fake tracker seeds "999").
+	staleSandbox.ResourceVersion = "999"
 
 	sandboxPatches := 0
 	fakeClient := fake.NewClientBuilder().
@@ -3988,6 +3991,9 @@ func TestSandboxClaimAdoptionCacheLagPreservesFinalizedStatus(t *testing.T) {
 	// Frozen warm-pool-owned view: served on every Get to simulate an informer
 	// cache that has not converged yet, no matter what was patched.
 	staleSandbox := adoptedSandbox.DeepCopy()
+	// The stale view must carry the resourceVersion the informer cache saw so the
+	// optimistic-lock adoption patch has a base RV (the fake tracker seeds "999").
+	staleSandbox.ResourceVersion = "999"
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -4104,6 +4110,9 @@ func TestSandboxClaimFreshAdoptionDoesNotRepatchDuringCacheLag(t *testing.T) {
 	// Frozen warm-pool-owned view: served on every Get to simulate an informer
 	// cache that never converges within the test, no matter what was patched.
 	staleSandbox := warmSandbox.DeepCopy()
+	// The stale view must carry the resourceVersion the informer cache saw so the
+	// optimistic-lock adoption patch has a base RV (the fake tracker seeds "999").
+	staleSandbox.ResourceVersion = "999"
 
 	sandboxPatches := 0
 	fakeClient := fake.NewClientBuilder().
@@ -5963,5 +5972,167 @@ func TestSandboxClaimColdStartsWhenPoolHasNoAdoptableMembers(t *testing.T) {
 	coldSb := &sandboxv1beta1.Sandbox{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, coldSb); err != nil {
 		t.Fatalf("expected a cold-start sandbox on the first pass when the pool has no adoptable members, got: %v", err)
+	}
+}
+
+// TestSandboxClaimAdoptionRaceLoserReAdoptsDifferentSandbox verifies the
+// optimistic lock on completeAdoption's sandbox patch: when two claims race for
+// the same warm candidate, exactly one wins the sandbox. The loser — whose view
+// of the candidate is stale (it was adopted by the winner after the loser read
+// it) — gets a 409 instead of silently overwriting the winner's ownership, and
+// re-adopts a DIFFERENT candidate from the queue rather than cold-starting.
+func TestSandboxClaimAdoptionRaceLoserReAdoptsDifferentSandbox(t *testing.T) {
+	scheme := newScheme(t)
+	poolNameHash := sandboxcontrollers.NameHash("test-pool")
+	templateHash := sandboxcontrollers.NameHash("test-template")
+
+	// The "loser" claim under test. The "winner" (claim-a) is only represented
+	// by its ownership of sb-1; it already finished its adoption.
+	claimB := &extensionsv1beta1.SandboxClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-b", Namespace: "default", UID: "claim-b-uid"},
+		Spec: extensionsv1beta1.SandboxClaimSpec{
+			WarmPoolRef: extensionsv1beta1.SandboxWarmPoolRef{Name: "test-pool"},
+		},
+	}
+
+	template := &extensionsv1beta1.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-template", Namespace: "default"},
+		Spec: extensionsv1beta1.SandboxTemplateSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}},
+		}}},
+	}
+
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default", UID: "warmpool-uid-123"},
+		Spec:       extensionsv1beta1.SandboxWarmPoolSpec{TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: "test-template"}},
+	}
+
+	newWarmSandbox := func(name, uid string) *sandboxv1beta1.Sandbox {
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				UID:       types.UID(uid),
+				Labels: map[string]string{
+					warmPoolSandboxLabel:   poolNameHash,
+					sandboxTemplateRefHash: templateHash,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+					Kind:       "SandboxWarmPool",
+					Name:       "test-pool",
+					UID:        "warmpool-uid-123",
+					Controller: ptr.To(true), // nolint:modernize
+				}},
+			},
+			Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "img"}}}}}},
+			Status: sandboxv1beta1.SandboxStatus{
+				Conditions: []metav1.Condition{{
+					Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionTrue, Reason: "Ready",
+				}},
+			},
+		}
+	}
+	sb1 := newWarmSandbox("sb-1", "sb-1-uid")
+	sb2 := newWarmSandbox("sb-2", "sb-2-uid")
+
+	staleSb1 := &sandboxv1beta1.Sandbox{}
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(template, warmPool, claimB, sb1, sb2).
+		WithStatusSubresource(claimB).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				// Claim B's informer never observes the winner's adoption of sb-1:
+				// serve the frozen pre-adoption view.
+				if sb, ok := obj.(*sandboxv1beta1.Sandbox); ok && key.Name == "sb-1" && staleSb1.Name != "" {
+					staleSb1.DeepCopyInto(sb)
+					return nil
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	// Snapshot the pre-adoption (warm-pool-owned) server view of sb-1: this is
+	// what claim B's stale cache keeps serving.
+	preAdoption := &sandboxv1beta1.Sandbox{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "sb-1", Namespace: "default"}, preAdoption); err != nil {
+		t.Fatalf("failed to snapshot pre-adoption view of sb-1: %v", err)
+	}
+
+	// The winner (claim-a) adopts sb-1 on the server: ownership transfers and the
+	// warm-pool label is removed, bumping sb-1's resourceVersion past the stale view.
+	winnerAdopted := preAdoption.DeepCopy()
+	delete(winnerAdopted.Labels, warmPoolSandboxLabel)
+	winnerAdopted.Labels[sandboxv1beta1.SandboxLaunchTypeLabel] = sandboxv1beta1.SandboxLaunchTypeWarm
+	winnerAdopted.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+		Kind:       "SandboxClaim",
+		Name:       "claim-a",
+		UID:        "claim-a-uid",
+		Controller: ptr.To(true), // nolint:modernize
+	}}
+	if err := fakeClient.Update(context.Background(), winnerAdopted); err != nil {
+		t.Fatalf("failed to apply winner's adoption of sb-1: %v", err)
+	}
+	// Freeze claim B's stale view AFTER the winner's write is applied to the store.
+	preAdoption.DeepCopyInto(staleSb1)
+
+	// Claim B's queue is stale too: it still offers sb-1 (first) and sb-2.
+	warmSandboxQueue := queue.NewSimpleSandboxQueue()
+	namespacedPool := queue.GetNamespacedWarmPoolName("default", "test-pool")
+	warmSandboxQueue.Add(namespacedPool, queue.SandboxKey{Namespace: "default", Name: "sb-1"})
+	warmSandboxQueue.Add(namespacedPool, queue.SandboxKey{Namespace: "default", Name: "sb-2"})
+
+	reconciler := &SandboxClaimReconciler{
+		Client:           fakeClient,
+		Scheme:           scheme,
+		Recorder:         events.NewFakeRecorder(10),
+		Tracer:           asmetrics.NewNoOp(),
+		WarmSandboxQueue: warmSandboxQueue,
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "claim-b", Namespace: "default"}}
+
+	if _, err := reconciler.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// Exactly one winner: sb-1 must still belong to claim-a, NOT be overwritten
+	// by claim B's stale last-writer-wins patch.
+	finalSb1 := &sandboxv1beta1.Sandbox{}
+	// Bypass the stale-view interceptor by clearing the frozen copy's name marker.
+	staleSb1.Name = ""
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "sb-1", Namespace: "default"}, finalSb1); err != nil {
+		t.Fatalf("failed to get sb-1: %v", err)
+	}
+	controllerRef := metav1.GetControllerOf(finalSb1)
+	if controllerRef == nil || controllerRef.Kind != "SandboxClaim" || controllerRef.Name != "claim-a" {
+		t.Fatalf("expected sb-1 to remain owned by the winner claim-a, got controller ref: %+v", controllerRef)
+	}
+	if _, hasWarmLabel := finalSb1.Labels[warmPoolSandboxLabel]; hasWarmLabel {
+		t.Error("expected sb-1 to stay out of the warm pool after the winner's adoption")
+	}
+
+	// The loser re-adopted a DIFFERENT candidate.
+	updatedClaim := &extensionsv1beta1.SandboxClaim{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "claim-b", Namespace: "default"}, updatedClaim); err != nil {
+		t.Fatalf("failed to get claim-b: %v", err)
+	}
+	if updatedClaim.Status.SandboxStatus.Name != "sb-2" {
+		t.Errorf("expected the losing claim to re-adopt sb-2, got status sandbox %q", updatedClaim.Status.SandboxStatus.Name)
+	}
+	finalSb2 := &sandboxv1beta1.Sandbox{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "sb-2", Namespace: "default"}, finalSb2); err != nil {
+		t.Fatalf("failed to get sb-2: %v", err)
+	}
+	if ref := metav1.GetControllerOf(finalSb2); ref == nil || ref.Kind != "SandboxClaim" || ref.Name != "claim-b" {
+		t.Errorf("expected sb-2 to be owned by claim-b after re-adoption, got controller ref: %+v", ref)
+	}
+
+	// And it did NOT cold-start.
+	coldSb := &sandboxv1beta1.Sandbox{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "claim-b", Namespace: "default"}, coldSb); !k8errors.IsNotFound(err) {
+		t.Errorf("expected NO cold-start sandbox for the losing claim, get err=%v", err)
 	}
 }

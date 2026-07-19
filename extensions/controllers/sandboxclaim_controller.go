@@ -1463,8 +1463,14 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 		}
 	}
 
+	// Optimistic lock: two claims racing for the same candidate would otherwise
+	// both send last-writer-wins merge patches, silently transferring the
+	// sandbox twice — the loser then believes it owns a sandbox another claim
+	// walked away with, burns the candidate, and falls through to a cold start.
+	// With the lock the loser gets a 409, which both callers already treat as
+	// "candidate lost, retry with the next one" (queue re-add + bounded retry).
 	patchStart := time.Now()
-	err := r.Patch(ctx, adopted, client.MergeFrom(originalAdopted))
+	err := r.Patch(ctx, adopted, client.MergeFromWithOptions(originalAdopted, client.MergeFromWithOptimisticLock{}))
 	if trace := adoptionTraceFrom(ctx); trace != nil {
 		trace.completeDur += time.Since(patchStart)
 	}
