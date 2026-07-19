@@ -11,6 +11,23 @@ The `agent-sandbox-controller` supports several command-line flags to tune perfo
 * `--kube-api-qps` (default: -1, no client-side rate limiting): Client-side QPS limit for the Kubernetes API client.
 * `--kube-api-burst` (default: 10): The maximum burst for client-side throttling of the Kubernetes API client.
 
+## API Transport Settings
+
+The kube-apiserver allows at most ~100 concurrent in-flight requests per HTTP/2 connection
+(`SETTINGS_MAX_CONCURRENT_STREAMS`, server default 100), and the controller normally multiplexes
+all API traffic — writes and watch streams alike — over a single connection. Under large bursts
+this caps effective concurrency at ~100 and lets write floods stall watch event delivery. Two
+opt-in flags address this; both defaults preserve the stock single-connection behavior exactly.
+
+* `--separate-watch-connection` (default: false): Give the informer cache's list/watch streams a
+  dedicated HTTP/2 connection, isolated from write traffic, so watch event delivery does not
+  queue behind bursts of concurrent writes.
+* `--api-connections` (default: 1): Number of independent HTTP/2 connections for non-watch API
+  traffic. Values > 1 shard requests round-robin across that many pre-established connections,
+  raising the effective in-flight ceiling to ~N×100.
+
+For high-burst workloads, enable both (e.g. `--separate-watch-connection --api-connections=4`).
+
 ## Cluster Settings
 
 * `--cluster-domain` (default: `cluster.local`): The Kubernetes cluster domain used to
