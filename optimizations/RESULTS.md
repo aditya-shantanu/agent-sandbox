@@ -144,3 +144,18 @@ ROUND2-FINDINGS.md). A/B on the runner VM via the reuse+smoke workflow:
 - Artifacts: gs://kops-state-142966328212/perf-bench-results/round2/
 
 Results: PENDING (legs A then B, sequential).
+
+### Leg A (pre-quickwins @ 6ca3422) — COMPLETE (cluster sandbox-20260719-042602, kept)
+
+Smoke (20 claims, uncontended): create→Ready p50 62ms / p90 79ms — proof that
+warm adoption itself is fast; everything above it is burst contention.
+
+300-burst: p50 1107ms / p90 1610ms / p99 7654ms / all-ready 7.86s (ack p50 152ms).
+
+Adoption segment decomposition (220 sampled "adoption timing" lines):
+creation→winning-pass-entry p50 1169 / p90 1953ms (dominant; retry waves +
+doomed stale passes); pop ~0.1ms; Update p50 99ms; sandbox patch p50 116ms;
+status patch p50 136ms; in-pass total p50 382 / p90 551ms (writes run 3-5×
+the ~30ms server commit — in-flight ceiling). Cold-start fallthroughs logged:
+**183 × "warm pool queue empty"** (the stale-storm duplicate generator,
+directly observed). Leg B (quickwins) pending on the same cluster.
