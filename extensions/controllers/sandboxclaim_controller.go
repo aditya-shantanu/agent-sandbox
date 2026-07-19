@@ -259,6 +259,13 @@ type adoptionTrace struct {
 	flushDur    time.Duration // deferred claim annotation flush Patch (post-status)
 
 	adopted string // sandbox name once an adoption patch was sent this pass
+	// pendingAsync carries the deferred sandbox-side adoption patch of the
+	// one-write adoption path. It is prepared inside
+	// adoptSandboxFromCandidates when OneWriteAdoption is on, and handed to
+	// the flush worker by Reconcile only AFTER the pass has issued the claim
+	// status patch (the single critical write), so the commit order is
+	// status-first on every return path. With the flag off it is never set.
+	pendingAsync *adoptionFlushRequest
 	// assignedPending is the sandbox name whose AssignedSandboxNameAnnotation
 	// still needs persisting on the claim: the adoption transaction no longer
 	// writes the claim before patching the sandbox, so the annotation is
@@ -385,6 +392,21 @@ type SandboxClaimReconciler struct {
 	// the annotation (it uses the claim-UID label index). Wired to
 	// --disable-claim-observability-annotations.
 	DisableObservabilityAnnotations bool
+	// OneWriteAdoption inverts the warm-pool adoption transaction (wired to
+	// --one-write-adoption, default false = the 2-write transaction exactly):
+	// reserve the candidate from the in-memory queue, write the CLAIM STATUS
+	// first (binding + podIPs + forwarded Ready in the one status patch that
+	// already exists — the single critical write), then apply the sandbox
+	// patch (ownership transfer, warm-pool label removal, claim-uid label,
+	// safe-to-evict strip) asynchronously via adoptionFlusher. Claim Ready is
+	// visible to clients after ONE write RTT. See adoption_flush.go for the
+	// full transaction, race and recovery analysis.
+	OneWriteAdoption bool
+	// adoptionFlusher applies deferred sandbox-side adoption patches when
+	// OneWriteAdoption is enabled. Created by SetupWithManager (or by tests);
+	// when nil, deferred patches are applied synchronously at enqueue time so
+	// correctness never depends on the worker being wired.
+	adoptionFlusher *adoptionFlusher
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;update;patch;delete
@@ -433,6 +455,20 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		sinceCreation: reconcileEntry.Sub(claim.CreationTimestamp.Time),
 	}
 	ctx = withAdoptionTrace(ctx, trace)
+	// One-write adoption: the sandbox-side half of the transaction is handed
+	// to the async flush worker only HERE, at pass exit — i.e. strictly after
+	// whichever claim status patch the pass issued — so the claim status
+	// (write 1, the commit point) is always durable before the sandbox patch
+	// is even scheduled. If the status write failed, enqueueing is still
+	// correct: the sandbox patch stamps the claim-UID label + controller ref,
+	// which is exactly the durable record the crash-recovery List
+	// (findAdoptedSandboxByClaimUID) rebinds from on the retry pass.
+	defer func() {
+		if trace.pendingAsync != nil {
+			r.enqueueAdoptionFlush(trace.pendingAsync)
+			trace.pendingAsync = nil
+		}
+	}()
 	defer func() {
 		// One summary line per completed adoption transaction:
 		// grep '"adoption timing"' | jq for post-run analysis.
@@ -1416,7 +1452,50 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			// status write as an observability/recovery hint. Crash recovery
 			// between the two writes is handled by the claim-UID label List in
 			// getOrCreateSandbox, not by the annotation.
-			if err := r.completeAdoption(ctx, claim, adopted); err != nil {
+			//
+			// ONE-WRITE ADOPTION (--one-write-adoption) inverts the order: the
+			// in-memory queue pop above already reserved the candidate for
+			// exactly this claim (single-process exclusivity), so the sandbox
+			// patch is only PREPARED here and deferred to the async flush
+			// worker; the claim status patch later in this pass becomes the
+			// single critical write. The deferred patch keeps the optimistic
+			// lock as the cross-process safety net — if it loses a race the
+			// flusher re-verifies and, on a genuine steal, clears the claim
+			// binding for re-adoption (see adoption_flush.go).
+			if r.OneWriteAdoption {
+				if trace == nil {
+					// Defensive: without a reconcile trace there is no pass
+					// exit to defer to — fall back to the synchronous patch.
+					if err := r.completeAdoption(ctx, claim, adopted); err != nil {
+						if k8errors.IsNotFound(err) {
+							return false, nil
+						}
+						r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
+						if k8errors.IsConflict(err) {
+							return false, nil
+						}
+						return false, err
+					}
+				} else {
+					originalAdopted := adopted.DeepCopy()
+					if err := r.applyAdoptionMutations(ctx, claim, adopted); err != nil {
+						// Mutation errors (template lookup, metadata merge) are
+						// user/config errors surfaced before any API write —
+						// same handling as a non-conflict completeAdoption
+						// failure on the 2-write path.
+						r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
+						logger.Error(err, "Failed to prepare one-write adoption for candidate sandbox", "sandbox candidate", adopted.Name, "claim", claim.Name)
+						return false, err
+					}
+					trace.pendingAsync = &adoptionFlushRequest{
+						claim:     claim.DeepCopy(),
+						mutated:   adopted,
+						original:  originalAdopted,
+						queueKey:  adoptedKey,
+						poolQueue: namespacedWarmPoolNameForQueue,
+					}
+				}
+			} else if err := r.completeAdoption(ctx, claim, adopted); err != nil {
 				if k8errors.IsNotFound(err) {
 					return false, nil
 				}
@@ -1480,6 +1559,33 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 	// Take a snapshot of the sandbox BEFORE we mutate it to generate a clean JSON Patch.
 	originalAdopted := adopted.DeepCopy()
 
+	if err := r.applyAdoptionMutations(ctx, claim, adopted); err != nil {
+		return err
+	}
+
+	// Optimistic lock: two claims racing for the same candidate would otherwise
+	// both send last-writer-wins merge patches, silently transferring the
+	// sandbox twice — the loser then believes it owns a sandbox another claim
+	// walked away with, burns the candidate, and falls through to a cold start.
+	// With the lock the loser gets a 409, which both callers already treat as
+	// "candidate lost, retry with the next one" (queue re-add + bounded retry).
+	patchStart := time.Now()
+	err := r.Patch(ctx, adopted, client.MergeFromWithOptions(originalAdopted, client.MergeFromWithOptimisticLock{}))
+	if trace := adoptionTraceFrom(ctx); trace != nil {
+		trace.completeDur += time.Since(patchStart)
+	}
+	return err
+}
+
+// applyAdoptionMutations applies, IN MEMORY ONLY, every sandbox-side mutation
+// of the adoption transaction: warm-pool label removal, launch-type/identity/
+// template-hash label sync, safe-to-evict strip from the pod template,
+// ownership transfer to the claim, trace-context propagation, and the merged
+// pod-template metadata. completeAdoption sends the resulting diff as one
+// optimistic-lock merge patch; the one-write adoption path defers that same
+// diff to the async flush worker (and re-invokes this to rebuild it against a
+// fresh read after a benign conflict).
+func (r *SandboxClaimReconciler) applyAdoptionMutations(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, adopted *v1beta1.Sandbox) error {
 	templateHash := adopted.Labels[sandboxTemplateRefHash]
 
 	// Remove warm pool labels so the sandbox no longer appears in warm pool queries
@@ -1569,21 +1675,6 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 		if err := r.mergePodMetadata(&adopted.Spec.PodTemplate.ObjectMeta, &claim.Spec.AdditionalPodMetadata); err != nil {
 			return err
 		}
-	}
-
-	// Optimistic lock: two claims racing for the same candidate would otherwise
-	// both send last-writer-wins merge patches, silently transferring the
-	// sandbox twice — the loser then believes it owns a sandbox another claim
-	// walked away with, burns the candidate, and falls through to a cold start.
-	// With the lock the loser gets a 409, which both callers already treat as
-	// "candidate lost, retry with the next one" (queue re-add + bounded retry).
-	patchStart := time.Now()
-	err := r.Patch(ctx, adopted, client.MergeFromWithOptions(originalAdopted, client.MergeFromWithOptimisticLock{}))
-	if trace := adoptionTraceFrom(ctx); trace != nil {
-		trace.completeDur += time.Since(patchStart)
-	}
-	if err != nil {
-		return err
 	}
 
 	return nil
@@ -2041,6 +2132,21 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 				}
 				return sandbox, false, nil
 			}
+			if r.OneWriteAdoption {
+				// Status-first commit: a status-bound sandbox NOT (yet)
+				// controlled by the claim is a one-write adoption in its async
+				// window (patch queued/in flight), its crash window (process
+				// died before the patch landed), or lost to a steal. Without
+				// this handling the pass would fall through and re-enter
+				// adoption — burning a second candidate and potentially
+				// double-binding the claim.
+				if wait, werr := r.recoverStatusFirstBinding(ctx, claim, sandbox); wait || werr != nil {
+					return nil, false, werr
+				}
+				// Fall through: the sandbox was genuinely lost (stolen or
+				// unusable); the paths below re-adopt and the status write
+				// rebinds the claim.
+			}
 		} else if !k8errors.IsNotFound(err) {
 			return nil, false, fmt.Errorf("failed to get sandbox %q from status: %w", statusName, err)
 		}
@@ -2280,6 +2386,79 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 
 	// No warm pool sandbox available; caller decides whether to create
 	return nil, false, nil
+}
+
+// recoverStatusFirstBinding handles the one-write adoption states in which
+// the claim status (write 1, the commit) names a sandbox the claim does not
+// (yet) control. Return contract: (true, err) stops the pass — err is nil or
+// a retry sentinel/real error for Reconcile; (false, nil) tells the caller
+// the binding is genuinely lost (stolen/unusable) and the pass should fall
+// through to re-adoption, which overwrites the stale binding via the normal
+// status write.
+//
+// States, in order:
+//
+//  1. ASYNC WINDOW (same process): triggeredAdoptions records the pending
+//     flush for exactly this claim+sandbox — wait via the bounded requeue;
+//     the flusher (or its steal recovery) always resolves the entry.
+//  2. CRASH WINDOW (restarted process, sandbox still pool-owned, adoptable):
+//     re-apply the sandbox-side patch idempotently via completeAdoption —
+//     the status commit made this claim the rightful owner; only the
+//     sandbox-side record was lost with the process. On a 409/NotFound the
+//     next pass re-reads and re-classifies (a genuine steal then shows a
+//     foreign controller ref and falls to state 3).
+//  3. STOLEN/UNUSABLE (foreign controller ref, or pool-owned but failing
+//     candidate verification): drop any stale in-memory record and let the
+//     pass fall through to re-adoption. Loud log — this is the documented
+//     multi-process window (leader election makes it rare; namespace
+//     sharding removes it).
+func (r *SandboxClaimReconciler) recoverStatusFirstBinding(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, sandbox *v1beta1.Sandbox) (bool, error) {
+	logger := log.FromContext(ctx)
+	statusName := sandbox.Name
+	adoptionKey := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+
+	controllerRef := metav1.GetControllerOf(sandbox)
+	if controllerRef == nil || controllerRef.Kind != "SandboxWarmPool" {
+		// State 3: taken by another owner (or orphaned). The flusher's steal
+		// recovery may already be clearing the status; either way this pass
+		// re-adopts and its status write rebinds the claim.
+		if prev, ok := r.triggeredAdoptions.Load(adoptionKey); ok && prev.uid == claim.UID && prev.sandbox == statusName {
+			r.triggeredAdoptions.Delete(adoptionKey)
+		}
+		logger.Info("ONE-WRITE ADOPTION: status-bound sandbox is owned by another controller; falling through to re-adoption",
+			"claim", claim.Name, "sandbox", statusName, "owner", controllerRef)
+		return false, nil
+	}
+
+	// Still pool-owned.
+	if prev, ok := r.triggeredAdoptions.Load(adoptionKey); ok && prev.uid == claim.UID && prev.sandbox == statusName {
+		// State 1: the async patch is queued/in flight (or landed but the
+		// cache has not converged). Wait — do not re-send.
+		logger.V(4).Info("One-write adoption async window: waiting for the deferred sandbox patch to land/converge",
+			"claim", claim.Name, "sandbox", statusName)
+		return true, fmt.Errorf("%w: sandbox %s (async adoption patch pending)", errAdoptionTriggeredRetry, statusName)
+	}
+
+	// State 2: crash-window recovery.
+	if verr := verifySandboxCandidate(sandbox, claim); verr != nil {
+		logger.Info("ONE-WRITE ADOPTION: status-bound sandbox is pool-owned but no longer adoptable; falling through to re-adoption",
+			"claim", claim.Name, "sandbox", statusName, "reason", verr.Error())
+		return false, nil
+	}
+	if err := r.completeAdoption(ctx, claim, sandbox); err != nil {
+		if k8errors.IsConflict(err) || k8errors.IsNotFound(err) {
+			// Raced another writer (or wrote from a stale cache view): requeue
+			// and re-classify against a fresher read next pass.
+			logger.Info("ONE-WRITE ADOPTION: crash-window recovery patch conflicted; requeueing to re-verify",
+				"claim", claim.Name, "sandbox", statusName, "error", err.Error())
+			return true, fmt.Errorf("%w: sandbox %s (crash-window recovery conflict)", errAdoptionTriggeredRetry, statusName)
+		}
+		return true, fmt.Errorf("failed to recover one-write adoption of %q: %w", statusName, err)
+	}
+	r.triggeredAdoptions.Store(adoptionKey, triggeredAdoptionEntry{uid: claim.UID, sandbox: statusName})
+	logger.Info("ONE-WRITE ADOPTION: recovered crash window — re-applied the sandbox-side adoption patch, waiting for cache convergence",
+		"claim", claim.Name, "sandbox", statusName)
+	return true, fmt.Errorf("%w: sandbox %s", errAdoptionTriggeredRetry, statusName)
 }
 
 // findAdoptedSandboxByClaimUID returns the sandbox already bound to the claim
@@ -2528,6 +2707,17 @@ func (r *SandboxClaimReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWo
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1beta1.Sandbox{},
 		sandboxClaimUIDLabelIndex, sandboxClaimUIDLabelIndexer); err != nil {
 		return fmt.Errorf("failed to index sandboxes by claim UID label: %w", err)
+	}
+
+	// One-write adoption: run the async sandbox-patch flush workers under the
+	// manager (leader-gated). Without the flusher wired, deferred patches
+	// would be applied synchronously at enqueue time — correct, but with the
+	// 2-write latency profile.
+	if r.OneWriteAdoption && r.adoptionFlusher == nil {
+		r.adoptionFlusher = newAdoptionFlusher(r)
+		if err := mgr.Add(r.adoptionFlusher); err != nil {
+			return fmt.Errorf("failed to add one-write adoption flush worker: %w", err)
+		}
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
