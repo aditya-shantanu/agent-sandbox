@@ -159,3 +159,31 @@ status patch p50 136ms; in-pass total p50 382 / p90 551ms (writes run 3-5×
 the ~30ms server commit — in-flight ceiling). Cold-start fallthroughs logged:
 **183 × "warm pool queue empty"** (the stale-storm duplicate generator,
 directly observed). Leg B (quickwins) pending on the same cluster.
+
+### Leg B (+quickwins @ 838427e, same cluster) — COMPLETE, ROUND-2 VERDICT
+
+Smoke: p50 79ms. 300-burst: p50 1490 / p90 3116 / p99 3432 / **all-ready 3.45s**.
+
+| | Leg A (pre) | Leg B (quickwins) |
+|---|---|---|
+| cold-start fallthroughs | 183 | **0** |
+| adoption conflicts | ~45% PUT 409 | **~0** |
+| stale passes doing writes | hundreds | 0 (521 suppressed by guard) |
+| p99 / max | 7.65s / 7.86s | **3.43s / 3.45s** |
+| time to ALL ready | 7.86s | **3.45s (2.3×)** |
+| p50 / p90 | 1107 / 1610ms | 1490 / 3116ms (regressed) |
+
+Verdict: the quick-wins eliminate ALL pathology (cold starts, conflicts,
+wasted pods, unstable tail) and cut all-ready 2.3×, at the cost of a fairer
+but slower median: leg A's low median was lucky racers profiting from a storm
+that starved the tail. Leg B is a clean pipeline whose bound is now visible
+in the segments: write RTTs double under 300 simultaneous passes (update
+110 / patch 216 / status 179ms p50; in-pass total 617ms) vs ~30ms server
+commits → the ~100-stream in-flight ceiling × 3 serial writes IS the
+remaining bottleneck. queueLat p50 1739ms = waiting for a pipeline slot.
+
+Round-3 levers (design items from ROUND2-FINDINGS.md, now data-confirmed):
+1. Collapse 3 writes → 2 (sandbox patch as the adoption lock).
+2. Raise the in-flight ceiling (HTTP/2 transport sharding / MaxConcurrentStreams).
+Both attack the 617ms in-pass cost and the pipeline depth directly.
+Full-pool A vs B artifacts: gs://kops-state-142966328212/perf-bench-results/round2/
