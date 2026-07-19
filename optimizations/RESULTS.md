@@ -71,7 +71,24 @@ burns a candidate forces a cold start.
   forwards the warm sandbox's Ready condition, whose lastTransitionTime
   predates claim creation.
 
-### baseline2 (fresh cluster, started 02:41 UTC): RUNNING
+### baseline2 (`perf-baseline-bench`, fresh cluster, 2026-07-19 02:41 UTC start) — COMPLETE
+
+300/300 Ready, 0 failed, phase wall 113.8s. VM client (in-region; ack p50 147ms).
+
+| metric | value |
+|---|---|
+| create→Ready | p50 2539ms / **p90 5546ms** / p99 19.1s / max 20.2s |
+| time to ALL 300 Ready | 20.25s |
+| ready throughput | steady 48.9/s, overall 15.0/s |
+
+Confirms baseline1's magnitude from an in-region client (baseline1's Mac WAN
+was not the story). Note the tail (p99 19.1s vs baseline1's 6.7s) — the
+unoptimized tail is run-to-run unstable, consistent with conflict/backoff
+storms.
+
+**A/B so far (both VM-measured):** p90 5.55s → 1.49s (3.7×), all-ready
+20.25s → 6.74s (3.0×), steady throughput 48.9/s → 210.8/s (4.3×).
+
 ### candidate2 (fresh cluster, started 02:43 UTC): RUNNING
 
 Artifacts: `gs://kops-state-142966328212/perf-bench-results/latest/`.
