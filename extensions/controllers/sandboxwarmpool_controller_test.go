@@ -2510,3 +2510,261 @@ func TestObserveMembersForReplenish(t *testing.T) {
 		require.Nil(t, r.replenishState[key])
 	})
 }
+
+func TestTakeRefillTokens(t *testing.T) {
+	key := types.NamespacedName{Namespace: "default", Name: "test-pool"}
+	base := time.Now()
+
+	t.Run("rate zero bypasses the bucket and keeps no state", func(t *testing.T) {
+		r := &SandboxWarmPoolReconciler{}
+		granted, wait := r.takeRefillTokens(key, 300, base)
+		require.Equal(t, int32(300), granted)
+		require.Zero(t, wait)
+		require.Nil(t, r.refillState)
+	})
+
+	t.Run("non-positive want is a passthrough", func(t *testing.T) {
+		r := &SandboxWarmPoolReconciler{MaxRefillRate: 5}
+		granted, wait := r.takeRefillTokens(key, 0, base)
+		require.Equal(t, int32(0), granted)
+		require.Zero(t, wait)
+		require.Nil(t, r.refillState, "no bucket may be allocated for a zero-deficit pool")
+	})
+
+	t.Run("new bucket starts full and grants at most capacity", func(t *testing.T) {
+		r := &SandboxWarmPoolReconciler{MaxRefillRate: 4}
+		granted, wait := r.takeRefillTokens(key, 10, base)
+		require.Equal(t, int32(4), granted, "capacity is one second of creates")
+		require.Equal(t, 250*time.Millisecond, wait, "next token accrues in 1/rate")
+	})
+
+	t.Run("tokens accrue with elapsed time and cap at one second of creates", func(t *testing.T) {
+		r := &SandboxWarmPoolReconciler{MaxRefillRate: 2}
+		granted, _ := r.takeRefillTokens(key, 5, base) // drain the initial 2
+		require.Equal(t, int32(2), granted)
+
+		// No time passed: nothing accrued.
+		granted, wait := r.takeRefillTokens(key, 3, base)
+		require.Equal(t, int32(0), granted)
+		require.Equal(t, 500*time.Millisecond, wait)
+
+		// Half a second: exactly one token.
+		granted, wait = r.takeRefillTokens(key, 3, base.Add(500*time.Millisecond))
+		require.Equal(t, int32(1), granted)
+		require.Equal(t, 500*time.Millisecond, wait)
+
+		// A long idle period accrues only up to capacity (no banked burst).
+		granted, wait = r.takeRefillTokens(key, 5, base.Add(time.Hour))
+		require.Equal(t, int32(2), granted)
+		require.Equal(t, 500*time.Millisecond, wait)
+	})
+
+	t.Run("fractional rate paces below one create per second", func(t *testing.T) {
+		r := &SandboxWarmPoolReconciler{MaxRefillRate: 0.5}
+		granted, wait := r.takeRefillTokens(key, 2, base)
+		require.Equal(t, int32(1), granted, "capacity floor is one token")
+		require.Equal(t, 2*time.Second, wait, "next token at 1/rate")
+	})
+
+	t.Run("forgetReplenishState clears the bucket", func(t *testing.T) {
+		r := &SandboxWarmPoolReconciler{MaxRefillRate: 2}
+		granted, _ := r.takeRefillTokens(key, 5, base)
+		require.Equal(t, int32(2), granted)
+		r.forgetReplenishState(key)
+		require.Nil(t, r.refillState[key])
+		// Re-observation starts with a fresh full bucket.
+		granted, _ = r.takeRefillTokens(key, 5, base)
+		require.Equal(t, int32(2), granted)
+	})
+}
+
+func TestReconcilePoolMaxRefillRate(t *testing.T) {
+	poolNamespace := "default"
+	poolNameHash := sandboxcontrollers.NameHash("test-pool")
+	scheme := newTestScheme()
+	ctx := context.Background()
+
+	newReconciler := func(rate float64, delay time.Duration, now *time.Time, initialObjs ...runtime.Object) *SandboxWarmPoolReconciler {
+		return &SandboxWarmPoolReconciler{
+			Client:         newFakeClient(scheme, initialObjs...),
+			Scheme:         scheme,
+			MaxBatchSize:   sandboxCreateDeleteMaxBatchSize,
+			ReplenishDelay: delay,
+			MaxRefillRate:  rate,
+			clock:          func() time.Time { return *now },
+		}
+	}
+
+	countOwned := func(t *testing.T, r *SandboxWarmPoolReconciler, warmPool *extensionsv1beta1.SandboxWarmPool) int {
+		t.Helper()
+		return countPoolOwnedSandboxes(t, ctx, r.Client, poolNamespace, poolNameHash, warmPool.UID)
+	}
+
+	t.Run("rate zero fills the whole deficit in one reconcile and keeps no bucket state", func(t *testing.T) {
+		now := time.Now()
+		warmPool := newReplenishTestPool(3)
+		r := newReconciler(0, 0, &now, createTemplate(poolNamespace))
+
+		requeue, err := r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Zero(t, requeue)
+		require.Equal(t, 3, countOwned(t, r, warmPool))
+		require.Nil(t, r.refillState, "unshaped path must not allocate refill state")
+	})
+
+	t.Run("rate paces creates across reconciles with token-timed requeues", func(t *testing.T) {
+		// replicas=5, rate=2/s (bucket capacity 2): expect 2, 0, 1, 2 creates
+		// as the clock advances, with 500ms token waits in between.
+		now := time.Now()
+		warmPool := newReplenishTestPool(5)
+		r := newReconciler(2, 0, &now, createTemplate(poolNamespace))
+
+		// Pass 1: full bucket grants one second of creates, remainder paced.
+		requeue, err := r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Equal(t, 500*time.Millisecond, requeue, "requeue must land on the next token")
+		require.Equal(t, 2, countOwned(t, r, warmPool))
+
+		// Pass 2, same instant: bucket empty, zero creates, same wait.
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Equal(t, 500*time.Millisecond, requeue)
+		require.Equal(t, 2, countOwned(t, r, warmPool), "no creates may happen with an empty bucket")
+
+		// Pass 3, +500ms: exactly one token accrued.
+		now = now.Add(500 * time.Millisecond)
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Equal(t, 500*time.Millisecond, requeue)
+		require.Equal(t, 3, countOwned(t, r, warmPool))
+
+		// Pass 4, +2s: accrual caps at capacity, which covers the remaining
+		// deficit exactly — no further requeue.
+		now = now.Add(2 * time.Second)
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Zero(t, requeue)
+		require.Equal(t, 5, countOwned(t, r, warmPool))
+
+		// Steady state: full pool, nothing to pace.
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Zero(t, requeue)
+		require.Equal(t, 5, countOwned(t, r, warmPool))
+	})
+
+	t.Run("replenish delay defers the start, rate shapes the flow", func(t *testing.T) {
+		const delay = 5 * time.Second
+		now := time.Now()
+		warmPool := newReplenishTestPool(3)
+		template := createTemplate(poolNamespace)
+
+		// Start from a full pool of ready members so only the adoption drop
+		// exercises the delay+rate interaction (initial fill would otherwise
+		// consume the bucket).
+		makeSandbox := func(suffix string) *sandboxv1beta1.Sandbox {
+			sb := createPoolSandbox("test-pool", poolNamespace, poolNameHash, template, suffix)
+			sb.CreationTimestamp = metav1.Time{Time: now.Add(-time.Hour)}
+			sb.Status.Conditions = []metav1.Condition{{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			}}
+			return sb
+		}
+		r := newReconciler(1, delay, &now, template,
+			makeSandbox("-aaa"), makeSandbox("-bbb"), makeSandbox("-ccc"))
+
+		// Baseline: full pool, no hold, no pacing.
+		requeue, err := r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Zero(t, requeue)
+
+		// A claim burst adopts two members.
+		list := &sandboxv1beta1.SandboxList{}
+		require.NoError(t, r.List(ctx, list, &client.ListOptions{Namespace: poolNamespace}))
+		adopted := 0
+		for i := range list.Items {
+			if adopted == 2 {
+				break
+			}
+			sb := &list.Items[i]
+			if ref := metav1.GetControllerOf(sb); ref == nil || ref.UID != warmPool.UID {
+				continue
+			}
+			adoptSandboxByClaim(t, ctx, r.Client, sb, fmt.Sprintf("claim-uid-%d", adopted))
+			adopted++
+		}
+		require.Equal(t, 2, adopted)
+
+		// Drop observed: the hold defers the START — zero creates, no tokens
+		// consumed, status stays truthful.
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Equal(t, delay, requeue)
+		require.Equal(t, 1, countOwned(t, r, warmPool))
+		require.Equal(t, int32(1), warmPool.Status.Replicas)
+		require.Nil(t, r.refillState[types.NamespacedName{Namespace: poolNamespace, Name: "test-pool"}],
+			"the bucket must not be touched while the hold is active")
+
+		// Mid-window: still deferred for the remainder.
+		now = now.Add(2 * time.Second)
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Equal(t, 3*time.Second, requeue)
+		require.Equal(t, 1, countOwned(t, r, warmPool))
+
+		// Hold expired: the rate now shapes the FLOW — one create per second,
+		// starting with at most one second's worth (capacity 1).
+		now = now.Add(3500 * time.Millisecond)
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Equal(t, time.Second, requeue, "remainder paced at 1/rate")
+		require.Equal(t, 2, countOwned(t, r, warmPool))
+
+		// Next token: pool back to full, stream stops. Status keeps
+		// reporting the observed (pre-create) count, exactly as in the
+		// unshaped path.
+		now = now.Add(time.Second)
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Zero(t, requeue)
+		require.Equal(t, 3, countOwned(t, r, warmPool))
+		require.Equal(t, int32(2), warmPool.Status.Replicas, "status reflects the count observed at pass start")
+
+		// Steady state: the next pass observes the full pool.
+		requeue, err = r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Zero(t, requeue)
+		require.Equal(t, 3, countOwned(t, r, warmPool))
+		require.Equal(t, int32(3), warmPool.Status.Replicas)
+	})
+
+	t.Run("GC of stuck members proceeds while refill is paced", func(t *testing.T) {
+		now := time.Now()
+		warmPool := newReplenishTestPool(2)
+		template := createTemplate(poolNamespace)
+
+		// One healthy ready member and one stuck member past the readiness
+		// grace period; deficit after GC is 1, granted from the full bucket.
+		healthy := createPoolSandbox("test-pool", poolNamespace, poolNameHash, template, "-aaa")
+		healthy.CreationTimestamp = metav1.Time{Time: now.Add(-time.Hour)}
+		healthy.Status.Conditions = []metav1.Condition{{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionTrue,
+		}}
+		stuck := createPoolSandbox("test-pool", poolNamespace, poolNameHash, template, "-bbb")
+		stuck.CreationTimestamp = metav1.Time{Time: now.Add(-time.Hour)}
+		stuck.Status.Conditions = []metav1.Condition{{
+			Type:   string(sandboxv1beta1.SandboxConditionReady),
+			Status: metav1.ConditionFalse,
+		}}
+		r := newReconciler(1, 0, &now, template, healthy, stuck)
+
+		requeue, err := r.reconcilePool(ctx, warmPool)
+		require.NoError(t, err)
+		require.Zero(t, requeue, "replacement fits in the initial bucket")
+		err = r.Get(ctx, types.NamespacedName{Namespace: poolNamespace, Name: "test-pool-bbb"}, &sandboxv1beta1.Sandbox{})
+		require.True(t, k8serrors.IsNotFound(err), "stuck sandbox must be GC'd regardless of pacing")
+		require.Equal(t, 2, countOwned(t, r, warmPool))
+	})
+}

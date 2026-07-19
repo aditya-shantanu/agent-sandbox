@@ -81,6 +81,7 @@ func main() {
 	var sandboxTemplateConcurrentWorkers int
 	var sandboxWarmPoolMaxBatchSize int
 	var sandboxWarmPoolReplenishDelay time.Duration
+	var sandboxWarmPoolMaxRefillRate float64
 	var enableWarmPoolEviction bool
 	var disableClaimEvents bool
 	var watchNamespaces string
@@ -142,6 +143,11 @@ func main() {
 		"How long the SandboxWarmPool controller defers creating replacement sandboxes after pool members drop out of the pool "+
 			"(e.g. a burst of SandboxClaims adopting warm sandboxes), so the burst gets API server priority. "+
 			"The hold re-arms while members keep dropping. 0 (default) replenishes immediately.")
+	flag.Float64Var(&sandboxWarmPoolMaxRefillRate, "sandbox-warm-pool-max-refill-rate", 0,
+		"Max rate (sandboxes/second, per pool) at which the SandboxWarmPool controller creates replacement sandboxes, "+
+			"pacing refill into a smooth stream instead of full-deficit bursts that flood the write path and compete with claim adoption. "+
+			"Composes with --sandbox-warm-pool-replenish-delay: the delay defers the start of refill, the rate shapes its flow. "+
+			"0 (default) leaves refill unpaced (whole deficit per reconcile).")
 	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
 	flag.BoolVar(&disableClaimEvents, "disable-claim-events", false,
 		"Disable Kubernetes Event emission from the SandboxClaim controller (hot-path Eventf calls become no-ops), "+
@@ -516,6 +522,7 @@ func main() {
 			MaxBatchSize:           sandboxWarmPoolMaxBatchSize,
 			EnableWarmPoolEviction: enableWarmPoolEviction,
 			ReplenishDelay:         sandboxWarmPoolReplenishDelay,
+			MaxRefillRate:          sandboxWarmPoolMaxRefillRate,
 		}).SetupWithManager(mgr, sandboxWarmPoolConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxWarmPool")
 			os.Exit(1)
