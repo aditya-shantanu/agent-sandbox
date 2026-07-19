@@ -43,9 +43,36 @@ client-observed numbers from here on have no WAN component and are NOT
 directly comparable to baseline1's client-observed row; the controller-internal
 metric is comparable across all runs).
 
-- candidate1 (`perf-investigation-master` @ 910dd2f): PENDING
-- baseline2 (`perf-baseline-bench` @ 36f8820, fresh cluster): PENDING
-- candidate2 (`perf-investigation-master` @ 910dd2f, fresh cluster): PENDING
+### candidate1 (`perf-investigation-master`, run 2026-07-19 02:23-02:41 UTC) — COMPLETE
+
+300/300 Ready, 0 failed, phase wall 56.5s. Client on VM (in-region):
+
+| metric | value |
+|---|---|
+| create ack | p50 103ms / p90 125ms / max 144ms |
+| create→Ready | p50 952ms / **p90 1489ms** / p99 5597ms / max 6735ms |
+| time to ALL 300 Ready | **6.74s** (baseline1: 13.82s, but that client was WAN-inflated) |
+| ready throughput | steady 210.8/s (baseline1: 45.8/s) |
+
+**Anomaly:** ~16 claims cold-started (48 cold-launch metric observations;
+baseline1 had zero). Cold pod creation (~3-6s) explains the p99/max tail.
+Under investigation — with pool=300 for 300 claims, any adoption race that
+burns a candidate forces a cold start.
+
+**Measurement notes discovered on this run:**
+- The cumulative `claim_controller_startup_latency_ms` histogram is polluted
+  by re-records (911 warm observations for 300 claims; re-recorded durations
+  grow with time since first-observed, so tail quantiles from the cumulative
+  histogram exceed true end-to-end latency). Do not read absolute quantiles
+  off the cumulative histogram; compare like-for-like or use windowed rate()
+  as CL2 does — or rely on the in-region client-observed table, whose client
+  overhead is ~100ms ack + in-region watch delivery.
+- Server-side condition timestamps cannot measure warm adoption: the claim
+  forwards the warm sandbox's Ready condition, whose lastTransitionTime
+  predates claim creation.
+
+### baseline2 (fresh cluster, started 02:41 UTC): RUNNING
+### candidate2 (fresh cluster, started 02:43 UTC): RUNNING
 
 Artifacts: `gs://kops-state-142966328212/perf-bench-results/latest/`.
 
