@@ -86,6 +86,7 @@ func main() {
 	var disableClaimEvents bool
 	var watchNamespaces string
 	var disableClaimObservabilityAnnotations bool
+	var oneWriteAdoption bool
 	var cacheLabelSelectors bool
 	var printVersion bool
 	var webhookPort int
@@ -165,6 +166,18 @@ func main() {
 			"same-process metrics and trace propagation, and adoption crash recovery is unaffected (it uses the "+
 			"claim-UID label index on Sandboxes, not the annotation). Costs the on-object debugging breadcrumbs and, "+
 			"after a controller restart, the startup-latency metric for claims first observed by the previous process.")
+	flag.BoolVar(&oneWriteAdoption, "one-write-adoption", false,
+		"Commit warm-pool adoption with a single critical write: the claim status patch (sandbox binding + podIPs + forwarded "+
+			"Ready) is written FIRST, and the sandbox-side patch (ownership transfer, warm-pool label removal, claim-uid label, "+
+			"safe-to-evict strip) is applied asynchronously by a bounded flush worker (sub-second target), so claims observe Ready "+
+			"after ONE write RTT and hot-path write concurrency halves. The deferred sandbox patch keeps its optimistic lock as the "+
+			"cross-process safety net: if it loses a race the controller re-verifies and, on a genuine steal, clears the stale claim "+
+			"binding and re-adopts (bounded retries, loud logs). CAVEATS: candidate exclusivity before the async patch lands relies "+
+			"on the in-process adoption queue — keep leader election on (default) and use disjoint --watch-namespaces shards for "+
+			"multi-instance deployments; running multiple active instances over the SAME namespaces widens the steal window from "+
+			"leader-failover-only to every adoption. The claimed pod also keeps the cluster-autoscaler safe-to-evict=true annotation "+
+			"until the async patch and the next sandbox reconcile land (sub-second exposure to scale-down eviction). Default false "+
+			"preserves today's 2-write adoption transaction exactly.")
 	flag.BoolVar(&cacheLabelSelectors, "cache-label-selectors", false,
 		"Scope the manager's Pod and Service informer caches to objects carrying the sandbox tracking label ("+
 			controllers.SandboxNameHashLabel+"). The controller only ever creates/looks up pods and Services it "+
@@ -501,6 +514,7 @@ func main() {
 			Tracer:                          instrumenter,
 			AllowedLabelDomains:             allowedDomains,
 			DisableObservabilityAnnotations: disableClaimObservabilityAnnotations,
+			OneWriteAdoption:                oneWriteAdoption,
 		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
 			os.Exit(1)
