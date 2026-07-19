@@ -18,7 +18,12 @@ latency investigation (branch `perf-investigation-master`). GCP project:
 
 Bootstrap + orchestration scripts live in
 `gs://kops-state-142966328212/perf-bench-scripts/` (`vm-bootstrap.sh`,
-`vm-orchestrate.sh`). Repo clones on the VM: `/root/repo-baseline` (branch
+`vm-orchestrate.sh`) — canonical copies are checked in under
+`optimizations/infra/`: Terraform for the VM in `infra/terraform/` (import the
+live VM or apply fresh), the VM scripts and helpers in `infra/scripts/`
+(`launch-runner.sh` uploads scripts + relaunches without SSH,
+`run-ab-reuse.sh` is the sequential one-cluster A/B, `cleanup-leaks.sh`
+sweeps leaked clusters/VM). Repo clones on the VM: `/root/repo-baseline` (branch
 `perf-baseline-bench`) and `/root/repo-candidate`
 (`perf-investigation-master`). SSH requires interactive corp auth
 (IAP/OS Login); monitoring therefore goes through GCS heartbeats (below), not SSH.
