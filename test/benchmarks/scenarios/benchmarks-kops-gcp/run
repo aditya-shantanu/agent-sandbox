@@ -199,7 +199,7 @@ echo "Exporting kubeconfig..."
 kops export kubeconfig --name "${CLUSTER_NAME}" --admin
 
 echo "Waiting for cluster to be ready..."
-kops validate cluster --wait 10m
+kops validate cluster --wait 20m
 
 if [[ "${CNI}" == "cilium" ]]; then
   # Raise Cilium's endpoint-create API rate limit. The agent rate-limits
@@ -227,7 +227,7 @@ if [[ "${CNI}" == "cilium" ]]; then
   # out). Delete the agent pods so the DaemonSet brings them back with the
   # new config, then re-validate the cluster to wait for them to be Ready.
   kubectl --namespace kube-system delete pods --selector=k8s-app=cilium
-  kops validate cluster --wait 5m
+  kops validate cluster --wait 10m
 fi
 
 # Deploy to cluster
