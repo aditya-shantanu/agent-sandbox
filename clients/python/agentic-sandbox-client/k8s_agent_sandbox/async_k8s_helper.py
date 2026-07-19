@@ -124,15 +124,38 @@ class AsyncK8sHelper:
         name. This method watches the SandboxClaim until the sandbox name
         appears in the claim's status, then returns it.
         """
+        return await self._watch_claim(claim_name, namespace, timeout, require_ready=False)
+
+    async def wait_for_claim_ready(self, claim_name: str, namespace: str, timeout: int) -> str:
+        """Watches the SandboxClaim until it is bound to a sandbox AND its
+        Ready condition is True, then returns the sandbox name.
+
+        This is the lowest-latency ready-wait: the claim controller writes
+        ``status.sandbox.name``, ``status.sandbox.podIPs`` and the forwarded
+        Ready condition in a single status update on warm-pool adoption, so a
+        single watch on the claim observes readiness without a second watch
+        on the Sandbox resource (the claim's Ready condition is a direct
+        forward of the Sandbox's Ready condition).
+        """
+        return await self._watch_claim(claim_name, namespace, timeout, require_ready=True)
+
+    async def _watch_claim(self, claim_name: str, namespace: str, timeout: int, require_ready: bool) -> str:
+        """Shared SandboxClaim watch loop.
+
+        Returns the sandbox name once ``status.sandbox.name`` is populated;
+        when ``require_ready`` is set, additionally waits until the claim's
+        Ready condition is True.
+        """
         await self._ensure_initialized()
 
+        goal = "claim readiness" if require_ready else "sandbox name"
         deadline = time.monotonic() + timeout
-        logger.info(f"Resolving sandbox name from claim '{claim_name}'...")
+        logger.info(f"Watching claim '{claim_name}' for {goal}...")
         while True:
             remaining = int(deadline - time.monotonic())
             if remaining <= 0:
                 raise TimeoutError(
-                    f"Could not resolve sandbox name from claim "
+                    f"Could not resolve {goal} from claim "
                     f"'{claim_name}' within {timeout} seconds."
                 )
             w = watch.Watch()
@@ -155,7 +178,8 @@ class AsyncK8sHelper:
                     if event["type"] in ["ADDED", "MODIFIED"]:
                         claim_object = event["object"]
                         status = claim_object.get("status") or {}
-                        
+
+                        ready = False
                         for cond in status.get("conditions", []):
                             if (
                                 cond.get("type") == "Ready"
@@ -169,12 +193,17 @@ class AsyncK8sHelper:
                                 raise SandboxWarmPoolNotFoundError(
                                     f"SandboxWarmPool requested does not exist: {cond.get('message', 'WarmPool not found')}"
                                 )
+                            if cond.get("type") == "Ready" and cond.get("status") == "True":
+                                ready = True
 
                         sandbox_status = status.get("sandbox", {})
                         # Support both 'name' (standard) and 'Name' (legacy, before CRD rename in #440)
                         name = sandbox_status.get("name", "") or sandbox_status.get("Name", "")
-                        if name:
-                            logger.info(f"Resolved sandbox name '{name}' from claim status")
+                        if name and (ready or not require_ready):
+                            logger.info(
+                                f"Resolved sandbox name '{name}' from claim status"
+                                + (" (claim Ready)" if ready else "")
+                            )
                             return name
             finally:
                 await w.close()
