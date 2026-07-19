@@ -370,6 +370,13 @@ func main() {
 		LeaderElection:          enableLeaderElection,
 		LeaderElectionNamespace: leaderElectionNamespace,
 		LeaderElectionID:        "a3317529.agent-sandbox.x-k8s.io",
+		// Release the leader Lease on graceful shutdown so a rolling update
+		// hands over in ~0-2s instead of waiting out the full 15s
+		// LeaseDuration — at 500 claims/s that difference is ~7,500 claims
+		// queueing with no active controller (round-5b robustness audit).
+		// Crash failover still pays lease expiry by design (split-brain
+		// safety); only clean exits release early.
+		LeaderElectionReleaseOnCancel: true,
 	}
 	// Static namespace sharding (SCALE-ROADMAP.md R4.4, see sharding.go):
 	// scope the cache's watches server-side to this shard's namespaces and
