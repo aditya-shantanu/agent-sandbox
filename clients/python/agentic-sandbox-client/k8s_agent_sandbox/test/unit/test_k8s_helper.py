@@ -681,5 +681,93 @@ class TestK8sHelperWaitForGatewayIP(unittest.TestCase):
         self.assertEqual(ip, "192.168.1.1")
 
 
+@patch("k8s_agent_sandbox.k8s_helper.client.CoreV1Api")
+@patch("k8s_agent_sandbox.k8s_helper.client.CustomObjectsApi")
+@patch("k8s_agent_sandbox.k8s_helper.config")
+class TestK8sHelperWatchResourceVersion(unittest.TestCase):
+    """The claim ready-wait watch must always carry an explicit
+    resourceVersion (the created claim's, or "0") so the apiserver serves it
+    from the watch cache — an unset resourceVersion forces a quorum etcd read
+    to establish initial state on every wait."""
+
+    @staticmethod
+    def _ready_event(rv="7"):
+        return {
+            "type": "MODIFIED",
+            "object": {
+                "metadata": {"name": "test-claim", "resourceVersion": rv},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "sandbox": {"name": "warm-sandbox-1"},
+                },
+            },
+        }
+
+    def test_create_sandbox_claim_returns_api_response(self, mock_config, mock_api_cls, mock_core_cls):
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+        mock_api.create_namespaced_custom_object.return_value = {
+            "metadata": {"name": "test-claim", "resourceVersion": "42"}
+        }
+
+        helper = K8sHelper()
+        resp = helper.create_sandbox_claim("test-claim", "test-warmpool", "test-namespace")
+        self.assertEqual(resp["metadata"]["resourceVersion"], "42")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_defaults_to_resource_version_zero(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_watch.stream.return_value = [self._ready_event()]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(mock_watch.stream.call_args.kwargs["resource_version"], "0")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_starts_from_created_claim_resource_version(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_watch.stream.return_value = [self._ready_event()]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5, resource_version="12345")
+
+        self.assertEqual(name, "warm-sandbox-1")
+        self.assertEqual(mock_watch.stream.call_args.kwargs["resource_version"], "12345")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_410_gone_restarts_from_zero(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        """A compacted-away resourceVersion (410 Gone) restarts the watch
+        from "0" instead of failing the wait."""
+        mock_watch = MagicMock()
+        mock_watch.stream.side_effect = [
+            client.ApiException(status=410),
+            [self._ready_event()],
+        ]
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        name = helper.wait_for_claim_ready("test-claim", "default", timeout=5, resource_version="12345")
+
+        self.assertEqual(name, "warm-sandbox-1")
+        first, second = mock_watch.stream.call_args_list
+        self.assertEqual(first.kwargs["resource_version"], "12345")
+        self.assertEqual(second.kwargs["resource_version"], "0")
+
+    @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
+    def test_watch_non_410_api_exception_reraises(self, mock_watch_class, mock_config, mock_api_cls, mock_core_cls):
+        mock_watch = MagicMock()
+        mock_watch.stream.side_effect = client.ApiException(status=403)
+        mock_watch_class.return_value = mock_watch
+
+        helper = K8sHelper()
+        with self.assertRaises(client.ApiException) as ctx:
+            helper.wait_for_claim_ready("test-claim", "default", timeout=5)
+        self.assertEqual(ctx.exception.status, 403)
+
+
 if __name__ == '__main__':
     unittest.main()
