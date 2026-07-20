@@ -193,6 +193,19 @@ type Config struct {
 	// harness and inflate measured create-ack; see clientconns.go.
 	ClientConnections int `json:"clientConnections"`
 
+	// PerNamespaceClaimWatch replaces the single cluster-wide SandboxClaim
+	// watch with one namespace-scoped watch per claims namespace (the run
+	// namespace plus the sustained phase's <ns>-s1..sN shards). Each shard
+	// is its own server-side watch stream with its own per-watcher dispatch
+	// queue (~0.7-0.9ms/event pace, PATH-TO-100MS §1.3), so under burst the
+	// Ready-delivery backlog splits across shards instead of queueing behind
+	// the whole herd's ADDED events on one stream. This is the sharded
+	// session-watch shape SUB-FLOOR option 5b prescribes for multi-claim
+	// clients (a production SDK holding one watch per claim has NO backlog;
+	// this mode brackets the shared-observer cost in between). Default off:
+	// the single-stream shape is the historical measurement.
+	PerNamespaceClaimWatch bool `json:"perNamespaceClaimWatch"`
+
 	CollectMetrics  bool          `json:"collectMetrics"`
 	MetricsInterval time.Duration `json:"metricsIntervalNanos"`
 
@@ -241,6 +254,7 @@ func run(ctx context.Context) error {
 	flag.IntVar(&cfg.SustainedNamespaces, "sustained-namespaces", 1, "Spread the sustained phase's pools and claims across N pre-created namespaces (1 = run in the test namespace)")
 	flag.DurationVar(&cfg.SustainedPoolHeadroom, "sustained-pool-headroom", 10*time.Second, "Warm pool sizing for the sustained phase: each namespace's pool has ceil(rate/namespaces * headroom-seconds) replicas; must cover the controller's replenish delay + refill p99")
 	flag.IntVar(&cfg.ClientConnections, "client-connections", 1, "Shard the harness's mutating API requests across N HTTP/2 connections; 1 = single connection shared with watches (historical behavior, subject to the apiserver's ~100-streams-per-connection cap)")
+	flag.BoolVar(&cfg.PerNamespaceClaimWatch, "per-namespace-claim-watch", false, "Open one namespace-scoped SandboxClaim watch per claims namespace instead of the single cluster-wide stream (splits the server-side per-watcher event backlog across shards; see Config.PerNamespaceClaimWatch)")
 	flag.BoolVar(&cfg.CollectMetrics, "collect-metrics", true, "Whether to scrape Prometheus metrics from the control plane, the sandbox controller, and kubelets to metrics.jsonl.gz")
 	flag.DurationVar(&cfg.MetricsInterval, "metrics-interval", 15*time.Second, "Interval between Prometheus metrics scrapes")
 	flag.BoolVar(&cfg.ProfileAPIServer, "profile-apiserver", true, "Capture a kube-apiserver CPU profile during each throughput level (pprof-apiserver-<phase>.pprof)")
@@ -397,31 +411,51 @@ func run(ctx context.Context) error {
 	// Only watch SandboxClaims when a claims phase runs: the extensions
 	// CRDs may not be installed otherwise, and a missing CRD would make the
 	// watcher retry-loop for the whole run.
-	if hasClaimsPhase(cfg.Phases) {
-		gvrList = append(gvrList, schema.GroupVersionResource{Group: "extensions.agents.x-k8s.io", Version: "v1beta1", Resource: "sandboxclaims"})
+	if hasClaimsPhase(cfg.Phases) && !cfg.PerNamespaceClaimWatch {
+		gvrList = append(gvrList, gvrSandboxClaims)
+	}
+
+	// recordEvent builds the shared watch callback: milestone tracking first
+	// (cheap and time-sensitive), then the watch log write.
+	recordEvent := func(gvr schema.GroupVersionResource) func(event WatchEventRecord) error {
+		return func(event WatchEventRecord) error {
+			if u, ok := event.Object.(*unstructured.Unstructured); ok {
+				tracker.HandleWatchEvent(gvr.Resource, event.Type, u)
+			} else if event.Object != nil {
+				return fmt.Errorf("unhandled type in event %T", event.Object)
+			}
+
+			if writeToFileChannel != nil {
+				select {
+				case writeToFileChannel <- event:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
 	}
 
 	for _, gvr := range gvrList {
 		taskRunner.RunAsync(ctx, func(ctx context.Context) error {
-			return watchResource(ctx, dynamicClient, gvr, func(event WatchEventRecord) error {
-				// Update milestone tracking first: it is cheap and time-sensitive,
-				// while the file write may block briefly on the writer.
-				if u, ok := event.Object.(*unstructured.Unstructured); ok {
-					tracker.HandleWatchEvent(gvr.Resource, event.Type, u)
-				} else if event.Object != nil {
-					return fmt.Errorf("unhandled type in event %T", event.Object)
-				}
-
-				if writeToFileChannel != nil {
-					select {
-					case writeToFileChannel <- event:
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				}
-				return nil
-			})
+			return watchResource(ctx, dynamicClient, gvr, recordEvent(gvr))
 		})
+	}
+
+	// Sharded claims watches (--per-namespace-claim-watch): one stream per
+	// claims namespace. The sustained shard namespaces have deterministic
+	// names and namespace-scoped watches are valid before the namespace
+	// exists, so all shards start here alongside the other watchers. Events
+	// from all shards feed the same tracker and watch log; per-claim records
+	// and quantiles are computed identically to the single-stream mode.
+	if hasClaimsPhase(cfg.Phases) && cfg.PerNamespaceClaimWatch {
+		namespaces := claimWatchNamespaces(cfg)
+		log.Printf("Claims watch sharded per namespace (%d shard(s)): %v", len(namespaces), namespaces)
+		for _, ns := range namespaces {
+			taskRunner.RunAsync(ctx, func(ctx context.Context) error {
+				return watchResourceInNamespace(ctx, dynamicClient, gvrSandboxClaims, ns, recordEvent(gvrSandboxClaims))
+			})
+		}
 	}
 
 	// Periodically scrape Prometheus metrics from the control plane, the
@@ -1079,7 +1113,24 @@ func getRestConfig() (*rest.Config, error) {
 
 // watchResource will watch the given resource until the context is cancelled, or the callback function returns an error.
 func watchResource(ctx context.Context, dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, callback func(event WatchEventRecord) error) error {
+	return watchResourceInNamespace(ctx, dynamicClient, gvr, "", callback)
+}
+
+// watchResourceInNamespace is watchResource optionally scoped to one
+// namespace ("" = cluster-wide). Namespace-scoped watches are the sharding
+// unit of --per-namespace-claim-watch: each shard is a separate server-side
+// watch stream with its own per-watcher dispatch/encode queue, so a burst's
+// event backlog splits across shards instead of serializing on one stream
+// (SUB-FLOOR option 5b as re-scoped by PATH-TO-100MS §4.3: session-level
+// watches must be sharded or they re-create the S4 backlog).
+func watchResourceInNamespace(ctx context.Context, dynamicClient dynamic.Interface, gvr schema.GroupVersionResource, namespace string, callback func(event WatchEventRecord) error) error {
 	var resourceVersion string
+	iface := func() dynamic.ResourceInterface {
+		if namespace == "" {
+			return dynamicClient.Resource(gvr)
+		}
+		return dynamicClient.Resource(gvr).Namespace(namespace)
+	}()
 
 	for {
 		select {
@@ -1093,7 +1144,7 @@ func watchResource(ctx context.Context, dynamicClient dynamic.Interface, gvr sch
 			ResourceVersion: resourceVersion,
 		}
 
-		watcher, err := dynamicClient.Resource(gvr).Watch(ctx, listOptions)
+		watcher, err := iface.Watch(ctx, listOptions)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -1149,6 +1200,20 @@ func watchResource(ctx context.Context, dynamicClient dynamic.Interface, gvr sch
 			}
 		}
 	}
+}
+
+// claimWatchNamespaces returns every namespace SandboxClaims are created in
+// during this run: the main run namespace (claims-warm, and the sustained
+// phase with --sustained-namespaces=1) plus the sustained phase's
+// deterministic <ns>-s1..sN shard namespaces (see runClaimsWarmSustainedPhase).
+func claimWatchNamespaces(cfg Config) []string {
+	namespaces := []string{cfg.Namespace}
+	if slices.Contains(cfg.Phases, string(PhaseClaimsWarmSustained)) && cfg.SustainedNamespaces > 1 {
+		for i := 1; i <= cfg.SustainedNamespaces; i++ {
+			namespaces = append(namespaces, fmt.Sprintf("%s-s%d", cfg.Namespace, i))
+		}
+	}
+	return namespaces
 }
 
 // runWriter drains eventChan to a gzip-compressed JSONL file.
