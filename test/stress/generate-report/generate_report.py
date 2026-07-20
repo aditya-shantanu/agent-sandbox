@@ -572,6 +572,19 @@ def main():
 
     if watch_file.exists():
         watch_path_str = str(watch_file).replace("'", "''")
+        # Schema-pinned watch-stream scan. read_json_auto infers a nested
+        # STRUCT for `object` from a sample of lines; any later line whose
+        # object carries a key absent from the sampled shapes (e.g. the
+        # sustained phase's sandboxclaims events with `status.sandbox`) makes
+        # the transform fail with `unknown key` and killed the whole report
+        # (gate-zero leg S, 2026-07-20). Only the envelope is typed; `object`
+        # stays raw JSON so any watched resource shape is tolerated, and
+        # ignore_errors skips truncated trailing lines from interrupted runs.
+        watch_scan = (
+            f"read_json('{watch_path_str}', format='newline_delimited', "
+            "columns={timestamp: 'TIMESTAMP', resource: 'VARCHAR', "
+            "type: 'VARCHAR', object: 'JSON'}, ignore_errors=true)"
+        )
         print("Querying capacity timeseries from watch stream...")
         capacity_ts_raw = conn.execute(f"""
             WITH raw_events AS (
@@ -582,7 +595,7 @@ def main():
                     -- name is two objects, not one long-lived one.
                     CAST(object->'metadata'->>'uid' AS VARCHAR) as uid,
                     type
-                FROM read_json_auto('{watch_path_str}')
+                FROM {watch_scan}
                 WHERE resource IN ('pods', 'sandboxes')
             ),
             lifecycle_ends AS (
@@ -650,7 +663,7 @@ def main():
                     -- name is two objects, not one long-lived one.
                     CAST(object->'metadata'->>'uid' AS VARCHAR) as uid,
                     type
-                FROM read_json_auto('{watch_path_str}')
+                FROM {watch_scan}
                 WHERE resource IN ('pods', 'sandboxes')
             ),
             lifecycle_ends AS (

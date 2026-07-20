@@ -454,7 +454,40 @@ mkdir -p "${STRESS_OUTPUT_DIR}"
 
 capture_stress_diagnostics() {
   echo "Capturing controller diagnostics..."
-  kubectl logs deployment/agent-sandbox-controller --namespace agent-sandbox-system --tail=-1 > "${STRESS_OUTPUT_DIR}/controller.log" || true
+  # Per-pod capture, stderr preserved. The previous single
+  # `kubectl logs deployment/... > controller.log || true` silently produced a
+  # 0-byte controller.log whenever kubectl failed (gate-zero leg S,
+  # 2026-07-20): `kubectl logs deployment/` resolves ONE pod — if that pod is
+  # evicted/failed (the controller runs BestEffort, GAP-2) or mid-replacement,
+  # the command errors, `|| true` eats it, and the redirect leaves an empty
+  # file with zero trace of why. Capture every pod in the namespace
+  # individually, keep --previous logs of restarted containers, and record
+  # kubectl's stderr in capture-errors.log instead of discarding it.
+  : > "${STRESS_OUTPUT_DIR}/capture-errors.log"
+  kubectl get pods --namespace agent-sandbox-system -o wide \
+    > "${STRESS_OUTPUT_DIR}/controller-pods.txt" 2>>"${STRESS_OUTPUT_DIR}/capture-errors.log" || true
+  local ctrl_pod
+  for ctrl_pod in $(kubectl get pods --namespace agent-sandbox-system -o name 2>>"${STRESS_OUTPUT_DIR}/capture-errors.log"); do
+    kubectl logs --namespace agent-sandbox-system "${ctrl_pod}" --tail=-1 \
+      > "${STRESS_OUTPUT_DIR}/controller-${ctrl_pod#pod/}.log" 2>>"${STRESS_OUTPUT_DIR}/capture-errors.log" || true
+    # Previous container instance, if the pod restarted (OOM/crash): best effort.
+    kubectl logs --namespace agent-sandbox-system "${ctrl_pod}" --previous --tail=-1 \
+      > "${STRESS_OUTPUT_DIR}/controller-${ctrl_pod#pod/}-previous.log" 2>/dev/null || \
+      rm -f "${STRESS_OUTPUT_DIR}/controller-${ctrl_pod#pod/}-previous.log"
+  done
+  # Keep the historical controller.log name for downstream tooling: the
+  # concatenation of all current (non--previous) controller pod logs.
+  : > "${STRESS_OUTPUT_DIR}/controller.log"
+  local ctrl_log
+  for ctrl_log in "${STRESS_OUTPUT_DIR}"/controller-*.log; do
+    [[ -e "${ctrl_log}" ]] || continue
+    [[ "${ctrl_log}" == *-previous.log ]] && continue
+    cat "${ctrl_log}" >> "${STRESS_OUTPUT_DIR}/controller.log" || true
+  done
+  if [[ ! -s "${STRESS_OUTPUT_DIR}/controller.log" ]]; then
+    echo "WARNING: controller.log is empty; see capture-errors.log and controller-pods.txt" | \
+      tee -a "${STRESS_OUTPUT_DIR}/capture-errors.log"
+  fi
   kubectl get pods -A -o wide > "${STRESS_OUTPUT_DIR}/pods.txt" || true
   kubectl get nodes -o wide > "${STRESS_OUTPUT_DIR}/nodes.txt" || true
   kubectl top nodes > "${STRESS_OUTPUT_DIR}/top-nodes.txt" 2>/dev/null || true
