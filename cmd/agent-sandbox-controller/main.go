@@ -206,15 +206,18 @@ func main() {
 			"gate-zero A/B benchmark); set =0 to restore the legacy fully-synchronous write path. Status writes, "+
 			"creates/deletes, and ownership transfers are never deferred.")
 	flag.BoolVar(&noSpecAdoption, "no-spec-adoption", true,
-		"Enable ownership-derived pod hygiene in the Sandbox controller (the sandbox-side half of the no-spec-adoption "+
-			"protocol, see optimizations/ROUND6-COALESCING.md): when a Sandbox is controlled by a SandboxClaim, the "+
+		"Enable BOTH halves of the no-spec-adoption protocol (see optimizations/ROUND6-COALESCING.md §3). "+
+			"Sandbox-controller half (ownership-derived pod hygiene): when a Sandbox is controlled by a SandboxClaim, the "+
 			"cluster-autoscaler.kubernetes.io/safe-to-evict=\"true\" template annotation is treated as absent — never "+
 			"propagated to the Pod and stripped from a Pod carrying it — regardless of whether the claim controller "+
-			"rewrote spec.podTemplate during adoption. This is the prerequisite for a claim controller that adopts "+
-			"with a metadata-only patch (no spec rewrite -> no generation bump -> no forced sandbox status write, "+
-			"-1 write per adoption). Safe to enable standalone; behavioral delta: claim-owned cold-start pods whose "+
-			"template explicitly sets safe-to-evict=true also have the marker suppressed (strictly safer). Default on "+
-			"(validated in the gate-zero A/B benchmark); set =false to restore the legacy behavior.")
+			"rewrote spec.podTemplate during adoption. Claim-controller half (metadata-only adoption): when a claim "+
+			"carries no additionalPodMetadata, the adoption patch is metadata-only (labels/annotations/ownerRef; no "+
+			"spec.podTemplate rewrite -> no generation bump -> no forced sandbox status write, -1 write per adoption "+
+			"system-wide), and the steady-state drift check compares the pod template modulo system-reserved keys so "+
+			"the spec is never rewritten through the back door. Claims WITH additionalPodMetadata keep the full legacy "+
+			"spec rewrite (KEP-0174 propagation contract, byte-for-byte). Behavioral delta: claim-owned cold-start pods "+
+			"whose template explicitly sets safe-to-evict=true also have the marker suppressed (strictly safer). Default "+
+			"on; set =false to restore the legacy behavior of both controllers.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -508,7 +511,7 @@ func main() {
 			"window", sandboxWriteBehindWindow, "podPatchBound", "1s")
 	}
 	if noSpecAdoption {
-		setupLog.Info("ownership-derived pod hygiene enabled (--no-spec-adoption): claim-owned pods never carry safe-to-evict=true")
+		setupLog.Info("no-spec adoption enabled (--no-spec-adoption): ownership-derived pod hygiene (claim-owned pods never carry safe-to-evict=true) + metadata-only adoption patches for claims without additionalPodMetadata")
 	}
 
 	if err = (&controllers.SandboxReconciler{
@@ -567,6 +570,7 @@ func main() {
 			AllowedLabelDomains:             allowedDomains,
 			DisableObservabilityAnnotations: disableClaimObservabilityAnnotations,
 			OneWriteAdoption:                oneWriteAdoption,
+			NoSpecAdoption:                  noSpecAdoption,
 		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
 			os.Exit(1)

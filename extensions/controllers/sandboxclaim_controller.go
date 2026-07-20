@@ -428,6 +428,37 @@ type SandboxClaimReconciler struct {
 	// the annotation (it uses the claim-UID label index). Wired to
 	// --disable-claim-observability-annotations.
 	DisableObservabilityAnnotations bool
+	// NoSpecAdoption enables the claim-side half of the no-spec-adoption
+	// protocol (wired to --no-spec-adoption, shared with the sandbox
+	// controller's ownership-derived pod hygiene — the enabling half, see
+	// controllers/sandbox_controller.go suppressSafeToEvictForClaim):
+	// when the claim carries no additionalPodMetadata, the adoption patch
+	// becomes METADATA-ONLY (top-level labels + annotations + ownerRef; no
+	// spec.podTemplate rewrite). Metadata never bumps metadata.generation, so
+	// the sandbox controller's observedGeneration stays valid and its
+	// updateStatus DeepEqual short-circuit produces ZERO sandbox status
+	// writes for the adoption event — one less system-wide write per
+	// adoption, and the adoption-MODIFIED sandbox reconcile goes read-only.
+	//
+	// The skipped spec rewrite is pod-inert by construction: every key it
+	// wrote lives in the system-reserved label domain (agents.x-k8s.io/*),
+	// which isSystemLabel blocks from template→pod propagation; pod-side
+	// discovery reads TOP-LEVEL sandbox labels (computeExtensionPodLabels),
+	// which this patch still stamps, and crash recovery uses the top-level
+	// claim-UID label index plus the ownerRef — both metadata. The
+	// safe-to-evict strip moves to the sandbox controller's ownership-derived
+	// hygiene. Claims WITH additionalPodMetadata keep the full spec rewrite
+	// byte-for-byte (KEP-0174: the spec injection IS the propagation
+	// mechanism for that feature).
+	//
+	// Documented residue: the pool's bookkeeping labels
+	// (warm-pool-sandbox, template hashes) stay in spec.podTemplate.ObjectMeta
+	// of fast-path-adopted sandboxes, and the live pod keeps the label copies
+	// it was created with. All are system-domain keys with no pod-side
+	// consumer (membership/discovery are top-level-label driven), and the
+	// reconcileActive drift check compares modulo system-reserved keys so
+	// they never trigger a back-door spec rewrite.
+	NoSpecAdoption bool
 	// OneWriteAdoption inverts the warm-pool adoption transaction (wired to
 	// --one-write-adoption, default false = the 2-write transaction exactly):
 	// reserve the candidate from the in-memory queue, write the CLAIM STATUS
@@ -920,7 +951,19 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 				return nil, err
 			}
 
-			needsUpdate := !equality.Semantic.DeepEqual(&mergedMeta, &sandbox.Spec.PodTemplate.ObjectMeta)
+			specNeedsUpdate := !equality.Semantic.DeepEqual(&mergedMeta, &sandbox.Spec.PodTemplate.ObjectMeta)
+			if specNeedsUpdate && r.metadataOnlyAdoption(claim) {
+				// Metadata-only adoption leaves system-owned keys (identity
+				// labels the legacy rewrite injected, pool bookkeeping labels,
+				// the pool's safe-to-evict marker) in spec.podTemplate. All of
+				// them are pod-inert (system-reserved keys never propagate to
+				// pods; safe-to-evict is ownership-suppressed), so drift is
+				// compared MODULO those keys — otherwise the first steady-state
+				// pass after a metadata-only adoption would rewrite the spec
+				// and reintroduce the generation bump through the back door.
+				specNeedsUpdate = !podTemplateMetaEqualModuloSystemKeys(&mergedMeta, &sandbox.Spec.PodTemplate.ObjectMeta)
+			}
+			needsUpdate := specNeedsUpdate
 			if sandbox.Labels[sandboxTemplateRefHash] != templateHash {
 				if sandbox.Labels == nil {
 					sandbox.Labels = make(map[string]string)
@@ -945,7 +988,12 @@ func (r *SandboxClaimReconciler) reconcileActive(ctx context.Context, claim *ext
 
 			if needsUpdate {
 				logger.V(1).Info("Updating sandbox metadata to match claim", "claim", claim.Name, "sandbox", sandbox.Name)
-				sandbox.Spec.PodTemplate.ObjectMeta = mergedMeta
+				// Only rewrite the pod template when IT drifted: a top-level
+				// label sync alone must stay a metadata-only patch (no
+				// generation bump) under metadata-only adoption.
+				if specNeedsUpdate {
+					sandbox.Spec.PodTemplate.ObjectMeta = mergedMeta
+				}
 				if updateErr := r.Patch(ctx, sandbox, patch); updateErr != nil {
 					return sandbox, fmt.Errorf("failed to patch sandbox metadata for claim %q: %w", claim.Name, updateErr)
 				}
@@ -1653,6 +1701,20 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 	return err
 }
 
+// claimRequestsPodMetadata reports whether the claim carries any
+// additionalPodMetadata to inject into the sandbox pod template (the
+// KEP-0174 propagation path, which requires the spec rewrite).
+func claimRequestsPodMetadata(claim *extensionsv1beta1.SandboxClaim) bool {
+	return len(claim.Spec.AdditionalPodMetadata.Labels) > 0 ||
+		len(claim.Spec.AdditionalPodMetadata.Annotations) > 0
+}
+
+// metadataOnlyAdoption reports whether this adoption can skip the
+// spec.podTemplate rewrite entirely (see the NoSpecAdoption field docs).
+func (r *SandboxClaimReconciler) metadataOnlyAdoption(claim *extensionsv1beta1.SandboxClaim) bool {
+	return r.NoSpecAdoption && !claimRequestsPodMetadata(claim)
+}
+
 // applyAdoptionMutations applies, IN MEMORY ONLY, every sandbox-side mutation
 // of the adoption transaction: warm-pool label removal, launch-type/identity/
 // template-hash label sync, safe-to-evict strip from the pod template,
@@ -1661,8 +1723,18 @@ func (r *SandboxClaimReconciler) completeAdoption(ctx context.Context, claim *ex
 // optimistic-lock merge patch; the one-write adoption path defers that same
 // diff to the async flush worker (and re-invokes this to rebuild it against a
 // fresh read after a benign conflict).
+//
+// Under NoSpecAdoption with no claim additionalPodMetadata the mutation set
+// is METADATA-ONLY: every spec.podTemplate touch (safe-to-evict strip,
+// identity-label injection, template metadata forcing) is skipped so the
+// resulting patch carries no "spec" key and cannot bump metadata.generation.
+// The safe-to-evict protection is ownership-derived in the sandbox
+// controller instead; the crash-recovery paths only read metadata (top-level
+// claim-UID label index + ownerRef), so they are unaffected by which mode
+// stamped the adoption.
 func (r *SandboxClaimReconciler) applyAdoptionMutations(ctx context.Context, claim *extensionsv1beta1.SandboxClaim, adopted *v1beta1.Sandbox) error {
 	templateHash := adopted.Labels[sandboxTemplateRefHash]
+	metadataOnly := r.metadataOnlyAdoption(claim)
 
 	// Remove warm pool labels so the sandbox no longer appears in warm pool queries
 	delete(adopted.Labels, warmPoolSandboxLabel)
@@ -1675,7 +1747,11 @@ func (r *SandboxClaimReconciler) applyAdoptionMutations(ctx context.Context, cla
 	// Remove the warm pool's default eviction annotation so the adopted sandbox
 	// is protected from autoscaler scale-downs now that it hosts active state.
 	// Custom template-specified overrides (e.g. "false") are explicitly kept.
-	if adopted.Spec.PodTemplate.ObjectMeta.Annotations != nil && adopted.Spec.PodTemplate.ObjectMeta.Annotations[autoscalerSafeToEvictAnnotation] == "true" {
+	// Metadata-only mode leaves the spec annotation in place: the sandbox
+	// controller's ownership-derived hygiene (suppressSafeToEvictForClaim)
+	// treats safe-to-evict="true" as absent for claim-owned sandboxes, so the
+	// live Pod ends in the identical state without a spec write.
+	if !metadataOnly && adopted.Spec.PodTemplate.ObjectMeta.Annotations != nil && adopted.Spec.PodTemplate.ObjectMeta.Annotations[autoscalerSafeToEvictAnnotation] == "true" {
 		delete(adopted.Spec.PodTemplate.ObjectMeta.Annotations, autoscalerSafeToEvictAnnotation)
 	}
 
@@ -1701,6 +1777,24 @@ func (r *SandboxClaimReconciler) applyAdoptionMutations(ctx context.Context, cla
 
 	// Propagate claim identity labels for discovery and NetworkPolicy targeting.
 	adopted.Labels = ensureClaimIdentityLabels(adopted.Labels, claim)
+
+	if metadataOnly {
+		// Metadata-only fast path: the pod template is left untouched (no
+		// generation bump). The template lookup is only needed when the pool
+		// member somehow lost its top-level template-ref-hash label.
+		if templateHash == "" {
+			if template, templateErr := r.getTemplate(ctx, claim); templateErr == nil && template != nil {
+				templateHash = SandboxTemplateRefHash(template.Name)
+			} else if templateErr != nil {
+				log.FromContext(ctx).V(1).Info("Unable to set template ref hash label during adoption because template lookup failed", "sandbox", adopted.Name, "claim", claim.Name, "error", templateErr.Error())
+			}
+		}
+		if templateHash != "" {
+			adopted.Labels[sandboxTemplateRefHash] = templateHash
+		}
+		return nil
+	}
+
 	adopted.Spec.PodTemplate.ObjectMeta.Labels = ensureClaimIdentityLabels(adopted.Spec.PodTemplate.ObjectMeta.Labels, claim)
 
 	// Resolve the template hash and metadata used by reconcileActive.
@@ -1754,6 +1848,62 @@ func (r *SandboxClaimReconciler) applyAdoptionMutations(ctx context.Context, cla
 	}
 
 	return nil
+}
+
+// noSpecIgnoredLabelKey reports whether a pod-template LABEL key is excluded
+// from the metadata-only drift comparison. System-reserved keys are
+// controller bookkeeping that never propagates to Pods (the core
+// controller's isSystemLabel blocks the whole domain from template→pod
+// propagation), so differences in them cannot affect any pod-side state.
+func noSpecIgnoredLabelKey(key, _ string) bool {
+	return strings.HasPrefix(key, "agents.x-k8s.io/") ||
+		strings.HasPrefix(key, "extensions.agents.x-k8s.io/")
+}
+
+// noSpecIgnoredAnnotation reports whether a pod-template ANNOTATION entry is
+// excluded from the metadata-only drift comparison: system-reserved keys
+// (never propagated to Pods), and the autoscaler safe-to-evict marker when
+// its value is "true" — the sandbox controller's ownership-derived hygiene
+// suppresses exactly that value for claim-owned sandboxes, mirroring the
+// legacy strip rule in applyAdoptionMutations (explicit overrides such as
+// "false" are still compared and enforced).
+func noSpecIgnoredAnnotation(key, value string) bool {
+	if key == autoscalerSafeToEvictAnnotation && value == "true" {
+		return true
+	}
+	return strings.HasPrefix(key, "agents.x-k8s.io/") ||
+		strings.HasPrefix(key, "extensions.agents.x-k8s.io/")
+}
+
+// podTemplateMetaEqualModuloSystemKeys compares two pod-template metadata
+// sets ignoring entries that are pod-inert under the no-spec-adoption
+// protocol (see the NoSpecAdoption field docs): system-reserved label and
+// annotation keys, and the pool's safe-to-evict="true" marker.
+func podTemplateMetaEqualModuloSystemKeys(a, b *v1beta1.PodMetadata) bool {
+	return mapsEqualIgnoring(a.Labels, b.Labels, noSpecIgnoredLabelKey) &&
+		mapsEqualIgnoring(a.Annotations, b.Annotations, noSpecIgnoredAnnotation)
+}
+
+// mapsEqualIgnoring compares two string maps, skipping entries for which
+// ignore(key, value) is true on either side.
+func mapsEqualIgnoring(a, b map[string]string, ignore func(key, value string) bool) bool {
+	for k, v := range a {
+		if ignore(k, v) {
+			continue
+		}
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	for k, v := range b {
+		if ignore(k, v) {
+			continue
+		}
+		if av, ok := a[k]; !ok || av != v {
+			return false
+		}
+	}
+	return true
 }
 
 // isSandboxReady checks if a sandbox has Ready=True condition.
