@@ -191,7 +191,7 @@ still open.
 | item 3 create-ack | **−10 to −15ms** (first-window ack p90 34-42ms → ~20ms) | smoke ack p50 8-10ms; POST server mean 22.7ms is admission+encode, trimmable; ack is additive in every claim's path |
 | item 2 claim-side no-spec | **−5 to −15ms** | removes the sandbox status echo write + one sandbox reconcile per adoption — less competing traffic in the same cacher/etcd/seat pool at 300 adoptions/s (ROUND7's estimate, unchanged — the mechanism was verified in leg B: 835 sandbox PATCHes + 1,537 sandbox status PATCHes rode along in the burst window) |
 | item 4 CBOR | **−5 to −10ms** | at 300/s the claims stream (~600-750 ev/s) runs at ρ≈0.5 of the 1,350 ev/s fan-out capacity — queueing is modest, so CBOR buys less here than at burst; S0/S3 encode share is the real sustained win |
-| sharding (item 6) | ~0 at 300/s | fan-out unsaturated; this is the 500-1000/s rate-holding item |
+| sharding (item 6) | ~0 at 300/s **on the claim path**; round-9b re-scoped it as a *supply* lever at 300/s | claim-path fan-out unsaturated at 300/s — but 9b measured the controller **supply** pipelines (refill issuance + pod-Ready→sandbox-Ready marking) capping at ~100-150/s aggregate, and sharding is the standing hypothesis for that wall (R4.4 / RESULTS round-9b ladder item 3). Still the 500-1000/s claim-path rate-holding item too |
 | GAP-12 payload trim | reprioritize **down** | measured: claim events are already only ~1KB; the trim targets are sandbox events (3.5KB) — indirect benefit only |
 
 **Projection: sustained-300 p90 ≈ 60-80ms with items 2+3+4 landed** — under
@@ -200,21 +200,36 @@ the target with margin, and consistent with ROUND7's §1.2 prediction
 
 ### 3.3 The actual blocker for a 60-second <100ms demonstration: supply
 
-At the measured contended refill (~26-46 creates/s/pool, creates outrunning
-Ready 3-4×, node pipeline ~50-65 ready/s on 34 nodes), a 60s × 300/s phase
-starves after ~5s regardless of claim-path latency: deficit ≈ (300 − ~60)/s ×
-55s ≈ 13k pods — no pool size on this cluster covers it. To *demonstrate*
-sustained-<100ms-p90 over a full window, pick one:
+**[ROUND-9B REWRITE, 2026-07-20 — the paragraph this section originally
+carried attributed the supply wall to node throughput (~50-65 ready/s on 34
+nodes ⇒ "more nodes" as option 3). Round-9b falsified that: the same ~47/s
+appeared on 150 nodes/16,500 slots. The measured wall ladder (RESULTS.md
+round-9b verdict, SCALE-ROADMAP §1.4) supersedes it.]**
 
-1. **Rate within supply:** ramp legs at 100-150/s (within the measured ready
-   throughput) — expected p90 well under 100ms for the whole window; this is
-   the cheapest true "sustained <100ms" result and validates §3.2's items.
-2. **Deeper shock absorber for exactly 60s:** pool ≈ deficit ≈ 13-14k warm
-   pods — beyond the 3,668-pod envelope; not feasible at 34 nodes.
-3. **More nodes:** ~150-200 nodes (RESULTS round-8 verdict path 1) makes
-   300/s indefinitely supply-feasible.
-4. **L6 recycling** — the only path where sustained rate decouples from pod
-   churn; still gated on the security memo.
+The supply walls between here and a full-window demonstration, in the order
+they bind:
+
+1. ~~**kube-scheduler client QPS (default 50)** — the 47-50 binds/s wall of
+   rounds 8 + 9b-SUST3; an environment bug (kops v1.35 silently ignores
+   `kubeScheduler.kubeAPIQPS`; only `kubeScheduler.qps/burst` reach the
+   generated clientConnection). Peeled by the round-9b run-script fix:
+   binds hit 104-222/s, pod-create→scheduled p50 183.5s → 0.82s.~~
+2. **Controller supply pipelines ≈ 100-150/s aggregate — the current
+   binding constraint** (SUST4): refill issuance (claim→pod-created p50
+   41.9s under backlog) + pod-Ready→sandbox-Ready marking (p50 50.5s at
+   ~13k live pods). Levers: sharding (R4.4/#1213 recipe), pipeline
+   profiling via the round-10 supply-segment histograms — NOT more nodes.
+3. **etcd default quota-backend-bytes (2GiB) — a hard duration wall:**
+   ~3.2MB/s main-DB revision growth at 300/s churn ⇒ NOSPACE in ~10 min.
+   Any sustained leg must raise the quota (≥8GiB) + compact at ~2m.
+4. Nodes: **exonerated at 300/s** — corrected sizing is pool 3,000 + 300/s
+   × ~10s residence ≈ 6,000 slots ⇒ ~60-80 e2-standard-8 workers
+   (~$12-16k/mo), half the pre-9b §1.4 estimate.
+5. **L6 recycling** — unchanged: the only path where sustained rate
+   decouples from pod churn entirely; still gated on the security memo.
+
+A ramp leg at 100-150/s (inside the measured pipeline ceiling) remains the
+cheapest true "sustained <100ms" result if the wall-2 work slips.
 
 ---
 
@@ -301,10 +316,11 @@ SUB-FLOOR's "do it" verdict.
 
 ## 5. Recommended execution order
 
-1. **Supply-side sustain work first** (round-8 verdict paths: ramp benches at
-   100→200→300/s, refill/node levers, node-count sizing; L6 memo in flight) —
-   it gates any honest 60-second <100ms demonstration (§3.3) and every
-   sustained re-measurement below.
+1. **Supply-side sustain work first** *(updated for the 9b ladder: etcd
+   quota/compaction knobs + controller supply-pipeline profiling/sharding —
+   NOT node scaling or per-node I/O levers, both exonerated at 300/s; L6
+   memo in flight)* — it gates any honest 60-second <100ms demonstration
+   (§3.3) and every sustained re-measurement below.
 2. **Item 2 (claim-side no-spec)** — still unimplemented; S-M; sequenced after
    the #1118 rebase check exactly as ROUND7 §2 requires.
 3. **Item 3 (create-ack)** + **5b completion (session watch, sharded)** +
@@ -344,7 +360,9 @@ in every leg — the 2-snapshot delta was decisive here.
   stretch goal, correctly not the stated target.
 - Sustained-300 with supply already measures **p50 41 / p90 95-105ms**; items
   2+3+4 project **60-80ms** — the target falls on the claim path; what's left
-  of "<100ms at 300/s for 60s" is pods-per-second supply, not milliseconds.
+  of "<100ms at 300/s for 60s" is pods-per-second supply, not milliseconds —
+  and per round-9b the supply walls are control-plane ones (controller
+  pipelines ~100-150/s, etcd 2GiB quota), not nodes (§3.3 rewrite).
 - SUB-FLOOR stands with updated numbers: pre-binding is the only sub-floor
   option, now cheaper to build (round-8 reservation + DirectReader) but less
   necessary (p50 41ms) and useless against the supply wall — decide after the

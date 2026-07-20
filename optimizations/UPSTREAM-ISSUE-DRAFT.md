@@ -718,6 +718,22 @@ conflicts with
   re-run the CBOR leg**); adoption segment histograms
   (clean legs self-decompose); sharded per-namespace claims watch in the
   harness (SUB-FLOOR 5b).
+- **kops upstream bug worth filing on its own (found round 9b, not
+  agent-sandbox code):** kops v1.35 silently ignores
+  `cluster.spec.kubeScheduler.kubeAPIQPS`/`kubeAPIBurst` — the fields carry
+  only `flag:"kube-api-qps"`-style tags (pkg/apis/kops/componentconfig.go),
+  but modern kube-scheduler consumes client QPS exclusively from
+  `KubeSchedulerConfiguration.clientConnection`, which kops populates only
+  from the differently-named `kubeScheduler.qps`/`burst` fields
+  (pkg/model/components/kubescheduler). Net effect: a validated cluster
+  spec field that does nothing, capping every warm-pool/churn deployment at
+  the componentconfig default 50 QPS (~47-50 binds/s, measured). A
+  2026-07-20 search found **no existing kubernetes/kops issue** for this
+  (closest: kops#6353 historical kubeScheduler-section drops); file one
+  proposing either mapping `kubeAPIQPS/Burst` into clientConnection or
+  deprecating the dead fields with a validation warning. Until then, any
+  agent-sandbox-on-kops sizing guide must say `kubeScheduler.qps/burst`,
+  never `kubeAPIQPS`.
 - **Rebase-watch:** [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118)
   (still OPEN as of 2026-07-20; rewrites adoption finalization — re-express
   the stale-pass/bounded-requeue invariants in its structure when it
@@ -822,9 +838,11 @@ which the numbers in this issue would be wrong.
 ---
 
 *Maintenance: this document is updated at the end of every investigation
-round (latest: round-9a absorption, 2026-07-20 — PATH-TO-100MS decomposition
-folded in (sustained row, watch-fan-out wall note), task 12 claim half
-landed (metadata-only adoption), create-ack riders + TUNE_CBOR wiring +
-segment histograms + sharded claims watch in the harness, pre-binding
-demoted to conditional pending the 9b measurement). Numbers in the results
-table are always the latest verified A/B.*
+round (latest: round-10 doc audit, 2026-07-20 — round-9b supply-wall ladder
+absorbed into task 8's caveat and the remaining-work section: scheduler
+default-QPS wall peeled via the kops `kubeScheduler.qps` key fix (kops
+inert-`kubeAPIQPS` bug recorded above as its own upstream-filing item),
+controller supply pipelines ~100-150/s now the top open supply item, etcd
+2GiB quota duration wall, nodes exonerated with sizing corrected to ~60-80
+8-vCPU nodes at 300/s, ~$25-28 per 150-node supply leg. Numbers in the
+results table are always the latest verified A/B.*

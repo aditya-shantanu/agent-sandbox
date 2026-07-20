@@ -53,6 +53,7 @@ the move to the runner VM, cleaned).
 - Startup-script marker: the VM startup script is idempotent via `/root/.bench-started-vN`; bump the marker (v8 = gate zero, v9 = round 8, v10/v11 = round 9b), `gcloud compute instances add-metadata perf-bench-runner --metadata-from-file startup-script=optimizations/infra/terraform/vm-startup.sh`, then `reset` the VM to relaunch.
 - Quota watch (shared project; measured 2026-07-20): **N2_CPUS ~exhausted (7,708/8,000)** — the effective 34-worker cap on n2-standard-8 legs; node-scale legs use `NODE_MACHINE_TYPE=e2-standard-8` (CPUS quota, ~6,600 free) and `NODE_VOLUME_SIZE=100` (SSD_TOTAL_GB headroom ~21TB). The v11 orchestrator runs a quota preflight before cluster create.
 - Round-9b clusters (all created and deleted 2026-07-20, verified no leaks): `sandbox-20260720-181027` (SUST3, 150 nodes), `sandbox-20260720-195719` (SUST4, 150 nodes), SUST5-cbor never created (kops --set featureGates failure).
+- Cost anchors (measured 2026-07-20): 150× e2-standard-8 + n2-standard-16 CP + 100GB pd-ssd ≈ **$45/h all-in**; a full bring-up→measure→teardown supply leg = 33-37 min ≈ **$25-28**. A 70-node leg of the same shape ≈ $22-24/h, ≈ $15-20/leg (round-10 sizing, from the corrected ~60-80-node/$12-16k-per-month 300/s estimate).
 - Baseline1 artifacts (run from the laptop before the VM existed): local only, `/tmp/bench-artifacts-baseline/stress-test/` on the operator's Mac.
 
 ## Standard invocation

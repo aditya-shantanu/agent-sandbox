@@ -279,7 +279,9 @@ everything above at 500/s).** kops: control-plane `n2-standard-32`;
 `--max-mutating-requests-inflight=1000 --max-requests-inflight=3000` (and
 recompute APF shares in `k8s/apf-insulation.yaml`); events on a separate etcd
 (`--etcd-servers-overrides=/events#...`); etcd on local NVMe;
-`--etcd-compaction-interval=2m`; scheduler `--kube-api-qps=800 --kube-api-burst=1600`;
+`--etcd-compaction-interval=2m`; scheduler `--kube-api-qps=800 --kube-api-burst=1600`
+(on kops: MUST be expressed as `kubeScheduler.qps/burst` — the
+`kubeAPIQPS` spec key is silently inert, the round-9b discovery in §1.4);
 KCM `--kube-api-qps=200` (EndpointSlice/GC keep-up); cilium k8s client QPS up.
 Mechanism: removes the ceilings that would otherwise mis-attribute round-4
 regressions to our code. Ceiling: apiserver seat ceiling ~5x; etcd hot-path

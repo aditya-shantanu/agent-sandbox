@@ -1,5 +1,26 @@
 # ROUND7-PLAN — the last latency round, the floor, and the rate tracks
 
+**[STATUS ANNOTATIONS — round-10 doc audit, 2026-07-20. This is a
+historical planning doc; the text below is unedited. Corrections since:**
+- **§7 stopping rule: NOT YET FIRED.** The clean floor moved 31-40ms →
+  **14-23ms** (GAP-1, gate zero), so PATH-TO-100MS §5 re-derived the
+  revised-target clause to <45-50ms p90. Best supply-present sustained-300
+  measurement so far: p50 41 / p90 95-105ms (round-8 S2 warm-hit cohort,
+  pre-9a items); the 9a-composed re-measurement (SUST4 first window
+  124/304ms) is confounded by scheduler+etcd load and does not count. A
+  full-window supply-adequate leg — round 10 — is the pending test of the
+  stopping rule.
+- **§4 item 4 (CBOR): the `--set ...featureGates.CBORServingAndStorage`
+  wiring claim is WRONG** — kops v1.35 `--set` cannot address featureGates
+  map keys ("field not found in *Cluster", round-9b SUST5 abort); use the
+  cluster-yaml patch mechanism instead (round-10 run script).
+- **§1.2/§4 supply assumptions superseded by the round-9b wall ladder**
+  (RESULTS.md): kops silently ignored `kubeScheduler.kubeAPIQPS` (default
+  50 QPS = the 47-50 binds/s wall); with that peeled, controller supply
+  pipelines ≈100-150/s bind next; etcd 2GiB quota is a ~10-min duration
+  wall at 300/s; nodes exonerated (~60-80 workers suffice at 300/s).
+  Item 8(a) node-I/O levers demoted accordingly.]**
+
 Status: round-7 planning deliverable (2026-07-19), branch
 `perf-investigation-master-round7-plan`, base `perf-investigation-master`
 @ 43fb706 (L1 one-write adoption + round-6 coalescing/no-spec both merged).

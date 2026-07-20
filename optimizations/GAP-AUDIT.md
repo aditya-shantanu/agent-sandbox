@@ -4,6 +4,21 @@ Status: audit deliverable against `perf-investigation-master` @ f0a0092 (tree `/
 
 Impact classes: **latency-p50 / p90 / tail / churn / robustness / validity** (validity = the measurement itself is suspect).
 
+## Status ledger (round-10 doc audit, 2026-07-20 — post-9b; findings below are kept verbatim as written)
+
+| gap | status | disposition |
+|---|---|---|
+| GAP-1 clean instrumentation | **RESOLVED** | clean-leg discipline standard since gate zero; true smoke floor 14-23ms measured; every headline leg since runs stock logging |
+| GAP-2 BestEffort controller pod | **RESOLVED** | guaranteed QoS (4 CPU/8Gi req, mem limit), `system-cluster-critical`, GOMEMLIMIT in `k8s/controller.yaml`+`extensions.controller.yaml` since 2b60967 |
+| GAP-3 teardown path | **PARTIALLY MEASURED / reframed by 9b** | sustained legs exercised the dwell→delete pipeline at scale; round-9b showed delete-pipeline backlog inflating slot residence (~10s healthy budget) and etcd revision growth (~3.2MB/s at 300/s — wall 4 of the ladder) are the real teardown-scale costs; 404-PATCH waste fix still open |
+| GAP-4 pool-delete preconditions | **RESOLVED** | UID+RV preconditions merged (2b60967) |
+| GAP-5 SDK per-claim watches | **HALF-RESOLVED** | watch-from-RV merged (SDK + bench); per-namespace sharded claims watch in harness (9a, `--per-namespace-claim-watch`); session-level shared watch + per-claim-watcher bench leg still open |
+| GAP-6 cold-start decomposition | **REFRAMED by 9b** | at sustained rate, "refill latency" was dominated by the scheduler default-QPS wall (47-50 binds/s — kops inert-key bug), then by controller supply pipelines (~100-150/s), NOT node-local pod-start cost (scheduled→running p50 1.0-2.3s throughout). Node-local cold-latency levers (pre-pull, image streaming) demoted with the rest of the node track; single-pod cold decomposition still unowned |
+| GAP-7 Go runtime unmanaged | **RESOLVED (baseline)** | GOMEMLIMIT=6GiB anchored to real limits (GAP-2 fix); runtime/metrics in scrape set; GOGC A/B never run — fold into a future clean leg only if allocs profiles surface a GC term |
+| GAP-8 O(N) metrics collector | open | hygiene; matters ≥10k live sandboxes |
+| GAP-9/10/11 crash-recovery / LE / connection chaos | open | chaos legs still belong to the sharding benchmark matrix (round-10 leg B builds the first multi-shard topology they need) |
+| GAP-12 claim-payload bytes | **MEASURED, demoted** | leg-B forensics: claim events ~1KB (POST body 203B) — trim targets are sandbox events (3.5KB); indirect only |
+
 ---
 
 ## Findings (ordered by embarrassment potential)
