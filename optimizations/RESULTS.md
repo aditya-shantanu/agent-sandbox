@@ -696,3 +696,73 @@ and env `TUNE_CBOR=true` for the CBOR leg (fresh cluster only; remember the
 wire-format verification before attributing deltas). Projection with items
 composed: sustained-300 p90 ≈ **60-80ms** (PATH-TO-100MS §3.2).
 Results: PENDING (measured by the 9b leg on this tree).
+
+## 2026-07-20 — ROUND-9B SUST3 VERDICT (cluster sandbox-20260720-181027, 150× e2-standard-8, image 5c49ed1): supply wall FOUND — it was never the nodes
+
+Run 18:06-18:39 UTC end-to-end (VM reset → cluster up → smoke → sustained →
+report → cluster deleted; verified `DONE rc=0`). Smoke: ack p50 7ms,
+create→Ready p50 19 / p90 20ms — floor intact on E2 nodes.
+
+**Sustained 300/s × 60s (8 pools × 375, refill cap 100/pool, workers 8,
+dwell 1.5s):** 18,000 requested / 17,837 created (296.8/s held) / 17,205
+ready / 881 failed (594s wall). Ready throughput **47.4/s overall, best60s
+75.7/s** — on a cluster with 16,500 pod slots and ~16,180 spare.
+
+| window (arrival) | n | ready | p50 | p90 |
+|---|---|---|---|---|
+| [0-10s) | 2,987 | 2,987 | **56ms** | **122ms** |
+| [10-20s) | 2,985 | 2,985 | 160.5s | 203.1s |
+| [30-40s) | 2,936 | 2,936 | 182.5s | 204.3s |
+| [50-60s) | 3,054 | 2,496 | 281.4s | 299.4s |
+
+**The demonstration failed for a reason that changes the roadmap:** ready
+throughput on 150 nodes (47.4/75.7) is statistically identical to round-8's
+34 nodes (46.8/65.7). The supply ceiling is **node-count-independent**.
+Segment + scheduler-metrics forensics:
+
+- `podCreatedToScheduled` p50 **183.5s / min 98.5s** (n=11,119) with ~16k
+  slots free the whole run; `scheduledToPodRunning` p50 1.0s (nodes bored).
+- kube-scheduler `schedule_attempts` rate plateaued at **47-50/s** exactly;
+  `rest_client_rate_limiter_duration_seconds` (POST) climbed to **100+s
+  mean throttle wait** — the scheduler's own CLIENT-SIDE rate limiter.
+- **Root cause (kops v1.35 source):** `cluster.spec.kubeScheduler.kubeAPIQPS`
+  carries only a `flag:"kube-api-qps"` tag — a CLI flag modern
+  kube-scheduler does not consume; the fields kops maps into the generated
+  `KubeSchedulerConfiguration.clientConnection` are **`qps`/`burst`**
+  (componentconfig.go:798-800, kubescheduler/model.go MapToUnstructured).
+  TUNE_CONTROL_PLANE therefore NEVER tuned the scheduler: every cluster
+  since round 4/5 ran it at the componentconfig default **50 QPS/100
+  burst** = the measured 47-50 binds/s wall. (KCM's `kubeAPIQPS` IS a real
+  KCM flag; only the scheduler key was broken.) Fixed in the run script:
+  `kubeScheduler.qps=800` / `burst=1600`.
+- Corollary: round-8's "~1.5-2 ready/s/node churn wall" and SCALE-ROADMAP
+  §1.4's "150-200 nodes for 300/s" were **misattributed** — the per-node
+  pipeline demonstrated ~4.4 starts/s/node (round 8) and 1.0s
+  scheduled→running here; §1.4's own warning that the scheduler at default
+  QPS "is the refill ceiling all by itself" was the correct prediction all
+  along, hidden by the silently-inert kops key.
+- What held at rate: arrival 296.8/s for 60s; ack p50 33ms at 300/s + full
+  churn; first-window (pool-backed) create→Ready **p50 56 / p90 122ms** at
+  a true 300/s; refill creates ~143/s average during the pile-up (above
+  demand-share until the scheduler backlog swamped everything); zero
+  double-binds, zero wedged losers (round-8 fixes hold at a second full-scale
+  run). 881 failures = 300s per-claim timeouts, pure scheduler-queue
+  starvation, zero controller pathology.
+
+150-node E2 sizing/quota notes for the record: N2_CPUS 7,708/8,000 used
+forced e2-standard-8 (CPUS pool); SSD_TOTAL_GB forced 100GB pd-ssd boot
+disks; quota preflight added to the v10 orchestrator; bring-up→teardown of
+the 150-node cluster fit in a 33-minute wall clock.
+
+## 2026-07-20 — ROUND 9b SUST4: rerun with the scheduler actually tuned (v11, image 0b92308 + sched-fix) — PENDING
+
+Same 150× e2-standard-8 shape as SUST3, plus: **kubeScheduler.qps=800/
+burst=1600 applied via the fixed keys**; pinned at the 9a tip so the leg
+carries claim-side no-spec adoption, segment histograms, create-ack
+riders, and `--per-namespace-claim-watch` (8 shards, pairs with
+`--sustained-namespaces=8`). Conditional second leg SUST5-cbor
+(`TUNE_CBOR=true`, fresh cluster) runs only if SUST4 passes its criteria —
+CBOR claim-path deltas are unreadable under a supply collapse.
+`apfVerification` in summary.json to be checked (harness client must ride
+an exempt PL). Success criteria unchanged from the SUST3 design entry.
+Results: PENDING.

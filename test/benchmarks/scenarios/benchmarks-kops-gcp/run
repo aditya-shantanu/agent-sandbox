@@ -310,11 +310,24 @@ TUNE_KOPS_FLAGS=()
 if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
     # See the TUNE_CONTROL_PLANE comment above for the sizing rationale.
     echo "TUNE_CONTROL_PLANE=true: raising apiserver inflight limits and scheduler/KCM client QPS"
+    # SCHEDULER QPS KEY FIX (round 9b): cluster.spec.kubeScheduler.kubeAPIQPS
+    # NEVER reached the scheduler. In kops v1.35 that field carries only a
+    # `flag:"kube-api-qps"` tag (pkg/apis/kops/componentconfig.go:801-804)
+    # and modern kube-scheduler consumes client QPS exclusively from
+    # KubeSchedulerConfiguration.clientConnection; the fields kops maps into
+    # the generated config file (pkg/model/components/kubescheduler/model.go
+    # MapToUnstructured) are `qps`/`burst` (config:"clientConnection.qps").
+    # Every "tuned" cluster through round 9b therefore ran the scheduler at
+    # the componentconfig DEFAULT 50 QPS / 100 burst — measured as the
+    # 47-50 binds/s pod-supply ceiling on BOTH 34-node (round 8) and
+    # 150-node (round 9b SUST3) clusters: scheduler
+    # rest_client_rate_limiter POST waits reached 100+s mean while
+    # schedule_attempts plateaued at 47-50/s with ~16k free slots.
     TUNE_KOPS_FLAGS+=(
       "--set" "cluster.spec.kubeAPIServer.maxRequestsInflight=3000"
       "--set" "cluster.spec.kubeAPIServer.maxMutatingRequestsInflight=1000"
-      "--set" "cluster.spec.kubeScheduler.kubeAPIQPS=800"
-      "--set" "cluster.spec.kubeScheduler.kubeAPIBurst=1600"
+      "--set" "cluster.spec.kubeScheduler.qps=800"
+      "--set" "cluster.spec.kubeScheduler.burst=1600"
       "--set" "cluster.spec.kubeControllerManager.kubeAPIQPS=200"
       "--set" "cluster.spec.kubeControllerManager.kubeAPIBurst=400"
     )
