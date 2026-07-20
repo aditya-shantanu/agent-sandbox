@@ -55,7 +55,20 @@ const (
 	// value on warm sandboxes, so reconcilePool's member lookup is O(pool members) instead
 	// of O(sandboxes-in-namespace).
 	sandboxWarmPoolLabelIndex = ".metadata.labels[" + warmPoolSandboxLabel + "]"
+	// poolDeleteConflictRequeue is how soon a pool re-reconciles after one of
+	// its member DELETEs was rejected by a UID/ResourceVersion precondition
+	// (the member changed between the informer-cache read that selected it and
+	// the DELETE — most likely a claim's adoption patch winning ownership).
+	// The next pass re-lists and re-decides against fresh state.
+	poolDeleteConflictRequeue = time.Second
 )
+
+// errPoolSandboxDeleteConflict marks a pool-member DELETE rejected by its
+// UID/ResourceVersion precondition. The member is skipped this pass and
+// re-evaluated from a fresh list on the requeue; it is deliberately NOT
+// treated as a reconcile error (no backoff) because the conflict is the
+// precondition doing its job, not a failure.
+var errPoolSandboxDeleteConflict = errors.New("pool sandbox delete precondition failed: object changed since cache read")
 
 // SandboxWarmPoolReconciler reconciles a SandboxWarmPool object.
 type SandboxWarmPoolReconciler struct {
@@ -346,7 +359,7 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 	template, currentPodTemplateHash, currentSandboxBlueprintHash, tmplErr := r.fetchTemplateAndHash(ctx, warmPool)
 
 	// Delete stale pods, filter pods by ownership and adopt orphans
-	activeSandboxes, allErrors := r.filterActiveSandboxes(ctx, warmPool, sandboxList.Items, template, currentSandboxBlueprintHash, tmplErr)
+	activeSandboxes, deleteConflicts, allErrors := r.filterActiveSandboxes(ctx, warmPool, sandboxList.Items, template, currentSandboxBlueprintHash, tmplErr)
 
 	const warmPoolReadinessGracePeriod = 5 * time.Minute
 
@@ -357,9 +370,12 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 			logger.Info("Deleting stuck warm pool sandbox",
 				"sandbox", sb.Name,
 				"age", now.Sub(sb.CreationTimestamp.Time).Round(time.Second))
-			if err := r.Delete(ctx, &sb); err != nil {
-				logger.Error(err, "Failed to delete stuck sandbox", "sandbox", sb.Name)
-				allErrors = errors.Join(allErrors, err)
+			if err := r.deletePoolSandbox(ctx, &sb); err != nil {
+				if errors.Is(err, errPoolSandboxDeleteConflict) {
+					deleteConflicts = true
+				} else {
+					allErrors = errors.Join(allErrors, err)
+				}
 			}
 			continue
 		}
@@ -471,18 +487,41 @@ func (r *SandboxWarmPoolReconciler) reconcilePool(ctx context.Context, warmPool 
 		})
 
 		toDeleteCount := min(sandboxesToDelete, int32(len(activeSandboxes)))
+		var excessConflicts atomic.Bool
 		// Parallel sandbox deletion with adaptive slow-start batching (starts with 1 and doubles on success)
 		_, deleteErr := slowStartBatch(ctx, int(toDeleteCount), 1, func(idx int) error {
-			return r.deletePoolSandbox(ctx, &activeSandboxes[idx])
+			err := r.deletePoolSandbox(ctx, &activeSandboxes[idx])
+			if errors.Is(err, errPoolSandboxDeleteConflict) {
+				// The member changed (likely adopted) between cache read and
+				// DELETE: skip it without aborting the batch; the conflict
+				// requeue below re-lists and re-decides.
+				excessConflicts.Store(true)
+				return nil
+			}
+			return err
 		})
 		if deleteErr != nil {
 			logger.Error(deleteErr, "Failed to delete pool sandboxes")
 			allErrors = errors.Join(allErrors, deleteErr)
 		}
+		if excessConflicts.Load() {
+			deleteConflicts = true
+		}
 	}
 
 	if tmplErr != nil && !k8serrors.IsNotFound(tmplErr) {
 		allErrors = errors.Join(allErrors, tmplErr)
+	}
+
+	if deleteConflicts {
+		// At least one member DELETE lost a race with a concurrent mutation
+		// (most likely a claim adoption). The selection that chose it is
+		// stale, so re-list soon rather than waiting for the next watch event
+		// (the adoption may have re-parented the sandbox away from the pool,
+		// in which case no pool-keyed event is guaranteed to arrive).
+		if requeueAfter == 0 || poolDeleteConflictRequeue < requeueAfter {
+			requeueAfter = poolDeleteConflictRequeue
+		}
 	}
 
 	return requeueAfter, allErrors
@@ -509,10 +548,14 @@ func setWarmLaunchTypeLabelIfNeeded(sb *sandboxv1beta1.Sandbox) bool {
 }
 
 // filterActiveSandboxes filters the list of sandboxes, deleting stale ones and adopting orphans.
-func (r *SandboxWarmPoolReconciler) filterActiveSandboxes(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool, sandboxes []sandboxv1beta1.Sandbox, template *extensionsv1beta1.SandboxTemplate, currentSandboxBlueprintHash string, tmplErr error) ([]sandboxv1beta1.Sandbox, error) {
+// The returned bool reports whether any stale-member DELETE was skipped because its
+// UID/ResourceVersion precondition failed (the member changed since the cache read);
+// the caller should requeue soon so the pool re-lists and re-decides.
+func (r *SandboxWarmPoolReconciler) filterActiveSandboxes(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool, sandboxes []sandboxv1beta1.Sandbox, template *extensionsv1beta1.SandboxTemplate, currentSandboxBlueprintHash string, tmplErr error) ([]sandboxv1beta1.Sandbox, bool, error) {
 	logger := log.FromContext(ctx)
 	var activeSandboxes []sandboxv1beta1.Sandbox
 	var allErrors error
+	deleteConflicts := false
 
 	vettedHashes := make(map[string]bool)
 
@@ -550,9 +593,12 @@ func (r *SandboxWarmPoolReconciler) filterActiveSandboxes(ctx context.Context, w
 		if tmplErr == nil && (updateStrategy == extensionsv1beta1.RecreateSandboxWarmPoolUpdateStrategyType || isOrphan) {
 			if r.isSandboxStale(ctx, &sb, template, currentSandboxBlueprintHash, vettedHashes) {
 				logger.Info("Deleting stale sandbox", "sandbox", sb.Name, "isOrphan", isOrphan)
-				if err := r.Delete(ctx, &sb); err != nil {
-					logger.Error(err, "Failed to delete stale sandbox", "sandbox", sb.Name)
-					allErrors = errors.Join(allErrors, err)
+				if err := r.deletePoolSandbox(ctx, &sb); err != nil {
+					if errors.Is(err, errPoolSandboxDeleteConflict) {
+						deleteConflicts = true
+					} else {
+						allErrors = errors.Join(allErrors, err)
+					}
 				}
 				continue
 			}
@@ -577,7 +623,7 @@ func (r *SandboxWarmPoolReconciler) filterActiveSandboxes(ctx context.Context, w
 
 		activeSandboxes = append(activeSandboxes, sb)
 	}
-	return activeSandboxes, allErrors
+	return activeSandboxes, deleteConflicts, allErrors
 }
 
 // computePodTemplateHash computes a hash of the sandbox template's Spec.PodTemplate.
@@ -695,14 +741,36 @@ func (r *SandboxWarmPoolReconciler) createPoolSandbox(ctx context.Context, warmP
 	return nil
 }
 
-// deletePoolSandbox deletes a Sandbox CR from the warm pool. Ignores not found errors to not abort the batch deletion if some sandboxes are already deleted.
+// deletePoolSandbox deletes a Sandbox CR from the warm pool. The DELETE is
+// guarded by UID and ResourceVersion preconditions taken from the cached copy
+// that selected the sandbox for deletion: any concurrent mutation (a
+// SandboxClaim's adoption patch taking ownership, a label/spec update, ...)
+// bumps the resource version, so the server rejects the DELETE with 409
+// instead of destroying a sandbox the pool no longer exclusively owns —
+// DELETE-by-name ignores ownerRef changes, so without the precondition a
+// just-adopted, Ready-bound sandbox could be killed by a stale
+// scale-down/staleness/stuck decision computed from the informer cache.
+//
+// Returns nil when the sandbox is already gone (404, so batch deletion isn't
+// aborted by already-deleted members) and errPoolSandboxDeleteConflict on a
+// precondition failure so callers can skip the member and requeue for a
+// fresh list.
 func (r *SandboxWarmPoolReconciler) deletePoolSandbox(ctx context.Context, sb *sandboxv1beta1.Sandbox) error {
 	logger := log.FromContext(ctx)
-	if err := r.Delete(ctx, sb); err != nil && client.IgnoreNotFound(err) != nil {
+	uid := sb.UID
+	rv := sb.ResourceVersion
+	err := r.Delete(ctx, sb, client.Preconditions{UID: &uid, ResourceVersion: &rv})
+	switch {
+	case err == nil, k8serrors.IsNotFound(err):
+		return nil
+	case k8serrors.IsConflict(err):
+		logger.Info("Skipping pool sandbox delete: sandbox changed since cache read (possibly adopted); will re-list",
+			"sandbox", sb.Name, "namespace", sb.Namespace)
+		return errPoolSandboxDeleteConflict
+	default:
 		logger.Error(err, "Failed to delete sandbox", "sandbox", sb.Name, "namespace", sb.Namespace)
 		return err
 	}
-	return nil
 }
 
 // updateStatus updates the status of the SandboxWarmPool if it has changed.

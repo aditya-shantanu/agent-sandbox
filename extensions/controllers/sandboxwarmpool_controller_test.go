@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -38,6 +40,7 @@ import (
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // Create a test scheme with extensions types registered.
@@ -2767,4 +2770,165 @@ func TestReconcilePoolMaxRefillRate(t *testing.T) {
 		require.True(t, k8serrors.IsNotFound(err), "stuck sandbox must be GC'd regardless of pacing")
 		require.Equal(t, 2, countOwned(t, r, warmPool))
 	})
+}
+
+// TestDeletePoolSandboxPreconditions verifies that every pool-member DELETE
+// carries UID+ResourceVersion preconditions from the cached copy that
+// selected the member: a sandbox that changed between the cache read and the
+// DELETE reaching the server (e.g. a SandboxClaim's adoption patch winning
+// ownership) is NOT deleted — the conflict is skipped, never sandbox loss.
+func TestDeletePoolSandboxPreconditions(t *testing.T) {
+	poolName := "test-pool"
+	poolNamespace := "default"
+	poolNameHash := sandboxcontrollers.NameHash(poolName)
+	scheme := newTestScheme()
+	template := createTemplate(poolNamespace)
+
+	testCases := []struct {
+		name string
+		// mutate simulates a concurrent actor acting between the cache read
+		// (the copy handed to deletePoolSandbox) and the DELETE.
+		mutate      func(t *testing.T, c client.Client, cached *sandboxv1beta1.Sandbox)
+		wantErr     error
+		wantDeleted bool
+	}{
+		{
+			name:        "unchanged member is deleted",
+			wantDeleted: true,
+		},
+		{
+			name: "adopted-after-cache-read sandbox is NOT deleted",
+			mutate: func(t *testing.T, c client.Client, cached *sandboxv1beta1.Sandbox) {
+				// A claim adoption re-parents the sandbox and bumps its
+				// ResourceVersion after the pool's cache read.
+				fresh := &sandboxv1beta1.Sandbox{}
+				require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(cached), fresh))
+				isController := true
+				fresh.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion: sandboxv1beta1.GroupVersion.String(),
+					Kind:       "SandboxClaim",
+					Name:       "claim-1",
+					UID:        types.UID("claim-uid-1"),
+					Controller: &isController,
+				}}
+				require.NoError(t, c.Update(context.Background(), fresh))
+			},
+			wantErr:     errPoolSandboxDeleteConflict,
+			wantDeleted: false,
+		},
+		{
+			name: "concurrently modified (any write) member is NOT deleted",
+			mutate: func(t *testing.T, c client.Client, cached *sandboxv1beta1.Sandbox) {
+				fresh := &sandboxv1beta1.Sandbox{}
+				require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(cached), fresh))
+				if fresh.Labels == nil {
+					fresh.Labels = map[string]string{}
+				}
+				fresh.Labels["some-actor"] = "touched"
+				require.NoError(t, c.Update(context.Background(), fresh))
+			},
+			wantErr:     errPoolSandboxDeleteConflict,
+			wantDeleted: false,
+		},
+		{
+			name: "already-deleted member is a no-op",
+			mutate: func(t *testing.T, c client.Client, cached *sandboxv1beta1.Sandbox) {
+				require.NoError(t, c.Delete(context.Background(), cached.DeepCopy()))
+			},
+			wantDeleted: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			member := createPoolSandbox(poolName, poolNamespace, poolNameHash, template, "-abc123")
+			c := newFakeClient(scheme, template, member)
+			r := SandboxWarmPoolReconciler{
+				Client:       c,
+				Scheme:       scheme,
+				MaxBatchSize: sandboxCreateDeleteMaxBatchSize,
+			}
+
+			// The "cache read": the copy the deletion decision was computed from.
+			cached := &sandboxv1beta1.Sandbox{}
+			require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: poolNamespace, Name: member.Name}, cached))
+
+			if tc.mutate != nil {
+				tc.mutate(t, c, cached)
+			}
+
+			err := r.deletePoolSandbox(ctx, cached)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+
+			got := &sandboxv1beta1.Sandbox{}
+			getErr := c.Get(ctx, types.NamespacedName{Namespace: poolNamespace, Name: member.Name}, got)
+			if tc.wantDeleted {
+				require.True(t, k8serrors.IsNotFound(getErr), "sandbox should be gone, got err=%v", getErr)
+			} else {
+				require.NoError(t, getErr, "sandbox must survive the stale delete")
+			}
+		})
+	}
+}
+
+// TestReconcilePoolDeleteConflictRequeues verifies the reconcile-level
+// contract for precondition-failed member DELETEs: no error (no exponential
+// backoff), member survives, and the pool requeues soon to re-list.
+func TestReconcilePoolDeleteConflictRequeues(t *testing.T) {
+	poolName := "test-pool"
+	poolNamespace := "default"
+	poolNameHash := sandboxcontrollers.NameHash(poolName)
+	scheme := newTestScheme()
+	template := createTemplate(poolNamespace)
+
+	zero := int32(0)
+	warmPool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      poolName,
+			Namespace: poolNamespace,
+			UID:       "warmpool-uid-123",
+		},
+		Spec: extensionsv1beta1.SandboxWarmPoolSpec{
+			Replicas:    &zero,
+			TemplateRef: extensionsv1beta1.SandboxTemplateRef{Name: "test-template"},
+		},
+	}
+	member := createPoolSandbox(poolName, poolNamespace, poolNameHash, template, "-abc123")
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&extensionsv1beta1.SandboxWarmPool{}).
+		WithIndex(&sandboxv1beta1.Sandbox{}, sandboxWarmPoolLabelIndex, sandboxWarmPoolLabelIndexer).
+		WithIndex(&extensionsv1beta1.SandboxWarmPool{}, extensionsv1beta1.TemplateRefField, sandboxTemplateRefNameIndexer).
+		WithRuntimeObjects(template, warmPool, member).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				// Simulate the apiserver rejecting the DELETE because the
+				// object changed after the cache read (409 Conflict).
+				return k8serrors.NewConflict(
+					schema.GroupResource{Group: sandboxv1beta1.GroupVersion.Group, Resource: "sandboxes"},
+					obj.GetName(), errors.New("the object has been modified"))
+			},
+		}).
+		Build()
+
+	r := SandboxWarmPoolReconciler{
+		Client:       c,
+		Scheme:       scheme,
+		MaxBatchSize: sandboxCreateDeleteMaxBatchSize,
+	}
+
+	ctx := context.Background()
+	requeueAfter, err := r.reconcilePool(ctx, warmPool)
+	require.NoError(t, err, "a precondition conflict must not surface as a reconcile error")
+	require.Equal(t, poolDeleteConflictRequeue, requeueAfter, "conflict must schedule a prompt re-list")
+
+	got := &sandboxv1beta1.Sandbox{}
+	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: poolNamespace, Name: member.Name}, got),
+		"member must survive the conflicted delete")
 }
