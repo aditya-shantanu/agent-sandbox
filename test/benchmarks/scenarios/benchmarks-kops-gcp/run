@@ -241,6 +241,37 @@ TUNE_CONTROL_PLANE="${TUNE_CONTROL_PLANE:-false}"
 #     not look as expected.
 TUNE_NODES="${TUNE_NODES:-false}"
 
+# TUNE_CBOR=true (default false; bench-only experiment, ROUND7-PLAN item 4 /
+# PATH-TO-100MS B3) enables CBOR serving+storage for custom resources
+# (KEP-4222) end to end:
+#   - kube-apiserver: CBORServingAndStorage feature gate (ALPHA and off by
+#     default in k8s 1.35; beta retargeted to 1.37) — applied at cluster
+#     CREATION time only, like the other TUNE_* knobs. Covers CR serving
+#     AND storage, so watch-event and GET/POST encode/decode drop the
+#     per-watcher JSON compaction tax (k8s #110146).
+#   - clients (controller Deployment AND the stress harness, both plain
+#     client-go v0.36.x): the env-var client gates
+#     KUBE_FEATURE_ClientsAllowCBOR=true + KUBE_FEATURE_ClientsPreferCBOR=true
+#     (CASE-SENSITIVE names). With Allow+Prefer on, clients send
+#     Accept/Content-Type application/cbor and fall back process-wide to
+#     JSON on the first 415 — so a server without the gate degrades safely.
+#
+# TWO TRAPS (do not skip when reading a TUNE_CBOR leg):
+#   1. VERIFY CONTENT-TYPE ON THE WIRE, don't assume: controller-runtime
+#      (v0.24.x) builds its own clients on top of client-go — confirm CBOR
+#      was actually negotiated before attributing any delta to it. Cheapest
+#      checks: run the leg with INSTRUMENT_CLUSTER=true and grep the
+#      apiserver -v=3 request lines for 'application/cbor', and/or grep the
+#      controller log startup client config. If the controller stays pinned
+#      to JSON, the rest.Config must be overridden explicitly before the
+#      leg counts as a CBOR measurement.
+#   2. HOT-PATH PATCH BODIES STAY JSON: there is no CBOR merge-patch media
+#      type (application/apply-patch+cbor is SSA-only, and SSA is a
+#      rejected regression here). S3 (claim-status PATCH RTT) is NOT
+#      expected to move; the win is S0/S1/S4 encode/decode only
+#      (expected −5-10ms sustained, more at burst where fan-out queues).
+TUNE_CBOR="${TUNE_CBOR:-false}"
+
 if [[ -z "${EXISTING_CLUSTER:-}" ]]; then
 
 echo "Creating kOps cluster configuration..."
@@ -288,6 +319,15 @@ if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
       "--set" "cluster.spec.kubeControllerManager.kubeAPIBurst=400"
     )
 fi
+CBOR_KOPS_FLAGS=()
+if [[ "${TUNE_CBOR}" == "true" ]]; then
+    # See the TUNE_CBOR comment above. Feature-gate map keys ARE addressable
+    # via `kops create cluster --set` on kops v1.35 (unlike
+    # kubelet.systemReserved — verified in the ROUND7 research pass), so no
+    # cluster-yaml patching is needed here.
+    echo "TUNE_CBOR=true: enabling kube-apiserver CBORServingAndStorage (alpha) at creation"
+    CBOR_KOPS_FLAGS+=("--set" "cluster.spec.kubeAPIServer.featureGates.CBORServingAndStorage=true")
+fi
 NODE_TUNE_KOPS_FLAGS=()
 NODE_VOLUME_FLAGS=()
 if [[ "${TUNE_NODES}" == "true" ]]; then
@@ -331,6 +371,7 @@ kops create cluster \
   ${CNI_KOPS_FLAGS[@]+"${CNI_KOPS_FLAGS[@]}"} \
   ${INSTRUMENT_KOPS_FLAGS[@]+"${INSTRUMENT_KOPS_FLAGS[@]}"} \
   ${TUNE_KOPS_FLAGS[@]+"${TUNE_KOPS_FLAGS[@]}"} \
+  ${CBOR_KOPS_FLAGS[@]+"${CBOR_KOPS_FLAGS[@]}"} \
   ${NODE_TUNE_KOPS_FLAGS[@]+"${NODE_TUNE_KOPS_FLAGS[@]}"} \
   ${NODE_VOLUME_FLAGS[@]+"${NODE_VOLUME_FLAGS[@]}"}
 
@@ -420,6 +461,10 @@ else
     echo "NOTE: TUNE_NODES=true only applies at cluster creation; the reused cluster keeps"
     echo "its original eventTTL, kubelet reserves, and node boot-disk configuration."
   fi
+  if [[ "${TUNE_CBOR}" == "true" ]]; then
+    echo "NOTE: TUNE_CBOR=true only enables the apiserver CBORServingAndStorage gate at cluster"
+    echo "creation; the reused cluster keeps its original gates (client env gates still applied)."
+  fi
   kops export kubeconfig --name "${CLUSTER_NAME}" --admin
 fi
 
@@ -431,6 +476,17 @@ if [[ -n "${CONTROLLER_ARGS}" ]]; then
   DEPLOY_FLAGS+=(--controller-args "${CONTROLLER_ARGS}")
 fi
 dev/tools/deploy-to-kube "${DEPLOY_FLAGS[@]}"
+
+if [[ "${TUNE_CBOR}" == "true" ]]; then
+  # Client half of TUNE_CBOR for the CONTROLLER: client-go's env-var feature
+  # gate provider reads KUBE_FEATURE_<gate> from the process environment, so
+  # the gates ride the Deployment env (case-sensitive values/names). Done
+  # before the rollout wait so only one rollout happens. Safe on a non-CBOR
+  # apiserver: first 415 flips the process to JSON permanently.
+  echo "TUNE_CBOR=true: setting client CBOR env gates on the controller Deployment..."
+  kubectl set env deployment agent-sandbox-controller --namespace agent-sandbox-system \
+    KUBE_FEATURE_ClientsAllowCBOR=true KUBE_FEATURE_ClientsPreferCBOR=true
+fi
 
 # Wait for controller to be ready
 echo "Waiting for controller to be ready..."
@@ -521,6 +577,14 @@ capture_stress_diagnostics() {
     done
   fi
 }
+
+if [[ "${TUNE_CBOR}" == "true" ]]; then
+  # Client half of TUNE_CBOR for the STRESS HARNESS (plain client-go, same
+  # env-var gate provider as the controller). Exported once; covers the
+  # smoke run and the main run below.
+  export KUBE_FEATURE_ClientsAllowCBOR=true KUBE_FEATURE_ClientsPreferCBOR=true
+  echo "TUNE_CBOR=true: stress harness client CBOR env gates exported"
+fi
 
 # STRESS_SMOKE_COUNT (default 0 = off) runs a small claims-warm first as a
 # pipeline smoke test; under errexit a smoke failure aborts before the
