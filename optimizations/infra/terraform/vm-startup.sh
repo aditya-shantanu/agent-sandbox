@@ -2,7 +2,7 @@
 # Startup script for perf-bench-runner: bootstrap once, then launch the
 # benchmark orchestrator detached. Idempotent across reboots via marker file.
 set -u
-MARKER=/root/.bench-started-v10
+MARKER=/root/.bench-started-v11
 LOG=/root/startup-bench.log
 exec >>"${LOG}" 2>&1
 
