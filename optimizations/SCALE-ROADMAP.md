@@ -171,6 +171,19 @@ Service** (it is already optional: `spec.service` false skips creation,
 rate from pod churn rate** (pool as shock absorber + bounded-rate refill,
 or scrub-and-reuse recycling where the security model allows it).
 
+**Empirically confirmed (round-8 leg S2, 2026-07-20, 34× n2-standard-8
+tuned cluster, controller pathology-free):** at 300 claims/s sustained the
+controller issued pool-refill creates at 103-183/s aggregate (best-10s
+260/s) and the API server acked at p50 39ms — but pods reached Ready at
+only **~47/s overall (65.7/s best-60s)**, with pod-create→scheduled p50
+129s / p90 206s under queue. That is **~1.5-2 pods/s reaching Ready per
+node**: exactly this section's churn wall, measured. Sizing corollary for
+sustained R/s once the pool drains: `nodes × per-node-ready-rate ≥ R`
+(300/s ⇒ ~150-200 such nodes as-is), or raise the per-node rate (node
+I/O work, PRs #1203-#1208; scheduler/KCM/cilium QPS above), or take churn
+out of the steady state entirely (L6 recycling). Full data: `RESULTS.md`
+round-8 verdict.
+
 ## 2. Ranked roadmap
 
 Legend: ceiling raised = which wall it moves and roughly how far; effort

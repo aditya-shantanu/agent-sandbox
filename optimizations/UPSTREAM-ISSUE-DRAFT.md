@@ -26,11 +26,20 @@ the same cluster) were a 3.3× p90 gain (1000→301ms). Uncontended floor
 was instrumentation tax (see the observability section). Everything above
 ~20ms is burst contention, and each task below removes a piece of it.
 
-**Sustained-rate honesty:** the same gate-zero run's 300/s × 60s sustained
-leg FAILED (3,804/18,000 ready) — the warm-pool refill loop was starved to
-~2-3 creates/s per pool by claim-side contention. Burst-300 is solved;
-sustained-300 is not. See task 8's caveat and `RESULTS.md` (gate-zero leg S
-diagnosis) before quoting any sustained number.
+**Sustained-rate honesty (updated after round 8, 2026-07-20):** gate zero's
+300/s × 60s sustained leg FAILED (3,804/18,000 ready; 3,204 double-bound
+sandboxes; refill starved to ~2-3 creates/s per pool). The round-8 fixes —
+adoption reservation + DirectReader recovery (task 17) and pool-dedicated
+connection + backlog-aware polling (task 8) — were then verified by a full
+rerun (leg S2): **zero double-binds in 17,822 bindings, zero wedged losers,
+refill recovered 15-60× to ~26-46 creates/s per pool, 15,821/17,822 ready,
+rc=0**. The controller-side failure modes are gone. What remains at 300/s
+sustained is **supply-side**: 300 claims/s beyond pool depth requires 300
+pods/s reaching Ready, and a 34-node cluster delivers ~50-65 ready/s
+(pod-create→scheduled p50 129s under queue). The claim path itself ran at
+**119ms p50 at 300/s** while pool supply lasted. Sustained deployments must
+be sized for pods-to-Ready throughput (nodes × per-node ready-rate ≥ arrival
+rate); see task 8's caveat and `RESULTS.md` (round-8 verdict).
 
 Full data, per-round A/Bs, and forensic artifacts: `optimizations/` on the
 investigation fork (`aditya-shantanu/agent-sandbox`, branch
@@ -63,7 +72,7 @@ reviewable and roughly maps to one investigation branch.
 | 5 | Adoption conflicts → bounded requeue | 🟢 | ++ | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527), [#1042](https://github.com/kubernetes-sigs/agent-sandbox/issues/1042)/[PR #1072](https://github.com/kubernetes-sigs/agent-sandbox/pull/1072) |
 | 6 | Write-payload & CPU reductions (rawpatch + flags) | 🟢 | ++ | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527), [#350](https://github.com/kubernetes-sigs/agent-sandbox/issues/350), [#940](https://github.com/kubernetes-sigs/agent-sandbox/issues/940) |
 | 7 | Informer cache diet | 🟢 | ++ | merged | [#836](https://github.com/kubernetes-sigs/agent-sandbox/issues/836), [#484](https://github.com/kubernetes-sigs/agent-sandbox/issues/484) |
-| 8 | Warm-pool refill shaping (delay + rate) | 🟢 | ++ | merged | [PR #913](https://github.com/kubernetes-sigs/agent-sandbox/pull/913), [#1182](https://github.com/kubernetes-sigs/agent-sandbox/issues/1182) |
+| 8 | Warm-pool refill shaping + supply isolation | 🟢 | ++ | merged (isolation verified round-8 S2) | [PR #913](https://github.com/kubernetes-sigs/agent-sandbox/pull/913), [#1182](https://github.com/kubernetes-sigs/agent-sandbox/issues/1182) |
 | 9 | SDK single-watch ready wait | 🟢 | ++ | merged | [#574](https://github.com/kubernetes-sigs/agent-sandbox/issues/574), [#286](https://github.com/kubernetes-sigs/agent-sandbox/issues/286), [PR #565](https://github.com/kubernetes-sigs/agent-sandbox/pull/565) |
 | 10 | Write-behind coalescing (sandbox controller) | 🟢 | ++ | merged | [#350](https://github.com/kubernetes-sigs/agent-sandbox/issues/350), [#594](https://github.com/kubernetes-sigs/agent-sandbox/issues/594) |
 | 11 | Sandbox status writes race-proofed | 🟢 | + | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527), [#350](https://github.com/kubernetes-sigs/agent-sandbox/issues/350), [PR #882](https://github.com/kubernetes-sigs/agent-sandbox/pull/882) |
@@ -72,7 +81,7 @@ reviewable and roughly maps to one investigation branch.
 | 14 | Router name-cache (service-free resolution) | 🟢 | + | merged | [#883](https://github.com/kubernetes-sigs/agent-sandbox/issues/883), [#836](https://github.com/kubernetes-sigs/agent-sandbox/issues/836), [PR #850](https://github.com/kubernetes-sigs/agent-sandbox/pull/850) |
 | 15 | Benchmark honesty (measurement fixes) | 🟢 | + | merged | [#403](https://github.com/kubernetes-sigs/agent-sandbox/issues/403), [#624](https://github.com/kubernetes-sigs/agent-sandbox/issues/624), [#781](https://github.com/kubernetes-sigs/agent-sandbox/issues/781), [#1182](https://github.com/kubernetes-sigs/agent-sandbox/issues/1182) |
 | 16 | APF insulation + seat sizing | 🟡 | +++ | bench-only | none — novel |
-| 17 | L1 one-write adoption | 🟡 | +++ (measured) | merged | [#435](https://github.com/kubernetes-sigs/agent-sandbox/issues/435); rebase-watch [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118) |
+| 17 | L1 one-write adoption (+ reservation/DirectReader hardening) | 🟡 | +++ (measured) | merged (hardening verified round-8 S2) | [#435](https://github.com/kubernetes-sigs/agent-sandbox/issues/435), [#418](https://github.com/kubernetes-sigs/agent-sandbox/issues/418), [#478](https://github.com/kubernetes-sigs/agent-sandbox/issues/478); rebase-watch [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118) |
 | 18 | Collapse adoption transaction 3 writes → 2 | 🟡 | ++ | merged | [#478](https://github.com/kubernetes-sigs/agent-sandbox/issues/478); rebase-watch [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118) |
 | 19 | Horizontal scale via namespace sharding | 🟡 | ++ (rate-holding) | merged; re-scope onto [PR #1213](https://github.com/kubernetes-sigs/agent-sandbox/pull/1213) | [#484](https://github.com/kubernetes-sigs/agent-sandbox/issues/484), [PR #924](https://github.com/kubernetes-sigs/agent-sandbox/pull/924) |
 | 20 | Serve v1beta1 only; drop v1alpha1 + conversion webhook | 🟡 | + | merged | [#751](https://github.com/kubernetes-sigs/agent-sandbox/issues/751); conflicts [PR #1188](https://github.com/kubernetes-sigs/agent-sandbox/pull/1188), [PR #1106](https://github.com/kubernetes-sigs/agent-sandbox/pull/1106) |
@@ -293,29 +302,49 @@ instead of full-deficit bursts. Both default 0 = exact legacy behavior.
 Isolated per-pool refill ceiling measured at ~70-85/s (create→Ready incl.
 pod start); sizing formula documented in the flag comments.
 
+**Refill starvation fix (round 8, verified by leg S2).** Gate-zero leg S
+showed shaping is necessary but not sufficient: at 300/s × 60s the refill
+loop was starved to ~2-3 creates/s per pool (30-50× under its own token
+bucket) by claim-side contention on shared resources — refill POSTs shared
+the round-robin HTTP/2 write shards with 400 claim workers' backlog
+traffic, and ~14k pending claims polling the empty pool at a flat 50ms
+burned the pool workers' CPU/workqueue turns. Two additional mechanisms
+fix this: **`--pool-dedicated-connection`** (default on) gives pool member
+creates/deletes their own HTTP/2 connection (same `newIsolatedHTTPClient`
+mechanism as `--separate-watch-connection`), and **backlog-aware polling**
+— cold-start deferral requeues grow 50ms→500ms with consecutive deferrals,
+cutting empty-pool poll load ~10× exactly when the pool needs headroom.
+
 **Validated.** Unit tests pin bucket accrual/requeue math;
 replenish-delay=20s ran in every burst benchmark since round 2 (refill
-observably deferred past the burst window). Supersedes stale
+observably deferred past the burst window). The round-8 sustained rerun
+(leg S2, 300/s × 60s, same scenario that collapsed in leg S) measured the
+contended refill at **~26-46 creates/s per pool (103-183/s aggregate,
+best-10s 260/s)** — a 15-60× recovery that moved refill off the critical
+constraint (creates outran pod-Ready 3-4×). Supersedes stale
 [PR #913](https://github.com/kubernetes-sigs/agent-sandbox/pull/913); the
 [#1182](https://github.com/kubernetes-sigs/agent-sandbox/issues/1182)
 template→pools fan-out is the adjacent unfixed cliff.
 
-**⚠ Sustained-load caveat (gate-zero leg S, 2026-07-20).** Shaping is
-necessary but **not sufficient** for sustained rates. At 300/s × 60s
-(4 pools × 375, `--sandbox-warm-pool-max-refill-rate=100`, 4 pool workers)
-the run collapsed: 3,804/18,000 ready. The refill loop issued only **~2-3
-creates/s per pool** — 30-50× under its own token-bucket cap and ~10× under
-the isolated ceiling — because a ~14k pending-claim backlog kept 400 claim
-workers in adoption storms (3,204 sandboxes double-bound; ~4.3k loser
-claims wedged to timeout) that starved the pool controller's CPU/write
-budget. The cluster itself was healthy (create ack p99 87ms, pods started
-in ~1s once created; no capacity exhaustion, no cold-start flood).
-Sustained rates additionally need: supply/demand isolation (dedicated
-connection + worker/APF budget for refill), a bounded empty-pool claim
-retry path, the wedged-loser rebind fix, and pool sizing computed from the
-**contended** refill rate. Full diagnosis: `RESULTS.md` gate-zero verdict.
+**⚠ Sustained-load caveat (updated after round 8).** With the controller
+fixed, the honest remaining constraint at sustained rates is the
+**cluster's pods-to-Ready throughput**: leg S2 completed 15,821/17,822
+(89%, rc=0, zero double-binds/wedges) but a 34-node pipeline delivers only
+~50-65 pods/s to Ready against 300/s arrivals (pod-create→scheduled p50
+129s under queue), so claims beyond pool depth wait on supply (e2e p50
+141s) and the slowest 2,006 hit per-claim timeouts. The claim path itself
+held 119ms p50 while pool supply lasted. Sizing rule for sustained R/s:
+pool absorbs the transient; beyond it, `nodes × per-node-ready-rate ≥ R`
+(≈1.5-2 ready/s per n2-standard-8 node measured) — or raise per-node rates
+(node-local I/O work,
+[PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203))
+or remove pod churn from the steady state (recycling, security-gated).
+This is a deployment-sizing constraint, not a controller defect. Full
+data: `RESULTS.md` round-8 verdict.
 
-**Default:** both flags default 0 (legacy immediate full-deficit refill).
+**Default:** shaping flags default 0 (legacy immediate full-deficit
+refill); `--pool-dedicated-connection` defaults on (set `=false` for the
+legacy shared transport).
 
 ### Task 9: 🟢 ++ — SDK ready-wait was paying an extra round trip
 
@@ -515,21 +544,43 @@ on a genuine steal clears the stale binding and re-adopts (bounded retries,
 loud logs). Claims observe Ready after ONE write RTT; hot-path write
 concurrency halves.
 
+**Overload hardening (round 8): reservation semantics + DirectReader
+recovery.** Gate-zero leg S exposed the one-write visibility window under
+backlog: a popped-but-not-yet-patched sandbox still looks pool-owned in
+every cache view, so watch events re-queued it and a second claim
+status-bound the same sandbox (3,204 double-binds; ~4.3k losers wedged to
+timeout because recovery also read through the lagging cache) — the
+sustained-scale recurrence of
+[#418](https://github.com/kubernetes-sigs/agent-sandbox/issues/418)'s
+double-adoption and
+[#478](https://github.com/kubernetes-sigs/agent-sandbox/issues/478)'s
+failed-write wedge. Fix: (a) queue pops **reserve** the key — `Add` drops
+reserved keys, give-backs go through `Release`, deletes through `Forget`,
+and reservations survive terminal adoption outcomes until the sandbox
+DELETE event, so no watch event can re-queue an in-transaction or adopted
+sandbox; (b) the flusher's post-409 re-verify and `recoverLostAdoption`
+read through a **DirectReader** (`mgr.GetAPIReader()`), so recovery
+decisions never depend on informer convergence and a genuine loser unbinds
+in one RTT; (c) crash-window conflicts reclassify from a direct read (no
+409-storm loop); (d) the cold-start guard excludes reserved phantoms.
+
 **Validated.** `onewrite_adoption_test.go` incl. idempotent crash-window
 recovery pinned at N=50. Benchmarked in gate-zero leg B (with tasks 10+12):
 burst-300 p50 273 / p90 301 / p99 309 / max 312ms, all-ready 0.31s, zero
 failures — a 3.3× p90 composed gain over the same cluster's leg A, landing
-inside the §1.2 projection (205-345ms).
+inside the §1.2 projection (205-345ms). The overload hardening is
+**verified by the round-8 sustained rerun (leg S2)**: 300/s × 60s under a
+multi-thousand-claim backlog produced **0 double-bound sandboxes in 17,822
+bindings and 0 wedged losers** (leg S: 3,204 / ~4.3k), with the smoke floor
+intact (21ms p50) and the first contended window at 119ms p50. Regression
+tests reproduce both leg-S signatures pre-fix and pass post-fix; `-race`
+clean.
 
 **Why 🟡:** sub-second autoscaler-eviction window until the async patch
 lands — [#435](https://github.com/kubernetes-sigs/agent-sandbox/issues/435)
 (`safe-to-evict=on-completion`) would eliminate it; multi-process steal
 window widened (leader election makes it rare, namespace sharding removes
-it). **Sustained-overload caveat:** gate-zero leg S observed 3,204
-double-bindings whose losers never rebound (wedged to timeout) once the
-backlog reached ~14k pending claims — the steal-recovery path needs
-hardening (or an adoption reservation) before sustained-rate deployments;
-see task 8's caveat. Rebase-watch:
+it). Rebase-watch:
 [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118).
 
 **Default (post-flip):** `--one-write-adoption=true`; set `=false` to
@@ -603,13 +654,15 @@ conflicts with
 
 ## Remaining work (known, scoped, not in this issue)
 
-- **Sustained-300 remediation** (gate-zero leg S failed; diagnosis in
-  `RESULTS.md`): isolate warm-pool refill from claim-adoption contention
-  (dedicated connection/worker/APF budget), bound the empty-pool claim
-  retry storm, fix the wedged-loser rebind path, size pools from the
-  **contended** refill rate, and re-attempt with a rate ramp
-  (100→200→300/s). Burst-300 is done; this is the gate for every
-  sustained-rate claim.
+- **Sustained-rate supply side** (round-8 leg S2 closed the controller
+  side: zero double-binds/wedges, refill unstarved, 89% completion at
+  300/s on 34 nodes; `RESULTS.md` round-8 verdict). Remaining paths are
+  cluster-throughput engineering: (1) node-count sizing
+  (`nodes × per-node-ready-rate ≥ R`; ~1.5-2 ready/s per node measured),
+  (2) per-node ready-rate levers (node-local I/O
+  [PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203),
+  cilium/kubelet/scheduler QPS), (3) L6 recycling (security-gated) to
+  remove pod churn from the steady state.
 - **Rebase onto [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118)
   and [PR #1213](https://github.com/kubernetes-sigs/agent-sandbox/pull/1213)**
   before any further claim-controller code (ROUND7 §2).
@@ -708,7 +761,8 @@ which the numbers in this issue would be wrong.
 ---
 
 *Maintenance: this document is updated at the end of every investigation
-round (latest: gate-zero absorption, 2026-07-20 — composed-tree verified
-numbers, default flips, task-body expansion, leg-S sustained caveat, and
-the observability section). Numbers in the results table are always the
-latest verified A/B.*
+round (latest: round-8 absorption, 2026-07-20 — leg-S2 verification of the
+double-bind/wedge fixes (task 17 reservation + DirectReader) and the
+refill-starvation fixes (task 8 pool-dedicated-connection + backlog-aware
+polling), plus the honest supply-side sustained caveat). Numbers in the
+results table are always the latest verified A/B.*

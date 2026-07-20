@@ -400,14 +400,17 @@ sandboxes.jsonl; forensics 2026-07-20):
   watch-stream schema handling, and add a live refill-rate gauge to the
   progress line so collapse is visible at +30s instead of post-mortem.
 
-## 2026-07-20 — ROUND 8: leg-S root causes fixed, sustained-300 relaunched (PENDING)
+## 2026-07-20 — ROUND 8: leg-S root causes fixed, sustained-300 rerun (COMPLETE — verdict below)
 
-Status: **PENDING** — sustained-300 rerun (single leg `S2-sustained300`)
-relaunched on `perf-bench-runner` (startup marker v9, orchestrator pinned to
-`d1ddac3`) against a fresh 34-node tuned cluster, same capacity math as leg S
-(pool 1500 + in-flight 1950 = 3450 ≤ spare ≈ 3668). Results land in
+Sustained-300 rerun (single leg `S2-sustained300`) ran on `perf-bench-runner`
+(startup marker v9, orchestrator pinned to `d1ddac3`) against a fresh 34-node
+tuned cluster `sandbox-20260720-155728`, same capacity math as leg S
+(pool 1500 + in-flight 1950 = 3450 ≤ spare ≈ 3668). STATUS: **DONE rc=0,
+ROUND8 COMPLETE**; cluster deleted cleanly (run.log `Deleted cluster:
+"sandbox-20260720-155728"`; GCE instance/network/address lists verified
+empty post-run). Artifacts:
 `gs://kops-state-142966328212/perf-bench-results/round8/` (`STATUS.txt`,
-`hb-*` heartbeats every 3 min, `S2-sustained300/` leg folder). Commits:
+`hb-*` heartbeats, `S2-sustained300/` leg folder). Commits:
 `650bc0e` (double-bind + wedged-loser fix), `c9bcc7c` (pool starvation fix),
 `d1ddac3` (artifact-gap fixes).
 
@@ -500,3 +503,105 @@ measured new contended number to feed the §"refill feasibility math"), and
 failed-claim count ≈ 0 at 300/s × 60s. If refill still can't sustain 300/s
 aggregate, the next lever is the planned ramp (100 → 200 → 300/s) to measure
 the contended per-pool rate before re-attempting 300.
+
+## 2026-07-20 — ROUND-8 VERDICT (leg S2-sustained300, cluster sandbox-20260720-155728, image d1ddac3)
+
+Smoke on the fixed tree (20 claims, uncontended): ack p50 10ms,
+create→Ready **p50 21ms / p90 22ms / max 23ms** — the clean floor is intact
+after the round-8 fixes.
+
+**Sustained 300/s × 60s (4 pools × 375, refill cap 100/pool, dwell 1.5s):**
+
+| metric | value |
+|---|---|
+| requested / created / ready / failed | 18,000 / 17,822 / **15,821** / 2,006 (521.0s phase wall) |
+| arrival rate held | 296.7/s overall, 296.8/s steady (Poisson target 300/s) |
+| create ack | p50 **39ms** / p90 194ms / p99 573ms / max 1143ms |
+| create→Ready (ready cohort) | p50 141.0s / p90 246.6s / p99 277.0s |
+| ready throughput | overall 46.8/s, best60s **65.7/s**, best10s 152/s |
+
+Rolling 10s windows by arrival time (create→Ready):
+
+| window | arrivals | ready | p50 | p90 |
+|---|---|---|---|---|
+| [0-10s) | 2,956 | 2,956 | **119ms** | 176.2s |
+| [10-20s) | 2,999 | 2,999 | 67.2s | 76.5s |
+| [20-30s) | 2,970 | 2,681 | 98.3s | 133.7s |
+| [30-40s) | 2,893 | 2,335 | 153.5s | 169.3s |
+| [40-50s) | 2,993 | 1,847 | 207.8s | 220.8s |
+| [50-60s) | 3,011 | 3,003 | 246.9s | 274.9s |
+
+The pool lasted ~5-10s at 300/s; the first window's p50 119ms is the claim
+path performing at rate while supply existed. Every later window is
+queueing behind refill, not adoption cost.
+
+**Success criteria — forensics (sandboxes.jsonl, all 17,822 bindings):**
+
+- **Double-bound sandboxes: 0 of 17,822** (leg S: 3,204 of 5,457). The
+  reservation + DirectReader fix (`650bc0e`) is verified at full scale.
+  Controller-log counters concur: `DOUBLE-BIND` 0, `wedged` 0, `ONE-WRITE
+  ADOPTION LOST` 0. (Caveat: the per-pod controller log capture — the
+  `d1ddac3` fix worked, `capture-errors.log` clean — still only retained the
+  final ~17s / 9,758 lines of the run at default kubectl limits; the
+  sandboxes.jsonl forensic is the definitive zero, the log counters are
+  corroboration. Next harness tweak: `--tail=-1` + since-start capture.)
+- **Wedged losers: 0.** All 2,006 failures were 300s per-claim timeouts of
+  claims **uniquely bound** to a sandbox whose pod never reached Ready in
+  time — pure supply starvation. Zero never-bound failures (the leg-S
+  empty-pool storm is gone), zero bindings that changed or pointed at
+  deleted sandboxes.
+- **Contended refill rate (timeseries.jsonl, aggregate pod creates):**
+  183/s in [10-30s), 156/s in [30-60s), 103/s in [60-120s), best-10s
+  259.9/s — i.e. **~26-46 creates/s per pool contended** vs leg S's 2-3/s
+  (**15-60× recovery**; `c9bcc7c` verified). Below the 70-85/s isolated
+  ceiling but no longer the binding constraint: creates outran Ready 3-4×
+  throughout.
+
+**Where the time went (segment decomposition, summary.json):** ack p50
+39ms → sandbox-create→pod-create p50 18.7s (refill queue) →
+**pod-create→scheduled p50 129.0s / p90 206.5s** (the wall) →
+scheduled→running p50 1.1s → pod-Ready→sandbox-Ready p50 0.1s. The
+scheduler/node pipeline, not the API server (ack healthy throughout) and
+not the controller (double-bind-free, refill flowing), absorbed the queue.
+
+**Fix effectiveness — old leg S vs S2, same scenario and capacity math:**
+
+| | leg S (gate zero) | S2 (round 8) |
+|---|---|---|
+| completion | 3,804/18,000 (**21%**), rc=1 | 15,821/17,822 created (**89%**), rc=0 |
+| double-bound sandboxes | 3,204 | **0** |
+| wedged losers | ~4,300 | **0** |
+| never-bound failures | 9,228 | **0** |
+| contended refill creates | ~2-3/s per pool | ~26-46/s per pool |
+| ready throughput | ~10/s decaying | 47/s overall / 65.7/s best60s |
+| create ack p50/p99 | 8ms / 87ms | 39ms / 573ms (healthy under 3-4× more live churn) |
+
+**Verdict.** The round-8 fixes eliminated the catastrophic failure mode
+entirely — no double-binding, no wedging, no starvation collapse, clean
+exit. What remains is **supply-side and empirical**: sustaining 300/s
+needs 300 pods/s reaching Ready, and a 34-node pipeline delivers ~50-65
+ready/s (~1.5-2 pods/s/node) — the SCALE-ROADMAP §1.4 churn wall,
+now confirmed with numbers. The three recorded paths forward:
+
+1. **Nodes-scale:** at ~1.5-2 ready/s per node, 300/s sustained implies
+   ~150-200 nodes plus scheduler QPS raises (§1.4) — a deployment-sizing
+   line item, not an engineering unknown.
+2. **Per-node ready-rate levers:** the node-local I/O wall work
+   (PRs #1203-#1208: containerd fdatasync, overlayfs-volatile, NVMe),
+   cilium client QPS, kubelet tuning — raises ready/s/node so the node
+   count shrinks.
+3. **L6 recycling (SCALE-ROADMAP):** decouple claim rate from pod churn
+   entirely — the only path where sustained high rates don't imply a
+   large pod pipeline; still gated on the security decision memo.
+
+**Definitive investigation scoreboard:**
+
+- **Burst-300: SOLVED.** p90 301ms, 18.4× vs baseline, all-ready 0.31s,
+  zero failures/cold-starts/conflicts (gate-zero leg B, clean).
+- **Sustained-300 claim path: PROVEN.** 119ms p50 at 300/s while pool
+  supply lasted; ack p50 39ms holding 296.7/s for 60s; zero controller
+  pathology at 14k-claim backlog.
+- **Sustained-300 end-to-end: SUPPLY-BOUND.** Beyond pool depth it is a
+  pods-to-Ready throughput problem (cluster sizing per paths 1-3 above),
+  not a controller defect. Feasibility rule confirmed:
+  `nodes × per-node-ready-rate ≥ arrival rate` once the pool drains.
