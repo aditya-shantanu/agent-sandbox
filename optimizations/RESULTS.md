@@ -661,7 +661,7 @@ plus a measured supply-ceiling estimate (slot residence, refill margin,
 per-node rates) for SCALE-ROADMAP §1.4.
 
 Artifacts: `gs://kops-state-142966328212/perf-bench-results/round9b/`.
-Results: PENDING.
+Results: COMPLETE — SUST3 verdict below (supply wall found: untuned scheduler).
 
 ## 2026-07-20 — ROUND 9a: claim-path items landed (code complete; measurement rides 9b) — PENDING
 
@@ -754,7 +754,7 @@ forced e2-standard-8 (CPUS pool); SSD_TOTAL_GB forced 100GB pd-ssd boot
 disks; quota preflight added to the v10 orchestrator; bring-up→teardown of
 the 150-node cluster fit in a 33-minute wall clock.
 
-## 2026-07-20 — ROUND 9b SUST4: rerun with the scheduler actually tuned (v11, image 0b92308 + sched-fix) — PENDING
+## 2026-07-20 — ROUND 9b SUST4: rerun with the scheduler actually tuned (v11, image 0b92308 + sched-fix) — COMPLETE (verdict below)
 
 Same 150× e2-standard-8 shape as SUST3, plus: **kubeScheduler.qps=800/
 burst=1600 applied via the fixed keys**; pinned at the 9a tip so the leg
@@ -765,4 +765,95 @@ riders, and `--per-namespace-claim-watch` (8 shards, pairs with
 CBOR claim-path deltas are unreadable under a supply collapse.
 `apfVerification` in summary.json to be checked (harness client must ride
 an exempt PL). Success criteria unchanged from the SUST3 design entry.
-Results: PENDING.
+Results: COMPLETE — round-9b verdict below.
+
+## 2026-07-20 — ROUND-9B VERDICT (SUST4 cluster sandbox-20260720-195719 @ 8a57aa7; SUST5-cbor aborted pre-cluster): scheduler wall peeled; next walls measured; 300/s NOT yet demonstrable
+
+Smoke on the 9a tree (claim-side no-spec aboard): ack p50 8ms, create→Ready
+p50 21 / p90 23 / max 23ms — floor intact.
+
+**SUST4 vs SUST3 (identical 150× e2-standard-8 / 16,500-slot shape, 8×375
+pools, same arrival process; deltas: kubeScheduler.qps=800/burst=1600
+actually applied, pin 8a57aa7 = 9a items + `--per-namespace-claim-watch`):**
+
+| | SUST3 (sched @ default 50 QPS) | SUST4 (sched @ 800 QPS) |
+|---|---|---|
+| created / ready / failed | 17,837 / 17,205 / 881 | 17,958 / **17,595 (97.7%)** / 492 |
+| arrival rate held | 296.8/s | 297.8/s |
+| ready throughput (overall / steady / best60s / best10s) | 47.4 / 42.8 / 75.7 / 296.6 | 45.9 / **78.6** / **109.5** / 303.2 |
+| scheduler bind rate | 47-50/s plateau; rl-POST wait >100s mean | **104-222/s** while etcd healthy; throttle gone |
+| pod-create→scheduled p50 | 183.5s (min 98.5s) | **0.82s** (p90 2.2s) |
+| claim→pod-created p50/p90 | 20.3s / 35.5s | 41.9s / 75.3s |
+| pod-Ready→sandbox-Ready p50/p90 | 14ms / 4.5s | **50.5s / 57.8s** |
+| first-window [0-10s) p50/p90 | 56 / 122ms | 124 / 304ms |
+| etcd main DB | survived | **137MB→2,028MB in 10.5min → NOSPACE**, binds→0 at 20:15, cleanup delete failed |
+| window p90 trend | 122ms → 299s | 304ms → 232s |
+
+**Success criteria:** ≥95% ready **PASS** (97.7%); steady ready ≥295/s
+**FAIL** (78.6/s steady, 109.5 best60s; 303/s only while pool-backed);
+flat rolling p90s **FAIL** (monotonic degradation after pool drain);
+supply ceiling **MEASURED** (below). Zero double-binds / wedges again
+(third full-scale confirmation).
+
+**The supply-wall ladder, now measured layer by layer (the round-9b
+deliverable):**
+
+1. ~~Nodes/slots~~ — exonerated: 150 nodes idled in both legs
+   (scheduled→running p50 1.0-2.3s; ≤2 starts/s/node vs ≥4.4 demonstrated).
+2. ~~kube-scheduler client QPS~~ — the 47-50/s wall of rounds 8 + SUST3;
+   peeled by the kops key fix (`kubeScheduler.qps`, commit 8a57aa7). Binds
+   reached 222/s burst.
+3. **Controller supply pipelines ≈ 100-150/s aggregate** (the current
+   binding constraint): refill issuance (claim→pod-created p50 41.9s under
+   backlog) and sandbox-Ready marking (pod-Ready→sandbox-Ready p50 50.5s
+   at ~13k live pods). Ready throughput steady 78.6/s / best60s 109.5/s.
+   Next levers: controller sharding (R4.4/task 19), refill/ready-marking
+   profiling; NOT more nodes.
+4. **etcd default quota-backend-bytes (2GiB) — a hard *duration* wall:**
+   ~3.2MB/s of main-DB revision growth at ~21k pod + 18k sandbox + 18k
+   claim churn ⇒ NOSPACE in ~10 min; even a fixed 100/s run dies in ~30
+   min. Any future sustained leg MUST raise ETCD_QUOTA_BACKEND_BYTES
+   (8GiB+) and set `--etcd-compaction-interval=2m` (R4.5 item, never
+   applied), and should consider the L4 pods/CR-group etcd split.
+
+Caveat for 9a: the first-window regression (56/122 → 124/304ms) and ack
+p50 33→118ms are **confounded** — scheduler at 800 QPS adds concurrent
+bind+event write load from t=0 and etcd bloat raises write latency
+run-wide; do NOT read a claim-path regression (or the no-spec/per-ns-watch
+delta) from SUST3 vs SUST4.
+
+**SUST5-cbor: aborted before cluster creation, zero cost, zero leak.**
+`kops create cluster --set
+cluster.spec.kubeAPIServer.featureGates.CBORServingAndStorage=true` fails
+with "field not found in *Cluster" — kops v1.35 `--set` cannot address
+featureGates map keys (same limitation as kubelet.systemReserved; the
+TUNE_CBOR comment's contrary claim was wrong). Fix for 9a: patch the
+cluster yaml between `kops create cluster` and `kops update cluster --yes`
+(the systemReserved pattern in the same script).
+
+**Cost & path recommendation (with the L6 comparison, per the mandate):**
+
+- Measured cost of a 150-node supply leg: ~$45/h all-in; 33-37 min
+  bring-up→teardown ≈ **~$25-28/leg**. Standing 150-node churn cluster:
+  ~$32k/mo — and it does NOT deliver 300/s (walls 3-4 are control-plane).
+- Corrected node sizing for 300/s churn: slots needed ≈ pool 3,000 + 300/s
+  × ~10s healthy residence ≈ 6,000 ⇒ **~60-80 e2-standard-8 nodes
+  (~$12-16k/mo)** once walls 3-4 fall — half the §1.4 estimate; nodes were
+  never the cost driver.
+- **L6 recycling comparison:** scrub-and-reuse removes pod churn from
+  steady state: no scheduler binds, no refill pipeline, etcd revision
+  growth ~0 instead of 3.2MB/s, ~6 writes/claim instead of 20-25. Cluster
+  size = concurrent live sandboxes = R × mean lifetime (at 300/s: 60s
+  lifetimes ⇒ ~18k pods ≈ 165 nodes — same iron as churn but with a
+  healthy control plane; short bench-like lifetimes ⇒ ~25-30 nodes,
+  ~$5-6k/mo). It remains the ONLY path where sustained rate decouples from
+  control-plane write ceilings; still gated on the security memo.
+- **Do not relaunch supply legs until**: (a) etcd quota/compaction knobs
+  are in the run script, (b) the ~100-150/s controller pipeline ceiling is
+  profiled (sharding per R4.4 is the standing hypothesis). Then a 60-80
+  node leg (~half the cost of SUST3/4) is the right next attempt.
+
+Artifacts: `gs://kops-state-142966328212/perf-bench-results/round9b/`
+(SUST3, SUST4 complete with reports; SUST5-cbor run.log only). All three
+clusters verified deleted (GCE instances/networks/addresses: zero
+`sandbox-2026*` remaining).

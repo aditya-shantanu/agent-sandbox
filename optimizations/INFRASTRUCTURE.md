@@ -50,7 +50,9 @@ the move to the runner VM, cleaned).
 
 - Images: `gcr.io/gke-ai-eco-dev/agent-sandbox/{agent-sandbox-controller,chrome-sandbox}:<git-describe>` plus `:buildcache` tags.
 - Benchmark results: `gs://kops-state-142966328212/perf-bench-results/latest/` — per-run folders (`candidate1`, `baseline2`, `candidate2`) with `RESULTS.txt`, `run.log`, `summary.json`, `metrics.jsonl.gz`; `heartbeat-*.log` refreshed every 3 min while runs are live. Later rounds use per-round folders (`round2/`, `round3/`, ..., `gate0/`) with the same shape plus `STATUS.txt` (one line per orchestrator state change) and `hb-<leg>-run.log` heartbeats. Superseded orchestrators are archived under `perf-bench-scripts/archive/`.
-- Startup-script marker: the VM startup script is idempotent via `/root/.bench-started-vN`; bump the marker (v8 = gate zero), `gcloud compute instances add-metadata perf-bench-runner --metadata-from-file startup-script=/tmp/vm-startup.sh`, then `reset` the VM to relaunch.
+- Startup-script marker: the VM startup script is idempotent via `/root/.bench-started-vN`; bump the marker (v8 = gate zero, v9 = round 8, v10/v11 = round 9b), `gcloud compute instances add-metadata perf-bench-runner --metadata-from-file startup-script=optimizations/infra/terraform/vm-startup.sh`, then `reset` the VM to relaunch.
+- Quota watch (shared project; measured 2026-07-20): **N2_CPUS ~exhausted (7,708/8,000)** — the effective 34-worker cap on n2-standard-8 legs; node-scale legs use `NODE_MACHINE_TYPE=e2-standard-8` (CPUS quota, ~6,600 free) and `NODE_VOLUME_SIZE=100` (SSD_TOTAL_GB headroom ~21TB). The v11 orchestrator runs a quota preflight before cluster create.
+- Round-9b clusters (all created and deleted 2026-07-20, verified no leaks): `sandbox-20260720-181027` (SUST3, 150 nodes), `sandbox-20260720-195719` (SUST4, 150 nodes), SUST5-cbor never created (kops --set featureGates failure).
 - Baseline1 artifacts (run from the laptop before the VM existed): local only, `/tmp/bench-artifacts-baseline/stress-test/` on the operator's Mac.
 
 ## Standard invocation

@@ -344,21 +344,28 @@ constraint (creates outran pod-Ready 3-4×). Supersedes stale
 [#1182](https://github.com/kubernetes-sigs/agent-sandbox/issues/1182)
 template→pools fan-out is the adjacent unfixed cliff.
 
-**⚠ Sustained-load caveat (updated after round 8).** With the controller
-fixed, the honest remaining constraint at sustained rates is the
-**cluster's pods-to-Ready throughput**: leg S2 completed 15,821/17,822
-(89%, rc=0, zero double-binds/wedges) but a 34-node pipeline delivers only
-~50-65 pods/s to Ready against 300/s arrivals (pod-create→scheduled p50
-129s under queue), so claims beyond pool depth wait on supply (e2e p50
-141s) and the slowest 2,006 hit per-claim timeouts. The claim path itself
-held 119ms p50 while pool supply lasted. Sizing rule for sustained R/s:
-pool absorbs the transient; beyond it, `nodes × per-node-ready-rate ≥ R`
-(≈1.5-2 ready/s per n2-standard-8 node measured) — or raise per-node rates
-(node-local I/O work,
-[PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203))
-or remove pod churn from the steady state (recycling, security-gated).
-This is a deployment-sizing constraint, not a controller defect. Full
-data: `RESULTS.md` round-8 verdict.
+**⚠ Sustained-load caveat (updated after round 9b — round 8's "per-node
+churn wall" reading was a misattribution).** Round-9b reran sustained-300
+on **150 nodes / 16,500 slots** and got the same ~47/s ready as 34 nodes;
+the ladder, then measured layer by layer: (1) **kube-scheduler default
+client QPS 50 was the 47-50/s wall** — an environment/tooling bug (kops
+v1.35 silently ignores `kubeScheduler.kubeAPIQPS`; only
+`kubeScheduler.qps/burst` reach clientConnection), worth an explicit
+sizing callout in any deployment guide because an untuned scheduler caps
+ANY warm-pool refill at ~50 pods/s regardless of cluster size; (2) with
+the scheduler at 800 QPS, **controller supply pipelines cap at ~100-150/s
+aggregate** (refill issuance p50 41.9s + pod-Ready→sandbox-Ready marking
+p50 50.5s under a ~13k-pod backlog) — the standing lever is sharding
+(task 19), and this is now the top open supply item; (3) **etcd default
+quota-backend-bytes (2GiB) is a hard duration wall** at churn: ~3.2MB/s
+main-DB revision growth at 300/s ⇒ NOSPACE in ~10 min (raise the quota +
+`--etcd-compaction-interval=2m` for any sustained deployment). The claim
+path itself held **p50 124ms / p90 304ms at a true 300/s** while pool
+supply lasted (round-9b SUST4 first window), with zero double-binds or
+wedged losers at a third full-scale run. Node sizing once (2)-(3) are
+addressed: pool + R × ~10s slot residence (~60-80 8-vCPU nodes at 300/s),
+or remove pod churn from steady state entirely (recycling,
+security-gated). Full data: `RESULTS.md` round-9b verdict.
 
 **Default:** shaping flags default 0 (legacy immediate full-deficit
 refill); `--pool-dedicated-connection` defaults on (set `=false` for the
@@ -680,15 +687,22 @@ conflicts with
 
 ## Remaining work (known, scoped, not in this issue)
 
-- **Supply-side sustained demonstration — IN PROGRESS (round 9b).**
-  Round-8 leg S2 closed the controller side (zero double-binds/wedges,
-  refill unstarved, 89% completion at 300/s on 34 nodes; `RESULTS.md`).
-  The 9b run measures the composed 9a items on a supply-adequate cluster.
-  Standing paths: (1) node-count sizing (`nodes × per-node-ready-rate ≥ R`;
-  ~1.5-2 ready/s per node measured), (2) per-node ready-rate levers
-  (node-local I/O
-  [PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203),
-  cilium/kubelet/scheduler QPS), (3) L6 recycling (security-gated).
+- **Supply-side sustained demonstration — MEASURED, NOT YET ACHIEVED
+  (round 9b, two 150-node legs).** 300/s for 60s remains undemonstrated,
+  but the wall ladder is now fully quantified: scheduler default-QPS wall
+  (47-50/s — peeled via the kops `kubeScheduler.qps` key fix), controller
+  supply pipelines (~100-150/s aggregate: refill issuance +
+  sandbox-Ready marking — NOW THE TOP OPEN SUPPLY ITEM; sharding/task 19
+  is the standing hypothesis), and etcd 2GiB default quota (NOSPACE after
+  ~10 min at 300/s churn; raise quota + compaction-interval 2m). Nodes
+  exonerated (same ~47/s on 34 and 150 nodes at default scheduler QPS;
+  150 nodes idle under the fixed scheduler). 97.7% of 18k claims ready at
+  297.8/s arrivals; zero controller pathology at third full-scale run.
+  Node sizing corrected: ~60-80 8-vCPU nodes at 300/s once the two
+  control-plane walls fall — per-node I/O levers
+  ([PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203))
+  demoted (nodes were never saturated). L6 recycling still the only path
+  that decouples rate from control-plane write ceilings.
 - **Round-9a items — LANDED on the fork, awaiting the 9b measurement:**
   claim-side no-spec adoption (task 12, both halves now merged); create-ack
   riders (S0 decomposed from the leg-B scrape: etcd ~11.6ms + ~10ms
@@ -697,7 +711,11 @@ conflicts with
   calibration warning in the harness; remaining S0 headroom rides on CBOR);
   CBOR serving/storage A/B wiring (`TUNE_CBOR=true`, KEP-4222 — novel,
   nobody upstream pursuing it for CR controllers; verify content-type on
-  the wire, merge-patch bodies stay JSON); adoption segment histograms
+  the wire, merge-patch bodies stay JSON — **wiring bug found in round-9b
+  SUST5: kops v1.35 `--set` cannot address `featureGates` map keys
+  ("field not found in *Cluster"); switch to the cluster-yaml patch
+  pattern the run script already uses for `kubelet.systemReserved`, then
+  re-run the CBOR leg**); adoption segment histograms
   (clean legs self-decompose); sharded per-namespace claims watch in the
   harness (SUB-FLOOR 5b).
 - **Rebase-watch:** [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118)

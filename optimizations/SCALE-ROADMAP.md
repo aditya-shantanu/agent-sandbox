@@ -171,18 +171,49 @@ Service** (it is already optional: `spec.service` false skips creation,
 rate from pod churn rate** (pool as shock absorber + bounded-rate refill,
 or scrub-and-reuse recycling where the security model allows it).
 
-**Empirically confirmed (round-8 leg S2, 2026-07-20, 34× n2-standard-8
-tuned cluster, controller pathology-free):** at 300 claims/s sustained the
-controller issued pool-refill creates at 103-183/s aggregate (best-10s
-260/s) and the API server acked at p50 39ms — but pods reached Ready at
-only **~47/s overall (65.7/s best-60s)**, with pod-create→scheduled p50
-129s / p90 206s under queue. That is **~1.5-2 pods/s reaching Ready per
-node**: exactly this section's churn wall, measured. Sizing corollary for
-sustained R/s once the pool drains: `nodes × per-node-ready-rate ≥ R`
-(300/s ⇒ ~150-200 such nodes as-is), or raise the per-node rate (node
-I/O work, PRs #1203-#1208; scheduler/KCM/cilium QPS above), or take churn
-out of the steady state entirely (L6 recycling). Full data: `RESULTS.md`
-round-8 verdict.
+**Empirically measured — CORRECTED in round 9b (supersedes the round-8
+reading below):** round-8 leg S2 (34 nodes) measured ~47/s ready (65.7
+best-60s) and attributed it to a per-node churn wall (`nodes ×
+per-node-ready-rate ≥ R`, ~1.5-2 ready/s/node ⇒ 150-200 nodes for 300/s).
+Round-9b SUST3 falsified that: the SAME ~47/s (75.7 best-60s) on **150
+nodes / 16,500 slots**. The real ladder, measured leg by leg
+(`RESULTS.md` round-9b):
+
+1. **kube-scheduler client QPS (default 50) was the 47-50/s wall** — this
+   section's own "must be raised or the scheduler is the refill ceiling
+   all by itself" warning, hidden because kops v1.35 silently ignores
+   `cluster.spec.kubeScheduler.kubeAPIQPS` (flag-tagged field; only
+   `kubeScheduler.qps/burst` reach the generated
+   KubeSchedulerConfiguration.clientConnection). Every "tuned" bench
+   cluster ran an untuned scheduler until the round-9b run-script fix.
+   With qps=800 applied (SUST4): binds 104-222/s, pod-create→scheduled
+   p50 183s → **0.82s**.
+2. **Controller supply pipelines ≈ 100-150/s aggregate** (SUST4's binding
+   constraint): refill issuance (claim→pod-created p50 41.9s under
+   backlog) + sandbox-Ready marking (pod-Ready→sandbox-Ready p50 50.5s at
+   ~13k live pods). Ready steady 78.6/s / best-60s 109.5/s. Lever:
+   sharding (R4.4/L2) + pipeline profiling — not nodes.
+3. **etcd default quota-backend-bytes (2GiB) is a hard DURATION wall:**
+   ~3.2MB/s main-DB revision growth at 300/s churn ⇒ NOSPACE (writes
+   rejected cluster-wide) in ~10 min; ~30 min even at 100/s. Mandatory for
+   any sustained run: ETCD_QUOTA_BACKEND_BYTES ≥ 8GiB +
+   `--etcd-compaction-interval=2m` (the R4.5 items, never yet applied),
+   plus the L4 pods/CR-group etcd split at higher rates.
+4. Nodes/slots: exonerated at 300/s — 150 e2-standard-8 workers idled
+   (scheduled→running p50 1.0-2.3s; ≥4.4 starts/s/node demonstrated).
+   Corrected slot sizing once walls 1-3 fall: pool + R × ~10s residence
+   (300/s ⇒ ~6,000 slots ⇒ **~60-80 nodes, not 150-200**).
+
+**Supply-path costs (measured 2026-07-20, us-central1):** 150×
+e2-standard-8 + n2-standard-16 CP + 100GB pd-ssd ≈ $45/h; a full
+bring-up→measure→teardown leg = 33-37 min ≈ **$25-28**. Standing churn
+cluster for 300/s after walls 2-3 fall: ~60-80 nodes ≈ $12-16k/mo.
+Quota reality in the bench project: N2_CPUS is ~exhausted (7,708/8,000 —
+the hidden 34-worker cap of rounds ≤8); node-scale legs use e2-standard-8
+(CPUS quota) and 100GB pd-ssd (SSD_TOTAL_GB headroom ~21TB). L6 recycling
+comparison: removes pod churn entirely (~6 writes/claim, no binds, ~zero
+etcd revision growth) — the only path where sustained rate decouples from
+walls 2-3; cluster size becomes R × mean sandbox lifetime.
 
 ## 2. Ranked roadmap
 
