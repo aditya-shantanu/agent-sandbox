@@ -399,3 +399,104 @@ sandboxes.jsonl; forensics 2026-07-20):
 - **Harness:** capture controller.log reliably, fix the report generator's
   watch-stream schema handling, and add a live refill-rate gauge to the
   progress line so collapse is visible at +30s instead of post-mortem.
+
+## 2026-07-20 — ROUND 8: leg-S root causes fixed, sustained-300 relaunched (PENDING)
+
+Status: **PENDING** — sustained-300 rerun (single leg `S2-sustained300`)
+relaunched on `perf-bench-runner` (startup marker v9, orchestrator pinned to
+`d1ddac3`) against a fresh 34-node tuned cluster, same capacity math as leg S
+(pool 1500 + in-flight 1950 = 3450 ≤ spare ≈ 3668). Results land in
+`gs://kops-state-142966328212/perf-bench-results/round8/` (`STATUS.txt`,
+`hb-*` heartbeats every 3 min, `S2-sustained300/` leg folder). Commits:
+`650bc0e` (double-bind + wedged-loser fix), `c9bcc7c` (pool starvation fix),
+`d1ddac3` (artifact-gap fixes).
+
+### Root cause 1 — L1 one-write double-bind (the 3,204 double-bound sandboxes)
+
+The queue pop WAS exclusive; the leak was a **re-add during the async
+window**. Under exhaustion, refill sandboxes are adoptable at CREATE (labels
++ pool ownerRef; `isAdoptable` does not require Ready), so backlogged claims
+pop them within milliseconds of the sandbox CREATE event — before the pod is
+scheduled. The pod-scheduling `status.nodeName` write then fires
+`sandboxEventHandler.Update` with `newAdoptable && nodeScheduled`, and the
+handler **re-Added the popped key**: with one-write adoption the sandbox
+still looks pool-owned/adoptable in every cache view until the async patch
+lands, so a second claim popped it, passed `verifySandboxCandidate` against
+the same stale view, and status-bound it too. A second amplifier lived in
+the flusher: its post-409 "fresh read" went through the **informer cache**,
+so under the watch backlog a genuine steal re-read as "still pool-owned" →
+"benign conflict" → 5 rebuilt-stale attempts → attempts-exhausted path
+**re-added the already-adopted candidate to the queue** (the triple-bound
+sandboxes). The losers then wedged because `recoverLostAdoption` also read
+the claim through the lagging cache, concluded its own status write "hadn't
+appeared yet", exhausted its 10×100ms budget and gave up — leaving the
+binding in place — while each subsequent reconcile pass misclassified as
+crash-window recovery and fired a doomed optimistic-lock patch every 50ms
+(the 409 storm), and the cold-start guard deferred against **reserved
+phantom members** that could never materialize.
+
+Fix (`650bc0e`): (a) queue pops now **reserve** the key — `Add` drops
+reserved keys, give-backs go through `Release`, ghosts/deletes through
+`Forget`, and reservations survive terminal adoption outcomes until the
+sandbox DELETE event, so no watch event can re-queue an in-transaction or
+adopted sandbox; (b) the flusher re-verify and `recoverLostAdoption` use a
+**DirectReader** (`mgr.GetAPIReader()`) — recovery decisions never depend on
+informer convergence and the loser's binding clears in one RTT; (c)
+crash-window conflicts reclassify from a direct read in the same pass (no
+more 409-storm loop); (d) `shouldDeferColdStart` excludes reserved members.
+Regression tests reproduce both leg-S signatures pre-fix (double-bind via
+the nodeScheduled re-add; wedged loser under a permanently stale claim
+cache) and pass post-fix; `-race` clean.
+
+### Root cause 2 — pool-controller starvation (2-3 creates/s vs 100/s cap)
+
+Two compounding mechanisms, both demand-side pressure on shared resources —
+the token bucket was never the limiter and (by design review) neither was
+APF: refill creates ride `agent-sandbox-bulk` (~322 seats at tuned server
+limits) while the claim-side sandbox patches ride `agent-sandbox-critical`,
+so the observed queueing had to be **client-side, upstream of APF**
+(leg-S flowcontrol metrics were unavailable — controller.log empty + report
+crash, both fixed). (i) The pool's refill POSTs shared the 4 round-robin
+HTTP/2 write shards with 400 claim workers; at backlog the claim side kept
+hundreds of streams in flight (409 storm + status patches + cleanup
+patches), so each pool create waited behind them, stretching each
+`slowStartBatch` pass to tens of seconds — 100 granted tokens / ~40s ≈ the
+measured 2-3 creates/s. (ii) The empty-pool claim polling was flat 50ms:
+~14k pending claims × 20 polls/s ≈ 280k attempted reconciles/s of pure
+spinning (each with an O(pool-members) cache scan), starving the 4 pool
+workers of CPU and workqueue turns — the refill decay (52/s → 7/s) tracks
+the backlog growth exactly.
+
+Fix (`c9bcc7c`): (i) `--pool-dedicated-connection` (default on) gives pool
+member creates/deletes their own HTTP/2 connection (the
+`newIsolatedHTTPClient` mechanism `--separate-watch-connection` already
+uses); (ii) backlog-aware polling — cold-start deferral requeues now grow
+from 50ms to a 500ms cap with consecutive deferrals
+(`coldStartDeferralRequeueDelay`), cutting per-claim empty-pool poll load
+10× exactly when the pool needs the headroom. Note the fixes compound:
+root-cause-1's reservation also stops double-binding from wasting ~half the
+scarce refill supply, and killing the 409 storm removes most of the
+competing write traffic.
+
+### Artifact gaps (fixed in `d1ddac3`)
+
+- `controller.log` 0 bytes in leg S: `kubectl logs deployment/... || true`
+  resolves ONE pod and silently produces an empty file when that pod is
+  evicted/failed (the controller runs BestEffort — GAP-2's exact hazard).
+  Capture is now per-pod (+ `--previous`), with kubectl stderr preserved in
+  `capture-errors.log` and a loud warning when the concatenated
+  `controller.log` is empty.
+- `generate_report.py` duckdb crash (`unknown key "sandbox"`):
+  `read_json_auto` inferred a nested STRUCT for the watch record's `object`
+  from a sample that never saw the sustained phase's `sandboxclaims` events
+  (`status.sandbox`). The watch scans now pin the envelope schema and read
+  `object` as raw JSON (`ignore_errors=true` for truncated tails) — any
+  resource shape is tolerated.
+
+Success criteria for the rerun: zero double-bound sandboxes
+(`sandboxes.jsonl` forensics), zero claims wedged >10s after losing a
+candidate, per-pool contended refill ≥ the ~70-85/s isolated ceiling (or a
+measured new contended number to feed the §"refill feasibility math"), and
+failed-claim count ≈ 0 at 300/s × 60s. If refill still can't sustain 300/s
+aggregate, the next lever is the planned ramp (100 → 200 → 300/s) to measure
+the contended per-pool rate before re-attempting 300.
