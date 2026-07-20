@@ -16,6 +16,24 @@ on 34 workers + tuned control plane with clean instrumentation):
 | round-4/5 stack (instrumented) | 489ms | 584ms | 761ms | 0.86s |
 | **gate-zero composed tree (clean)** | **273ms** | **301ms** | **309ms** | **0.31s** |
 | improvement | 9.3× | **18.4×** | 62× | 65× |
+| **sustained 300/s, warm supply present** (round-8 S2 warm-hit cohort) | **41ms** | **95-96ms** | 134ms | n/a (open-loop 60s arrivals) |
+
+The sustained row is the claim path at a true 300/s arrival rate while pool
+supply exists (first-10s warm-hit cohort of leg S2, n=1,517; window p90
+drifts 60→96→105ms as refill contention builds) — the <100ms p90 target is
+already being touched at rate; the burst rows are the adversarial
+all-at-once shape. Decomposition: `PATH-TO-100MS.md`.
+
+**Where the remaining milliseconds live (2026-07-20, PATH-TO-100MS.md):
+writes are exonerated.** Server-side under burst: claim-status PATCH mean
+15.8ms (100% ≤100ms), POST 22.7ms, APF wait 0.10-0.13ms on every priority
+level, workqueue <1ms, zero conflicts. The binding burst constraint is the
+**claims watch-event fan-out** — ~0.7-0.9ms/event (~1,350 events/s) per
+watcher stream, traversed twice (apiserver→controller, apiserver→client) —
+plus queue-rank domination (corr 0.767, drain ~1,120/s ⇒ ~240ms rank term
+at 300-burst). That is why the open work below targets event-path encode
+(CBOR), stream sharding, and per-adoption write elimination rather than
+write RTTs.
 
 The 301ms/0.31s row is the latest **verified** number (gate-zero leg B,
 2026-07-20): the fully-composed tree — tasks 10, 12 and 17 on top of the
@@ -76,7 +94,7 @@ reviewable and roughly maps to one investigation branch.
 | 9 | SDK single-watch ready wait | 🟢 | ++ | merged | [#574](https://github.com/kubernetes-sigs/agent-sandbox/issues/574), [#286](https://github.com/kubernetes-sigs/agent-sandbox/issues/286), [PR #565](https://github.com/kubernetes-sigs/agent-sandbox/pull/565) |
 | 10 | Write-behind coalescing (sandbox controller) | 🟢 | ++ | merged | [#350](https://github.com/kubernetes-sigs/agent-sandbox/issues/350), [#594](https://github.com/kubernetes-sigs/agent-sandbox/issues/594) |
 | 11 | Sandbox status writes race-proofed | 🟢 | + | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527), [#350](https://github.com/kubernetes-sigs/agent-sandbox/issues/350), [PR #882](https://github.com/kubernetes-sigs/agent-sandbox/pull/882) |
-| 12 | Generation-bump elimination (sandbox half) | 🟢 | + | merged; claim half: design | none |
+| 12 | Generation-bump elimination (both halves) | 🟢 | + | merged (claim half: round 9a) | none |
 | 13 | Leader-lease release on shutdown | 🟢 | + | merged | none — file fresh |
 | 14 | Router name-cache (service-free resolution) | 🟢 | + | merged | [#883](https://github.com/kubernetes-sigs/agent-sandbox/issues/883), [#836](https://github.com/kubernetes-sigs/agent-sandbox/issues/836), [PR #850](https://github.com/kubernetes-sigs/agent-sandbox/pull/850) |
 | 15 | Benchmark honesty (measurement fixes) | 🟢 | + | merged | [#403](https://github.com/kubernetes-sigs/agent-sandbox/issues/403), [#624](https://github.com/kubernetes-sigs/agent-sandbox/issues/624), [#781](https://github.com/kubernetes-sigs/agent-sandbox/issues/781), [#1182](https://github.com/kubernetes-sigs/agent-sandbox/issues/1182) |
@@ -410,28 +428,36 @@ write-free. Same change as
 
 **Default:** always on (no flag).
 
-### Task 12: 🟢 + — Generation-bump elimination, sandbox half *(claim half: design)*
+### Task 12: 🟢 + — Generation-bump elimination, both halves *(claim half landed round 9a)*
 
 **Problem.** Adoption's `spec.podTemplate` rewrite bumps
 `metadata.generation`, forcing one sandbox status write (observedGeneration
 echo) per adoption — a write a metadata-only adoption never needs.
 
-**Fix (mechanism).** `--no-spec-adoption`: ownership-derived safe-to-evict
-hygiene in the sandbox controller — when a Sandbox is claim-controlled, the
-safe-to-evict template annotation is treated as absent (never propagated,
-stripped if present) regardless of whether the claim controller rewrote
-`spec.podTemplate`. This makes the spec rewrite unnecessary when
-`additionalPodMetadata` is empty; KEP-0174 users keep today's path
-byte-for-byte. Behavioral delta: claim-owned cold-start pods that
-explicitly set safe-to-evict=true also have it suppressed (strictly safer).
+**Fix (mechanism).** `--no-spec-adoption`, one flag driving both halves.
+Sandbox half: ownership-derived safe-to-evict hygiene — when a Sandbox is
+claim-controlled, the safe-to-evict template annotation is treated as
+absent (never propagated, stripped if present) regardless of whether the
+claim controller rewrote `spec.podTemplate`. Claim half (round 9a): when
+`additionalPodMetadata` is empty, the adoption patch is METADATA-ONLY
+(labels/annotations/ownerRef; no `spec` key → no generation bump → the
+sandbox status echo never fires and the adoption-MODIFIED sandbox reconcile
+goes read-only), and the steady-state drift check compares the pod template
+modulo system-reserved keys so the spec is never rewritten through the back
+door. KEP-0174 users (non-empty `additionalPodMetadata`) keep today's spec
+rewrite byte-for-byte. Behavioral deltas: claim-owned cold-start pods that
+explicitly set safe-to-evict=true also have it suppressed (strictly safer);
+pool bookkeeping labels remain in the (pod-inert) spec template of
+fast-path-adopted sandboxes.
 
-**Validated.** Unit tests pin the hygiene path; benchmarked in gate-zero
-leg B as part of the composed tree (301ms p90, zero failures). Claim-side
-half is design-complete (`ROUND6-COALESCING.md` §3.3); both halves = −1
-write/claim system-wide.
+**Validated.** Unit tests pin both halves (hygiene: write-count proof in
+`round6_coalesce_test.go`; claim side: metadata-only patch byte-identity,
+back-door-bump absence, KEP-0174 contrast, one-write async + crash-recovery
+metadata-onlyness in `nospec_adoption_test.go`). Sandbox half benchmarked in
+gate-zero leg B; the composed −1 write/claim is measured in the 9b run.
 
 **Default (post-flip):** `--no-spec-adoption=true`; set `=false` to restore
-legacy.
+legacy behavior of both controllers.
 
 ### Task 13: 🟢 + — Graceful failover (leader-lease release)
 
@@ -654,22 +680,39 @@ conflicts with
 
 ## Remaining work (known, scoped, not in this issue)
 
-- **Sustained-rate supply side** (round-8 leg S2 closed the controller
-  side: zero double-binds/wedges, refill unstarved, 89% completion at
-  300/s on 34 nodes; `RESULTS.md` round-8 verdict). Remaining paths are
-  cluster-throughput engineering: (1) node-count sizing
-  (`nodes × per-node-ready-rate ≥ R`; ~1.5-2 ready/s per node measured),
-  (2) per-node ready-rate levers (node-local I/O
+- **Supply-side sustained demonstration — IN PROGRESS (round 9b).**
+  Round-8 leg S2 closed the controller side (zero double-binds/wedges,
+  refill unstarved, 89% completion at 300/s on 34 nodes; `RESULTS.md`).
+  The 9b run measures the composed 9a items on a supply-adequate cluster.
+  Standing paths: (1) node-count sizing (`nodes × per-node-ready-rate ≥ R`;
+  ~1.5-2 ready/s per node measured), (2) per-node ready-rate levers
+  (node-local I/O
   [PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203),
-  cilium/kubelet/scheduler QPS), (3) L6 recycling (security-gated) to
-  remove pod churn from the steady state.
-- **Rebase onto [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118)
-  and [PR #1213](https://github.com/kubernetes-sigs/agent-sandbox/pull/1213)**
-  before any further claim-controller code (ROUND7 §2).
-- Claim-side no-spec adoption (design: `ROUND6-COALESCING.md` §3.3) — kills
-  the sandbox status echo entirely.
-- Create-path cost (ack ~32-49ms calibrated) and CBOR serving/storage
-  (KEP-4222) — novel, nobody upstream pursuing it for CR controllers.
+  cilium/kubelet/scheduler QPS), (3) L6 recycling (security-gated).
+- **Round-9a items — LANDED on the fork, awaiting the 9b measurement:**
+  claim-side no-spec adoption (task 12, both halves now merged); create-ack
+  riders (S0 decomposed from the leg-B scrape: etcd ~11.6ms + ~10ms
+  handler/encode of the 22.7ms server mean, payloads already thin at
+  203B/273B — implemented the APF exempt-PL preflight + client-connection
+  calibration warning in the harness; remaining S0 headroom rides on CBOR);
+  CBOR serving/storage A/B wiring (`TUNE_CBOR=true`, KEP-4222 — novel,
+  nobody upstream pursuing it for CR controllers; verify content-type on
+  the wire, merge-patch bodies stay JSON); adoption segment histograms
+  (clean legs self-decompose); sharded per-namespace claims watch in the
+  harness (SUB-FLOOR 5b).
+- **Rebase-watch:** [PR #1118](https://github.com/kubernetes-sigs/agent-sandbox/pull/1118)
+  (still OPEN as of 2026-07-20; rewrites adoption finalization — re-express
+  the stale-pass/bounded-requeue invariants in its structure when it
+  merges) and [PR #1213](https://github.com/kubernetes-sigs/agent-sandbox/pull/1213)
+  (adopt its namespaced-mode flag for task 19).
+- **Speculative pre-binding: demoted to CONDITIONAL** (was "researched,
+  deferred"). Decision rule (PATH-TO-100MS §4.4): build only if the
+  post-9a supply-adequate sustained p90 measures **>70ms**, or product
+  commits to p50 <25ms / burst-p90 <100ms. Otherwise close it — at the
+  measured p50 41ms it buys ~20-25ms for a new controller loop + SDK
+  acquisition protocol + the #1089 idempotency interaction.
+- Router-held first request (3′) — the remaining read-path item (claim
+  informer + header path in `sandbox-router`); pair its informer with CBOR.
 - etcd/apiserver write-domain sharding for the ~20k writes/s churn budget at
   1000/s; per-claim churn reduction (service-free defaults,
   recycling — security-gated); node-local I/O wall
@@ -761,8 +804,9 @@ which the numbers in this issue would be wrong.
 ---
 
 *Maintenance: this document is updated at the end of every investigation
-round (latest: round-8 absorption, 2026-07-20 — leg-S2 verification of the
-double-bind/wedge fixes (task 17 reservation + DirectReader) and the
-refill-starvation fixes (task 8 pool-dedicated-connection + backlog-aware
-polling), plus the honest supply-side sustained caveat). Numbers in the
-results table are always the latest verified A/B.*
+round (latest: round-9a absorption, 2026-07-20 — PATH-TO-100MS decomposition
+folded in (sustained row, watch-fan-out wall note), task 12 claim half
+landed (metadata-only adoption), create-ack riders + TUNE_CBOR wiring +
+segment histograms + sharded claims watch in the harness, pre-binding
+demoted to conditional pending the 9b measurement). Numbers in the results
+table are always the latest verified A/B.*

@@ -662,3 +662,37 @@ per-node rates) for SCALE-ROADMAP §1.4.
 
 Artifacts: `gs://kops-state-142966328212/perf-bench-results/round9b/`.
 Results: PENDING.
+
+## 2026-07-20 — ROUND 9a: claim-path items landed (code complete; measurement rides 9b) — PENDING
+
+Goal (PATH-TO-100MS §3.2): sustained-300 claim-path p90 from the measured
+95-96ms (S2 warm-hit cohort; p50 41ms) to 60-80ms. All four items + one
+read-path closer landed on `perf-investigation-master`; upstream PR #1118
+re-checked before touching the claim controller: **still OPEN** (no rebase
+required; the completeAdoption/applyAdoptionMutations split is preserved so
+re-expression on #1118's structure stays mechanical).
+
+| item | commit | expected on sustained p90 | notes |
+|---|---|---|---|
+| claim-side no-spec adoption (ROUND6 §3.3; task 12 claim half) | `a3b61bd` | **−5 to −15ms** + −1 sandbox status write & −1 spec-bearing reconcile per adoption system-wide | metadata-only adoption patch when additionalPodMetadata is empty; drift check modulo system-reserved keys (no back-door bump); KEP-0174 path byte-for-byte; one-write async + crash recovery pinned metadata-only; same `--no-spec-adoption` flag (default on) drives both halves |
+| create-ack riders (item 3) | `b1b3337` | holds S0 at floor (verification); remaining −10-15ms rides CBOR + CP headroom | leg-B scrape decomposition: server 22.7ms = etcd ~11.6ms + handler/encode ~10ms + admission ~0.7ms; APF wait ~0; payloads thin (POST body 203B) ⇒ spec-trim rider DEAD; implemented APF exempt-PL preflight (dry-run + PF headers → summary.json `apfVerification`) and client-connections calibration warning |
+| CBOR A/B wiring (item 4) | `ab0db41` | **−5 to −10ms** (S0/S1/S4 encode; S3 stays JSON) | `TUNE_CBOR=true`: apiserver CBORServingAndStorage at creation + client env gates on controller Deployment and harness; both traps documented (verify content-type on the wire; no CBOR merge-patch) |
+| adoption segment histograms (measurement rider a) | `ccd7712` | decision data | `agent_sandbox_claim_adoption_segment_latency_ms{segment=queue_wait\|sandbox_patch\|status_write\|annotation_flush\|total\|async_queue_wait\|async_patch}` — not V(1)-gated; clean legs self-decompose (no more RV-interleave forensics) |
+| sharded session claims watch (SUB-FLOOR 5b) | `26f0898` | brackets B2's S4 share | `--per-namespace-claim-watch` (default off): one watch stream per claims namespace incl. sustained `-s1..sN`; splits the ~0.7-0.9ms/event per-stream backlog |
+
+Read-path follow-up NOT built (too large for this round): 3′ router-held
+first request (needs a SandboxClaim informer + claim-header path in
+`sandbox-router`); tracked in UPSTREAM-ISSUE-DRAFT remaining work.
+
+Validation: build/vet clean; full unit suite green including `-race`
+(extensions/controllers, controllers, internal/*, test/stress, cmd);
+cluster-backed e2e excluded (no cluster in the dev loop). New tests:
+`nospec_adoption_test.go` (6 invariants), `apfcheck_test.go`.
+
+**For the 9b combined run:** controller flags unchanged (no-spec claim half
+rides the existing default-on `--no-spec-adoption`); optional stress flags
+`--per-namespace-claim-watch` (recommended with `--sustained-namespaces=8`)
+and env `TUNE_CBOR=true` for the CBOR leg (fresh cluster only; remember the
+wire-format verification before attributing deltas). Projection with items
+composed: sustained-300 p90 ≈ **60-80ms** (PATH-TO-100MS §3.2).
+Results: PENDING (measured by the 9b leg on this tree).
