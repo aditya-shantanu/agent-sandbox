@@ -235,7 +235,7 @@ p90 584ms sits just above round-4's 230-340ms prediction: the residual is create
 
 ---
 
-## 2026-07-20 — GATE ZERO (ROUND7-PLAN §3 + GAP-AUDIT riders) — PENDING
+## 2026-07-20 — GATE ZERO (ROUND7-PLAN §3 + GAP-AUDIT riders) — COMPLETE (verdict below)
 
 Launched 06:23 UTC from the v8 orchestrator (perf-bench-runner reset; scripts
 in `gs://kops-state-142966328212/perf-bench-scripts/`, canonical copies in
@@ -278,4 +278,124 @@ stress client, 20-claim smoke before every leg:
 Results land in `gs://kops-state-142966328212/perf-bench-results/gate0/`
 (`STATUS.txt` + `hb-*` heartbeats every 3 min; per-leg folders
 `A-clean-burst/`, `B-clean-composed/`, `S-sustained300/` with RESULTS.txt,
-run.log, summary.json, metrics.jsonl.gz). Results: PENDING.
+run.log, summary.json, metrics.jsonl.gz).
+
+## 2026-07-20 — GATE-ZERO VERDICT (cluster sandbox-20260720-062747, image 2b60967)
+
+All three legs ran to measurement completion on one cluster (06:23-06:59 UTC;
+the rc=1 exits were cosmetic post-measurement failures: leg A/B report
+generation ran past the leg timeout, and leg S's `generate_report.py` crashed
+on a watch.jsonl.gz schema wrinkle — see the leg-S artifact-gap note below).
+Cluster deleted cleanly.
+
+### Legs A and B — burst-300, both clean, both 300/300 with zero failures
+
+| | smoke p50/p90 | ack p50 | e2e p50 | e2e p90 | e2e p99 | max | all-ready |
+|---|---|---|---|---|---|---|---|
+| **A** (round-4/5 flag set) | 41 / 44ms | 48ms | 522ms | 1000ms | 1082ms | 1170ms | 1.18s |
+| **B** (+ one-write-adoption, write-behind 250ms, no-spec-adoption) | **19 / 21ms** | 32ms | **273ms** | **301ms** | **309ms** | **312ms** | **0.31s** |
+| A→B gain | 2.1× | 1.5× | 1.9× | **3.3×** | 3.5× | 3.8× | 3.8× |
+
+The composed flags' first-ever benchmark delivered exactly the L1 forecast
+(round-7 §1.2 predicted p90 ~205-345ms): **the A→B delta is a clean 3.3× on
+p90 with a collapsed tail** (p99−p50 spread: A 560ms → B 36ms — the pipeline
+is now conflict-free AND wave-free). Leg B's max (312ms) is under leg A's p50.
+
+**Honest numbers vs history (all in-region client, like-for-like):**
+
+| | p50 | p90 | p99 | all-ready |
+|---|---|---|---|---|
+| baseline | 2539ms | 5546ms | 19.1s | 20.25s |
+| round 4/5 (instrumented) | 489ms | 584ms | 761ms | 0.86s |
+| **gate-zero B (clean, composed)** | **273ms** | **301ms** | **309ms** | **0.31s** |
+| vs baseline | **9.3×** | **18.4×** | **62×** | **65×** |
+
+**GAP-1 confirmed:** the clean smoke floor is **14-21ms** (leg B: min 14 /
+p50 19 / p90 21ms; leg S smoke: min 13 / p50 22ms) — LOWER than the 25-40ms
+floor assumed from instrumented runs (31-40ms measured with debug logging +
+pprof + JSON encoder). Instrumentation was overstating both the floor and the
+burst numbers; every historical number above the gate-zero row carries that
+tax. The uncontended adoption path is ~20ms of physics, and the 300-burst
+p50 (273ms) is now within ~250ms of it.
+
+Leg B validated with zero failures, zero cold starts, and a 3.3× composed
+gain → per the standing decision the five flags flipped to default-on in
+`cmd/agent-sandbox-controller/main.go` (commit "perf: flip validated
+optimization defaults on (gate-zero leg B)").
+
+### Leg S — sustained 300/s × 60s: FAILED (supply-side collapse) + diagnosis
+
+Headline: 18,000 requested → 17,891 created (298.2/s achieved), only **3,804
+ready, 14,117 failed** — every failure a 300s per-claim timeout, zero create
+failures. e2e for the "ready" cohort: p50 64s / p90 261s. Phase wall 444s.
+
+**What the artifacts show** (summary.json, run.log, watch.jsonl.gz,
+sandboxes.jsonl; forensics 2026-07-20):
+
+1. **The API server and cluster were healthy throughout.** Create ack p50
+   8ms / p99 87ms at a steady 298/s; pod scheduling p50 21ms; pod start
+   0.9-1.5s. Total sandboxes ever created: 5,812 (≈5,770 pods) — the
+   3,450-pod capacity envelope was never approached. **No capacity
+   exhaustion, no cold-start flood** (the claim cold-start fallback fired
+   only 147 times, all minutes into the drain).
+2. **The 1,500 pooled sandboxes drained in ~5s** (window [0,10s): 2,522 of
+   3,086 arrivals served, p50 137ms — warm hits are fast even at 300/s).
+3. **Pool refill then collapsed to ~2-3 creates/s per pool** — 30-50× below
+   the configured `--sandbox-warm-pool-max-refill-rate=100` per-pool cap and
+   ~10× below the ~70-85/s isolated per-pool ceiling measured in round 6.
+   Refill sandbox ADDED rate per 30s after the drain: 379, 262, 289, 202,
+   198, 180... (~8-13/s aggregate across 4 pools). Pods for those sandboxes
+   started promptly once created — the bottleneck was purely the rate at
+   which the warm-pool controller issued creates. Supply ~10/s vs demand
+   300/s → the backlog (peak ~14k pending claims) could never clear.
+4. **Adoption double-booking at scale:** of 5,457 sandboxes that claims
+   bound, **3,204 were bound by TWO claims** (2 by three). 6,410 claims
+   raced onto shared sandboxes; 2,096 won; **~4,300 losers stayed wedged
+   bound-but-never-Ready until their 300s timeout** (their recorded binding
+   never changed after the winner's dwell-delete removed the sandbox — the
+   409-steal rebind path either didn't fire or couldn't keep up). The
+   remaining 9,228 failures never bound at all (pool empty). Double-booking
+   also wasted ~half of the scarce refill supply.
+5. **Root cause (mechanism):** demand starved supply inside the controller.
+   A growing pending-claim backlog kept 400 claim workers in adoption
+   retry/rebinding storms (double-booking is the direct evidence) while the
+   4-worker pool controller — which must re-list and re-filter every
+   pool-labeled member each reconcile, including hundreds of
+   adopted-but-not-yet-deleted ones — got a shrinking share of CPU/write
+   budget; its refill create rate decayed as the backlog grew (52/s in the
+   first 30s → ~7/s by t=90s). The refill token bucket was never the
+   limiter; it was starved upstream of it. The original hypothesis (refill
+   ready-rate < drain rate → pool exhaustion) is confirmed, but the
+   magnitude is far worse than the 70-85/s ceiling math predicted, and the
+   mechanism is controller-internal contention — NOT pod cold-start
+   capacity.
+6. **Artifact gaps that hurt:** `controller.log` in the S folder is 0 bytes
+   (so the "Pacing pool replenishment" / deficit log lines that would nail
+   the starvation point are missing), and `generate_report.py` died on a
+   duckdb JSON-schema error over watch.jsonl.gz (`unknown key "sandbox"`)
+   before emitting the capacity/APF/throttling sections. Fix both before
+   the next sustained run.
+
+**What the next sustained attempt needs:**
+
+- **Refill feasibility math first:** sustain requires
+  `pools × contended-per-pool-refill-READY-rate ≥ arrival rate` — using the
+  CONTENDED rate, which this run measured at ~2-3/s/pool, not the isolated
+  70-85/s. Until the contention is fixed, no pool count is feasible at
+  300/s; fix supply isolation first, then re-measure the contended rate at
+  ~100/s before attempting 300/s again (ramp legs: 100 → 200 → 300/s).
+- **Isolate supply from demand:** dedicated API connection + worker/APF
+  budget for warm-pool refill; bound the claim controller's empty-pool
+  retry storm (rate-limited requeue while the pool is empty instead of hot
+  adoption passes); reconsider 400 claim workers (contention beat
+  parallelism here).
+- **Fix the wedged-loser bug:** a claim bound to a sandbox that was stolen
+  or deleted must unbind and re-enter adoption (this alone was ~4.3k of the
+  14.1k failures); add an adoption reservation so two workers can't select
+  the same candidate during the write-behind/one-write visibility window.
+- **Bigger shock absorber:** pool replicas sized ≥ R × (refill_p99 +
+  headroom) against the contended refill rate, and/or more, smaller pools
+  so per-pool list/filter work stays bounded.
+- **Harness:** capture controller.log reliably, fix the report generator's
+  watch-stream schema handling, and add a live refill-rate gauge to the
+  progress line so collapse is visible at +30s instead of post-mortem.
