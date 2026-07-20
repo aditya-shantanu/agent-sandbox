@@ -567,7 +567,22 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// timing lines at the burst peak (~2100 log lines/s), biasing every
 		// log-derived quantile toward the fast cohort. Gated on the same
 		// V(1) debug enablement as before.
-		if trace.adopted == "" || !logger.V(1).Enabled() {
+		if trace.adopted == "" {
+			return
+		}
+		// Histogram decomposition first: NOT gated on V(1), so clean
+		// (non-debug) legs decompose without log forensics (the segments
+		// mirror the timing line's fields; see AdoptionSegmentLatency docs).
+		asmetrics.RecordAdoptionSegment("queue_wait", trace.queueLat)
+		if trace.completeDur > 0 {
+			asmetrics.RecordAdoptionSegment("sandbox_patch", trace.completeDur)
+		}
+		asmetrics.RecordAdoptionSegment("status_write", trace.statusDur)
+		if trace.flushDur > 0 {
+			asmetrics.RecordAdoptionSegment("annotation_flush", trace.flushDur)
+		}
+		asmetrics.RecordAdoptionSegment("total", time.Since(trace.start))
+		if !logger.V(1).Enabled() {
 			return
 		}
 		adoptionTimingLog.Info("adoption timing",

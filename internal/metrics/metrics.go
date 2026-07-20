@@ -113,6 +113,37 @@ var (
 		nil,
 	)
 
+	// AdoptionSegmentLatency decomposes the warm-adoption hot path into its
+	// per-pass segments WITHOUT debug logging (PATH-TO-100MS measurement
+	// rider: the gate-zero clean legs had to reconstruct these segments from
+	// resourceVersion interleaves because the "adoption timing" line is
+	// V(1)-gated; this histogram makes clean legs self-decomposing — the
+	// stress harness already scrapes the controller's /metrics).
+	//
+	// Segments (label "segment", bounded cardinality):
+	//   - queue_wait:       controller watch-receive -> winning-pass entry
+	//                       (workqueue wait + earlier non-adopting passes;
+	//                       monotonic clock, never CreationTimestamp);
+	//   - sandbox_patch:    synchronous completeAdoption sandbox patch RTT
+	//                       (zero-valued and not recorded under one-write
+	//                       adoption, where the patch is deferred);
+	//   - status_write:     claim status patch RTT (the critical write);
+	//   - annotation_flush: deferred post-status claim annotation patch;
+	//   - total:            adoption-pass entry -> summary emission;
+	//   - async_queue_wait: one-write flusher enqueue -> worker pickup;
+	//   - async_patch:      one-write deferred sandbox patch RTT (success).
+	//
+	// Buckets give sub-ms resolution at the floor (queue-wait p99 <1ms on a
+	// healthy leg) and cover the 60-100ms target regime densely.
+	AdoptionSegmentLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "agent_sandbox_claim_adoption_segment_latency_ms",
+			Help:    "Warm-adoption hot-path segment latencies in milliseconds, labeled by segment (queue_wait, sandbox_patch, status_write, annotation_flush, total, async_queue_wait, async_patch).",
+			Buckets: []float64{0.25, 0.5, 1, 2.5, 5, 10, 15, 25, 35, 50, 75, 100, 150, 250, 500, 1000, 2500},
+		},
+		[]string{"segment"},
+	)
+
 	buildVersionInfo = version.Get()
 
 	// BuildInfo exposes agent-sandbox-controller build metadata as a constant gauge.
@@ -139,7 +170,13 @@ func init() {
 	metrics.Registry.MustRegister(ClaimControllerStartupLatency)
 	metrics.Registry.MustRegister(SandboxCreationLatency)
 	metrics.Registry.MustRegister(SandboxClaimCreationTotal)
+	metrics.Registry.MustRegister(AdoptionSegmentLatency)
 	metrics.Registry.MustRegister(BuildInfo)
+}
+
+// RecordAdoptionSegment records one warm-adoption hot-path segment duration.
+func RecordAdoptionSegment(segment string, d time.Duration) {
+	AdoptionSegmentLatency.WithLabelValues(segment).Observe(float64(d.Nanoseconds()) / 1e6)
 }
 
 // RecordClaimStartupLatency records the duration since the provided start time.

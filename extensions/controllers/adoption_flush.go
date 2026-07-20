@@ -31,6 +31,7 @@ import (
 	v1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
+	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
 // One-write adoption (--one-write-adoption): the async sandbox-patch flusher.
@@ -262,6 +263,10 @@ func (r *SandboxClaimReconciler) processAdoptionFlush(ctx context.Context, req *
 			// taken at pop time is deliberately KEPT (cleared by the sandbox
 			// DELETE event): it shields the adopted sandbox from stale watch
 			// events re-queueing it during cache convergence.
+			// Histogram decomposition (not V(1)-gated): async window length =
+			// worker queue wait + patch RTT, observable on clean legs.
+			asmetrics.RecordAdoptionSegment("async_queue_wait", start.Sub(req.enqueuedAt))
+			asmetrics.RecordAdoptionSegment("async_patch", time.Since(start))
 			if logger.V(1).Enabled() {
 				adoptionTimingLog.Info("adoption async patch",
 					uberzap.String("claim", req.claim.Namespace+"/"+req.claim.Name),

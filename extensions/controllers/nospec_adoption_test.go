@@ -65,8 +65,8 @@ func nsWarmSandbox(name string) *sandboxv1beta1.Sandbox {
 	sb.Labels[sandboxv1beta1.DeprecatedSandboxPodTemplateHashLabel] = "pod-template-hash"
 	sb.Labels[sandboxv1beta1.SandboxTemplateHashLabel] = "blueprint-hash"
 	sb.Spec.PodTemplate.ObjectMeta.Labels = map[string]string{
-		warmPoolSandboxLabel:   sandboxcontrollers.NameHash(rrPoolName),
-		sandboxTemplateRefHash: sandboxcontrollers.NameHash(rrTemplateName),
+		warmPoolSandboxLabel:                                 sandboxcontrollers.NameHash(rrPoolName),
+		sandboxTemplateRefHash:                               sandboxcontrollers.NameHash(rrTemplateName),
 		sandboxv1beta1.DeprecatedSandboxPodTemplateHashLabel: "pod-template-hash",
 		sandboxv1beta1.SandboxTemplateHashLabel:              "blueprint-hash",
 	}
