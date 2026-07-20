@@ -2,14 +2,16 @@
 
 **[STATUS ANNOTATIONS — round-10 doc audit, 2026-07-20. This is a
 historical planning doc; the text below is unedited. Corrections since:**
-- **§7 stopping rule: NOT YET FIRED.** The clean floor moved 31-40ms →
-  **14-23ms** (GAP-1, gate zero), so PATH-TO-100MS §5 re-derived the
-  revised-target clause to <45-50ms p90. Best supply-present sustained-300
-  measurement so far: p50 41 / p90 95-105ms (round-8 S2 warm-hit cohort,
-  pre-9a items); the 9a-composed re-measurement (SUST4 first window
-  124/304ms) is confounded by scheduler+etcd load and does not count. A
-  full-window supply-adequate leg — round 10 — is the pending test of the
-  stopping rule.
+- **§7 stopping rule: NOT YET FIRED (round-10 result, 2026-07-20).** The
+  clean floor moved 31-40ms → **14-23ms** (GAP-1, gate zero), so
+  PATH-TO-100MS §5 re-derived the revised-target clause to <45-50ms p90.
+  Round 10 measured the supply-present cohort at a true 300/s at
+  **p50 72 / p90 190ms** with `queue_wait` p50 0.21ms and `status_write`
+  p50 39.8ms — the elevation is entirely the write RTT through an
+  apiserver at ~12.8/16 cores absorbing supply churn. Verdict: the
+  stopping rule cannot fire until the CP wall falls (n2-standard-32 +
+  CBOR leg is the designated test); no claim-path code regression
+  (matched-cohort table in RESULTS.md round-10).
 - **§4 item 4 (CBOR): the `--set ...featureGates.CBORServingAndStorage`
   wiring claim is WRONG** — kops v1.35 `--set` cannot address featureGates
   map keys ("field not found in *Cluster", round-9b SUST5 abort); use the

@@ -188,17 +188,27 @@ nodes / 16,500 slots**. The real ladder, measured leg by leg
    cluster ran an untuned scheduler until the round-9b run-script fix.
    With qps=800 applied (SUST4): binds 104-222/s, pod-create→scheduled
    p50 183s → **0.82s**.
-2. **Controller supply pipelines ≈ 100-150/s aggregate** (SUST4's binding
-   constraint): refill issuance (claim→pod-created p50 41.9s under
-   backlog) + sandbox-Ready marking (pod-Ready→sandbox-Ready p50 50.5s at
-   ~13k live pods). Ready steady 78.6/s / best-60s 109.5/s. Lever:
-   sharding (R4.4/L2) + pipeline profiling — not nodes.
-3. **etcd default quota-backend-bytes (2GiB) is a hard DURATION wall:**
-   ~3.2MB/s main-DB revision growth at 300/s churn ⇒ NOSPACE (writes
-   rejected cluster-wide) in ~10 min; ~30 min even at 100/s. Mandatory for
-   any sustained run: ETCD_QUOTA_BACKEND_BYTES ≥ 8GiB +
-   `--etcd-compaction-interval=2m` (the R4.5 items, never yet applied),
-   plus the L4 pods/CR-group etcd split at higher rates.
+2. ~~**Controller supply pipelines ≈ 100-150/s aggregate**~~ —
+   **RE-ATTRIBUTED in round 10: it was never the controller process.**
+   The supply-segment histograms show refill CREATE RTT healthy
+   (p50 ~150-220ms) while `sandbox_create_to_pod_create` (p50 4.8→46s)
+   and `pod_ready_to_sandbox_ready` (p50 9-16s) absorb the time — and a
+   2-shard controller (leg B) with HALF the load per process measured
+   the SAME per-process lags and a WORSE aggregate (12,865 vs 14,456
+   ready). The shared resource is **kube-apiserver CPU: ~12.8 of 16
+   cores under 300/s churn, ~40% of samples GC from encode allocations,
+   JSON encode hot** (in-burst pprof). Levers: bigger CP
+   (n2-standard-32), CBOR/L5 (attacks exactly the measured hot path),
+   multi-apiserver/L4 — controller sharding (R4.4) helps only WITH L4
+   (shards pinned to different apiservers), not against one shared box.
+3. **etcd default quota-backend-bytes (2GiB) duration wall — RESOLVED
+   (round 10):** 8GiB + 2m periodic auto-compaction via
+   `etcdClusters[*].manager.env` (run-script cluster-spec patch; no kops
+   field exists for the apiserver's `--etcd-compaction-interval`, so
+   compaction is enforced etcd-side). Two 10.6-min full-churn runs
+   completed with working deletes; SUST4 died at exactly that duration.
+   Table stakes for any sustained deployment; the L4 pods/CR-group etcd
+   split remains the higher-rate lever.
 4. Nodes/slots: exonerated at 300/s — 150 e2-standard-8 workers idled
    (scheduled→running p50 1.0-2.3s; ≥4.4 starts/s/node demonstrated).
    Corrected slot sizing once walls 1-3 fall: pool + R × ~10s residence

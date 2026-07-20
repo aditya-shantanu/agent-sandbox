@@ -214,14 +214,17 @@ they bind:
    `kubeScheduler.kubeAPIQPS`; only `kubeScheduler.qps/burst` reach the
    generated clientConnection). Peeled by the round-9b run-script fix:
    binds hit 104-222/s, pod-create→scheduled p50 183.5s → 0.82s.~~
-2. **Controller supply pipelines ≈ 100-150/s aggregate — the current
-   binding constraint** (SUST4): refill issuance (claim→pod-created p50
-   41.9s under backlog) + pod-Ready→sandbox-Ready marking (p50 50.5s at
-   ~13k live pods). Levers: sharding (R4.4/#1213 recipe), pipeline
-   profiling via the round-10 supply-segment histograms — NOT more nodes.
-3. **etcd default quota-backend-bytes (2GiB) — a hard duration wall:**
-   ~3.2MB/s main-DB revision growth at 300/s churn ⇒ NOSPACE in ~10 min.
-   Any sustained leg must raise the quota (≥8GiB) + compact at ~2m.
+2. ~~**Controller supply pipelines ≈ 100-150/s aggregate**~~ — **round-10
+   re-attribution: apiserver CPU, not the controller process.** The
+   supply-segment histograms + a real 2-shard leg falsified sharding at
+   300/s (leg B: same per-process lags at half the load, worse
+   aggregate); the apiserver measured ~12.8/16 cores with GC+JSON encode
+   dominating (in-burst pprof). Levers: CP n2-standard-32, CBOR (L5),
+   multi-apiserver (L4) — sharding only composes with L4.
+3. **etcd 2GiB duration wall — RESOLVED (round 10):** 8GiB quota + 2m
+   etcd-side auto-compaction shipped in the run script
+   (TUNE_CONTROL_PLANE cluster-spec patch) and held through two full
+   10.6-min churn runs. Table stakes from here on.
 4. Nodes: **exonerated at 300/s** — corrected sizing is pool 3,000 + 300/s
    × ~10s residence ≈ 6,000 slots ⇒ ~60-80 e2-standard-8 workers
    (~$12-16k/mo), half the pre-9b §1.4 estimate.

@@ -908,4 +908,132 @@ Design (per the 9b "do not relaunch until" gate — both conditions now met):
   segment histograms; state a definitive claim-path regression verdict.
 
 Artifacts: `gs://kops-state-142966328212/perf-bench-results/round10/`.
-Results: PENDING (verdict below when complete).
+Results: COMPLETE — verdict below.
+
+## 2026-07-20 — ROUND-10 VERDICT (cluster sandbox-20260720-225023, 70× e2-standard-8, pin 273d9d7, run 22:46-23:34 UTC): etcd wall RESOLVED; sharding FALSIFIED at 300/s; the supply wall is apiserver CPU
+
+Orchestrator v12 ran fully autonomously: quota preflight OK → leg A →
+(criteria failed) → leg B on the same cluster → leg C correctly skipped
+(no winner) → cluster deleted → `gce-instance-leaks=0` (independently
+re-verified: zero `sandbox-2026*` instances/networks/addresses). Wall
+clock 48 min; ~43 cluster-minutes ≈ **~$17 total** (vs $60-90 budget).
+The new cluster-spec patch applied and verified on the real run
+("Cluster-spec patch verified."; ETCD env in both etcd-manager manifests).
+Smoke floor intact: ack p50 7-8ms, create→Ready p50 21 / p90 24ms.
+
+**Leg A (single controller, all TUNE knobs incl. etcd 8GiB + 2m compaction):**
+18,151 created (298.0/s held) / **14,456 ready / 4,112 failed**; ready
+throughput overall 39.2/s, best60s 79.7/s, best10s 310/s. Ack p50 105ms
+run-wide (22ms in the first window). **FAIL** on ≥95%/≥295-per-s criteria.
+
+| window (arrival) | n | ready | p50 | p90 |
+|---|---|---|---|---|
+| [0-10s) | 3,062 | **3,062** | **72ms** | **190ms** |
+| [10-20s) | 3,058 | 2,849 | 36.3s | 52.9s |
+| [30-40s) | 2,996 | 2,406 | 206.7s | 292.8s |
+| [50-60s) | 2,984 | 1,237 | 241.9s | 267.3s |
+
+**Leg B (2 shards via --watch-namespaces + SHARD_B_NAMESPACES, 4 ns each,
+same cluster):** shard2 deployed and rolled out; work split evenly (ready
+per namespace 1,525-1,676 across all 8). 17,899 created / **12,865 ready /
+5,972 failed** — **WORSE than leg A** (ready best60s 65.9 vs 79.7/s;
+first window p50 64 / p90 333ms; ack p50 137ms). Zero double-binds in
+36,050 bindings across both legs (4th/5th full-scale confirmation).
+
+**The round-10 finding — the supply-wall ladder, re-attributed with the
+new instrumentation:**
+
+1. **etcd 2GiB quota (ladder wall 4): RESOLVED.** With 8GiB +
+   2m periodic auto-compaction, two back-to-back 10.6-min full-churn runs
+   (~36k sandboxes + ~36k claims + ~33k pods each) completed rc=0 with
+   working deletes (created=deleted) and no NOSPACE signature — SUST4
+   died at exactly this duration. The knobs are now table stakes.
+2. **"Controller supply pipelines" (ladder wall 3): RE-ATTRIBUTED — it
+   was never the controller process.** The supply-segment histograms
+   decompose it: refill CREATE RTT is healthy (`pool_member_create` p50
+   146-217ms), but `sandbox_create_to_pod_create` (p50 4.8s in the first
+   window → 46s late) and `pod_ready_to_sandbox_ready` (p50 9-16s, p90
+   →73s) absorb everything. **Sharding did NOT move them**: per-shard
+   with HALF the namespaces each, leg B measured the SAME or worse
+   per-process lags (14-15s early, 70-73s late) and aggregate pod-create
+   issuance identical to leg A (~6.5k in the first 63s both legs) — the
+   lag is not process-CPU; it is queueing against a shared resource.
+3. **The shared resource is control-plane CPU: kube-apiserver measured
+   at ~12.8 of 16 cores (1280%) during the phase** (in-burst pprof, leg
+   A), ~40% of samples in GC (mallocgc/scanobject/findObject) driven by
+   allocation in encode paths, `encoding/json` visibly hot. Every
+   supply-pipeline stage (watch fan-out to controller+KCM+scheduler,
+   pod/sandbox status writes, deletes) queues on this box. A second
+   controller adds watch/encode fan-out and write concurrency → leg B
+   made the CP MORE saturated → worse. This is SCALE-ROADMAP §1.1's
+   "~25 cores at 1000/s" arriving early: at 300/s CHURN (~20-25
+   cluster-wide writes/claim + ~33k pod objects/leg + 12-13k live pod
+   objects at peak) one n2-standard-16 apiserver is the wall.
+4. Slot saturation is the SECONDARY effect: livePods peaked 12.6-13.3k
+   pod OBJECTS vs 7,553 slots (podCreatedToScheduled p50 72.7s = Pending
+   queue, scheduledToPodRunning p50 1.7s = nodes still bored). It is
+   downstream of (3): pods pile up because the delete pipeline lags
+   through the saturated CP. Scheduler attempts ran 50-150/s
+   unthrottled — wall 2 (kops QPS key) stays peeled.
+
+**Regression rider — sustained claim-path regression verdict: NO
+(quantified; cohort definition + load regime fully account for it).**
+Matched-cohort comparison across runs:
+
+| run (code, sched, etcd, nodes) | [0,3s) cohort p50/p90 | first-10s window p50/p90 | load during window |
+|---|---|---|---|
+| S2 round-8 (pre-9a, sched@50-inert, 2GiB, 34n) | 38 / 96ms | 119ms p50 (incl. pool cliff) | binds capped 47-50/s; ack p50 11-14ms |
+| SUST3 (pre-9a, sched@50-inert, 2GiB, 150n) | — | 56 / 122ms | binds capped ~50/s |
+| SUST4 (9a tree, sched@800, 2GiB→NOSPACE, 150n) | — | 124 / 304ms | binds 104-222/s + etcd degrading from t=0 |
+| **R10-A (9a tree + etcd knobs, sched@800, 70n)** | **72 / 195ms** | **72 / 190ms** (all 3,062 ready, every one <2s) | sched attempts 52-72/s; refill creates ~34/s; ack p50 22ms |
+
+Segment attribution (adoption histograms, leg A, first-21s delta,
+n=5,330): `queue_wait` p50 **0.21ms** / p90 70ms — the claim controller
+is NOT backlogged; `status_write` p50 **39.8ms / p90 372ms** vs the
+~15ms healthy server-side PATCH — the entire first-window elevation is
+the one critical write's RTT (+ watch fan-out) through a CP that is
+simultaneously absorbing supply churn. Three independent confirmations
+of no code regression: (a) same 9a tree, etcd fixed: SUST4 124/304 →
+R10-A 72/190 (code constant, environment moved); (b) smoke floor
+identical pre/post-9a (21-23ms); (c) S2's famous 41/95 was the [0,3s)
+warm-hit cohort at near-zero concurrent churn — its matched R10 cohort
+is 72/195 with the delta living in `status_write` RTT, not in any
+adoption segment the 9a items touched. (Side note: one-write
+`async_queue_wait` p50 reached 2.2s under churn — the deferred sandbox
+patch lags but never gates Ready; by design.)
+
+**Scoreboard after round 10:**
+
+- Sustained-300 flat-window <100ms p90: **NOT DEMONSTRATED.** Even the
+  supply-present first window is 190ms p90 in this regime — the claim
+  path <100ms at 300/s needs CP headroom, not more claim-path code.
+- Walls peeled so far: scheduler QPS (9b) ✅, etcd quota/compaction
+  (10) ✅, nodes exonerated (9b) ✅, controller-process supply ceiling
+  **falsified** (10) ✅. **Standing wall: apiserver CPU at 300/s churn.**
+- Controller correctness at scale: 5 consecutive full-scale runs with
+  zero double-binds/wedges.
+
+**What remains for 300 → 500/1000 (recommended order):**
+
+1. **CP headroom leg:** n2-standard-32 control plane (R4.5's original
+   spec; ~$0.9/h delta) — the single cheapest test of wall 3. Pair with
+   **CBOR (L5)**: the pprof shows exactly its target (JSON encode + GC
+   from encode allocs); the TUNE_CBOR wiring is now fixed and unused.
+   Expected: both first-window p90 <100ms and a higher ready plateau.
+2. **Multi-apiserver / write-domain sharding (L4)** if one 32-core box
+   still saturates — controller sharding composes with it (shards pinned
+   to different apiservers), which is where leg B's topology becomes
+   useful; it is NOT useful against a single shared apiserver.
+3. **Churn reduction beats churn service:** L6 recycling remains the
+   only path where sustained rate decouples from CP write ceilings
+   (~6 writes/claim, no pod churn) — **the security decision memo is now
+   the critical path to 500/1000**, since round 10 proves the ceiling is
+   CP-capacity-per-write, and 500-1000/s multiplies exactly that.
+4. Cheap bankable demo: a 100-150/s leg inside the measured ceiling for
+   a full-window <100ms p90 result (PATH-TO-100MS §3.3 option).
+
+Artifacts: `gs://kops-state-142966328212/perf-bench-results/round10/`
+(A-sust300-single/, B-sust300-shard2/ with RESULTS.txt, summary.json
+incl. apfVerification=exempt, sandboxes.jsonl, timeseries.jsonl,
+metrics.jsonl.gz with both shards' scrapes, apiserver pprof, reports;
+STATUS.txt + heartbeats). Cluster deleted; zero leaks.

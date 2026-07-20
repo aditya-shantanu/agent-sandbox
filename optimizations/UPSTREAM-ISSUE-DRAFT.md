@@ -352,20 +352,28 @@ client QPS 50 was the 47-50/s wall** — an environment/tooling bug (kops
 v1.35 silently ignores `kubeScheduler.kubeAPIQPS`; only
 `kubeScheduler.qps/burst` reach clientConnection), worth an explicit
 sizing callout in any deployment guide because an untuned scheduler caps
-ANY warm-pool refill at ~50 pods/s regardless of cluster size; (2) with
-the scheduler at 800 QPS, **controller supply pipelines cap at ~100-150/s
-aggregate** (refill issuance p50 41.9s + pod-Ready→sandbox-Ready marking
-p50 50.5s under a ~13k-pod backlog) — the standing lever is sharding
-(task 19), and this is now the top open supply item; (3) **etcd default
+ANY warm-pool refill at ~50 pods/s regardless of cluster size; (2)
+~~controller supply pipelines ~100-150/s~~ **round-10 re-attribution:
+the supply ceiling is kube-apiserver CPU, not the controller** — supply
+segment histograms show healthy refill-create RTTs with the time in
+watch/queue lags, a 2-shard controller run measured the same per-process
+lags at half the load and a WORSE aggregate (sharding falsified at
+300/s), and the apiserver profiled at ~12.8/16 cores (GC + JSON encode
+dominant). Levers: larger control plane, CBOR serving/storage, multiple
+apiservers (sharding composes with the latter); (3) **etcd default
 quota-backend-bytes (2GiB) is a hard duration wall** at churn: ~3.2MB/s
-main-DB revision growth at 300/s ⇒ NOSPACE in ~10 min (raise the quota +
-`--etcd-compaction-interval=2m` for any sustained deployment). The claim
-path itself held **p50 124ms / p90 304ms at a true 300/s** while pool
-supply lasted (round-9b SUST4 first window), with zero double-binds or
-wedged losers at a third full-scale run. Node sizing once (2)-(3) are
-addressed: pool + R × ~10s slot residence (~60-80 8-vCPU nodes at 300/s),
-or remove pod churn from steady state entirely (recycling,
-security-gated). Full data: `RESULTS.md` round-9b verdict.
+main-DB revision growth at 300/s ⇒ NOSPACE in ~10 min — **resolved in
+the bench (round 10)** via 8GiB quota + 2m etcd-side auto-compaction
+(etcd-manager env; kops has no field for the apiserver's
+`--etcd-compaction-interval`), verified across two full-churn runs. The
+claim path itself held **p50 72ms / p90 190ms at a true 300/s with
+supply present** (round-10 leg A first window, all 3,062 ready), with
+zero double-binds or wedged losers now at FIVE full-scale runs. Node
+sizing: pool + R × ~10s slot residence (~60-80 8-vCPU nodes at 300/s)
+holds for the healthy regime — but under a supply collapse pod objects
+pile to ~1.7× slots, so the CP wall must fall first; or remove pod churn
+from steady state entirely (recycling, security-gated). Full data:
+`RESULTS.md` round-9b + round-10 verdicts.
 
 **Default:** shaping flags default 0 (legacy immediate full-deficit
 refill); `--pool-dedicated-connection` defaults on (set `=false` for the
@@ -653,9 +661,17 @@ optimistic-lock patch (task 3), not process-local state, and adoption is
 namespace-local.
 
 **Validated.** Unit tests for lease-ID derivation and scoping; example
-manifest `k8s/namespace-sharding-example.yaml`. Not yet load-tested
-multi-instance (the sustained-rate work it exists for is blocked on the
-leg-S findings, task 8).
+manifest `k8s/namespace-sharding-example.yaml`. **First multi-instance
+load test: round 10 leg B** (2 shards × 4 namespaces at 300/s sustained,
+via the bench `SHARD_B_NAMESPACES` clone recipe): topology worked exactly
+as designed — independent leases, even work split across all 8
+namespaces, zero double-binds in 17,899 bindings. Scaling caveat from
+that run: sharding did NOT raise the 300/s supply ceiling (aggregate
+slightly worse), because the binding constraint there is apiserver CPU —
+sharding divides controller-side load, so it pays off only against a
+controller-side wall or when composed with multiple apiservers
+(shards pinned per-apiserver). It remains the 500-1000/s watch-ingestion
+lever, now with a demonstrated-safe deployment recipe.
 
 **Why 🟡:** [PR #1213](https://github.com/kubernetes-sigs/agent-sandbox/pull/1213)
 already ships a namespaced mode — this task must adopt its flag surface
@@ -687,22 +703,24 @@ conflicts with
 
 ## Remaining work (known, scoped, not in this issue)
 
-- **Supply-side sustained demonstration — MEASURED, NOT YET ACHIEVED
-  (round 9b, two 150-node legs).** 300/s for 60s remains undemonstrated,
-  but the wall ladder is now fully quantified: scheduler default-QPS wall
-  (47-50/s — peeled via the kops `kubeScheduler.qps` key fix), controller
-  supply pipelines (~100-150/s aggregate: refill issuance +
-  sandbox-Ready marking — NOW THE TOP OPEN SUPPLY ITEM; sharding/task 19
-  is the standing hypothesis), and etcd 2GiB default quota (NOSPACE after
-  ~10 min at 300/s churn; raise quota + compaction-interval 2m). Nodes
-  exonerated (same ~47/s on 34 and 150 nodes at default scheduler QPS;
-  150 nodes idle under the fixed scheduler). 97.7% of 18k claims ready at
-  297.8/s arrivals; zero controller pathology at third full-scale run.
-  Node sizing corrected: ~60-80 8-vCPU nodes at 300/s once the two
-  control-plane walls fall — per-node I/O levers
-  ([PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203))
-  demoted (nodes were never saturated). L6 recycling still the only path
-  that decouples rate from control-plane write ceilings.
+- **Supply-side sustained demonstration — STILL NOT ACHIEVED; the wall
+  is now pinned to apiserver CPU (rounds 9b + 10).** The ladder as
+  measured: scheduler default-QPS wall (47-50/s — peeled via the kops
+  `kubeScheduler.qps` key fix), etcd 2GiB quota duration wall (peeled in
+  round 10: 8GiB + 2m auto-compaction), controller-process supply
+  ceiling (FALSIFIED in round 10: a 2-shard controller changed nothing
+  per-process and worsened the aggregate), leaving **kube-apiserver CPU
+  saturation (~12.8/16 cores at 300/s churn, GC + JSON encode dominant)
+  as the standing supply wall.** Nodes exonerated (34/70/150-node runs).
+  Claim path with supply present: p50 72 / p90 190ms at a true 300/s
+  (round-10 first window) — the <100ms p90 needs CP headroom, not more
+  claim-path code. Next levers in order: CP n2-standard-32 + CBOR leg
+  (the profile shows CBOR's exact target), multi-apiserver/etcd
+  write-domain split, and the L6 recycling decision — now the critical
+  path to 500/1000, since the measured ceiling is CP capacity per write
+  and recycling is the only path that removes the writes. Per-node I/O
+  levers ([PRs #1203-#1208](https://github.com/kubernetes-sigs/agent-sandbox/pull/1203))
+  stay demoted. Zero controller pathology at five full-scale runs.
 - **Round-9a items — LANDED on the fork, awaiting the 9b measurement:**
   claim-side no-spec adoption (task 12, both halves now merged); create-ack
   riders (S0 decomposed from the leg-B scrape: etcd ~11.6ms + ~10ms
@@ -838,11 +856,11 @@ which the numbers in this issue would be wrong.
 ---
 
 *Maintenance: this document is updated at the end of every investigation
-round (latest: round-10 doc audit, 2026-07-20 — round-9b supply-wall ladder
-absorbed into task 8's caveat and the remaining-work section: scheduler
-default-QPS wall peeled via the kops `kubeScheduler.qps` key fix (kops
-inert-`kubeAPIQPS` bug recorded above as its own upstream-filing item),
-controller supply pipelines ~100-150/s now the top open supply item, etcd
-2GiB quota duration wall, nodes exonerated with sizing corrected to ~60-80
-8-vCPU nodes at 300/s, ~$25-28 per 150-node supply leg. Numbers in the
-results table are always the latest verified A/B.*
+round (latest: round-10 verdict, 2026-07-20 — etcd quota/compaction wall
+resolved (8GiB + 2m via etcd-manager env), controller-process supply
+ceiling falsified by the first real 2-shard load test (task 19 updated),
+supply wall re-attributed to apiserver CPU (~12.8/16 cores, GC + JSON —
+the CBOR target measured in vivo), supply-segment histograms landed,
+kops inert-`kubeAPIQPS` bug recorded as its own upstream-filing item,
+zero double-binds across five full-scale runs. Numbers in the results
+table are always the latest verified A/B.*

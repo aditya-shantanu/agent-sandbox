@@ -54,6 +54,7 @@ the move to the runner VM, cleaned).
 - Quota watch (shared project; measured 2026-07-20): **N2_CPUS ~exhausted (7,708/8,000)** — the effective 34-worker cap on n2-standard-8 legs; node-scale legs use `NODE_MACHINE_TYPE=e2-standard-8` (CPUS quota, ~6,600 free) and `NODE_VOLUME_SIZE=100` (SSD_TOTAL_GB headroom ~21TB). The v11 orchestrator runs a quota preflight before cluster create.
 - Round-9b clusters (all created and deleted 2026-07-20, verified no leaks): `sandbox-20260720-181027` (SUST3, 150 nodes), `sandbox-20260720-195719` (SUST4, 150 nodes), SUST5-cbor never created (kops --set featureGates failure).
 - Cost anchors (measured 2026-07-20): 150× e2-standard-8 + n2-standard-16 CP + 100GB pd-ssd ≈ **$45/h all-in**; a full bring-up→measure→teardown supply leg = 33-37 min ≈ **$25-28**. A 70-node leg of the same shape ≈ $22-24/h, ≈ $15-20/leg (round-10 sizing, from the corrected ~60-80-node/$12-16k-per-month 300/s estimate).
+- Round-10 clusters (2026-07-20, verified no leaks post-run): `sandbox-20260720-225023` (70 nodes, shared by legs A and B, deleted by leg B's cleanup + belt-and-braces check); `sandbox-r10dryrun` (kops CONFIG only for the cluster-spec-patch dry-run validation — no cloud resources ever created — deleted). Two legs total ≈ 43 cluster-minutes ≈ **~$17** against the $60-90 budget; leg C (CBOR) auto-skipped per its gate.
 - Baseline1 artifacts (run from the laptop before the VM existed): local only, `/tmp/bench-artifacts-baseline/stress-test/` on the operator's Mac.
 
 ## Standard invocation
