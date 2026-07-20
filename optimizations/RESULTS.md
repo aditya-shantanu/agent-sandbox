@@ -857,3 +857,55 @@ Artifacts: `gs://kops-state-142966328212/perf-bench-results/round9b/`
 (SUST3, SUST4 complete with reports; SUST5-cbor run.log only). All three
 clusters verified deleted (GCE instances/networks/addresses: zero
 `sandbox-2026*` remaining).
+
+---
+
+## 2026-07-20 — ROUND 10: sustained-300 with every measured wall addressed (v12 orchestrator, pin 273d9d7) — PENDING
+
+Design (per the 9b "do not relaunch until" gate — both conditions now met):
+
+- **Phase-0 doc audit** committed (f67c4d5): 9b ladder propagated to
+  PATH-TO-100MS/GAP-AUDIT/ROUND7-PLAN/UPSTREAM-ISSUE-DRAFT (+ the kops
+  inert-`kubeAPIQPS` bug recorded as its own upstream-filing item — no
+  existing kubernetes/kops issue found 2026-07-20).
+- **Pre-run fixes** (273d9d7): (a) TUNE_CONTROL_PLANE now applies
+  ETCD_QUOTA_BACKEND_BYTES=8GiB + 2m periodic auto-compaction to both etcd
+  clusters via a `kops get -o json`→jq→`kops replace` cluster-spec patch
+  (no kops spec field exists for the apiserver's
+  `--etcd-compaction-interval`, so compaction is enforced etcd-side);
+  validated by a state-store round-trip + `--target=terraform` render
+  (env present in both etcd-manager manifests); hard-fails if dropped.
+  (b) TUNE_CBOR server gate moved to the same patch mechanism (the SUST5
+  `--set` failure). (c) `agent_sandbox_supply_segment_latency_ms{segment=
+  pool_member_create|sandbox_create_to_pod_create|pod_ready_to_sandbox_ready}`
+  so the ~100-150/s supply-pipeline ceiling decomposes from the standard
+  scrape. (d) `SHARD_B_NAMESPACES` run-script knob: clones the deployed
+  controller as `agent-sandbox-controller-shard2` with its own
+  `--watch-namespaces` list (sharding-example recipe; distinct
+  auto-derived leader Lease).
+- **Cluster (one, reused):** 70× e2-standard-8 workers (corrected 9b
+  sizing; spare ≈ 7,550 slots vs 4,950 needed = 65%), CP n2-standard-16,
+  TUNE_CONTROL_PLANE + TUNE_NODES + new etcd knobs, clean instrumentation.
+- **Leg A (SUST300-single):** 300/s × 60s, 8 namespaces × 375-replica
+  pools, refill cap 100/pool, workers 8, dwell 1.5s, headroom 10s,
+  `--per-namespace-claim-watch`, single controller. Success: ≥95% of
+  ~18,000 ready; steady ready ≥295/s; flat window p90s <100ms.
+- **Leg B (SUST300-shard2, only if A fails its criteria = controller
+  pipeline ceiling binding):** same cluster, 2 controller shards
+  (`--watch-namespaces` r10b-s1..4 / SHARD_B_NAMESPACES r10b-s5..8),
+  `--namespace=r10b`, no smoke (smoke ns outside shard lists) — the
+  sharding-at-rate proof for ladder item 3.
+- **Leg C (SUST300-cbor, only if A or B passed):** TUNE_CBOR=true repeat
+  of the winner on a FRESH cluster (CBOR server gate is creation-time —
+  a reused-cluster CBOR leg measures nothing). Wire-format verification
+  required before attributing deltas.
+- Budget: ~$60-90 (leg ≈ $15-20 at ~$22-24/h for this shape); one retry
+  per leg on transient pre-measurement infra failure, nothing else.
+- **Regression rider (leg A analysis):** compute BOTH warm-hit cohort
+  definitions — (a) arrivals [0,3s) matching the S2 methodology, (b) full
+  first 10s window — and compare S2/SUST3/SUST4/round-10 with per-run
+  load context (bind rate during the window); attribute any delta via the
+  segment histograms; state a definitive claim-path regression verdict.
+
+Artifacts: `gs://kops-state-142966328212/perf-bench-results/round10/`.
+Results: PENDING (verdict below when complete).
