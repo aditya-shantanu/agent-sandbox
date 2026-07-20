@@ -122,11 +122,47 @@ var errColdStartDeferredRetry = errors.New("adoptable warm pool members pending,
 // still shows adoptable warm-pool members.
 const adoptionCacheLagRequeueDelay = 50 * time.Millisecond
 
+// coldStartDeferralMaxRequeueDelay caps the adaptive cold-start deferral
+// requeue delay (see coldStartDeferralRequeueDelay).
+const coldStartDeferralMaxRequeueDelay = 500 * time.Millisecond
+
+// coldStartDeferralRequeueDelay returns the bounded requeue delay for a
+// cold-start deferral pass, growing with the number of consecutive deferrals
+// the claim has already spent.
+//
+// WHY ADAPTIVE (round-8, leg-S starvation fix): with a flat 50ms delay every
+// claim waiting on an exhausted pool re-enters Reconcile ~20x/s. At a
+// sustained-overload backlog of ~14k pending claims that is ~280k attempted
+// reconciles/s of pure polling — the claim workers' CPU, workqueue and API
+// budget consumption starved the 4 pool workers, collapsing refill to
+// ~2-3 creates/s per pool against a 100/s cap (RESULTS.md 2026-07-20 leg S,
+// finding #5). Nothing event-driven wakes a waiting claim when a refill
+// candidate arrives (candidates flow through the in-memory warm queue, not
+// per-claim watch events), so polling is required — but while the pool is
+// empty for this claim, polls beyond the first few buy nothing. The first
+// five deferrals keep the low-latency 50ms cadence (covering plain
+// queue-vs-cache lag, the common case), then the delay grows linearly and
+// saturates at 500ms: a claim stuck behind an empty pool costs at most
+// 2 polls/s instead of 20, a 10x cut in claim-worker pressure exactly when
+// the pool controller needs the headroom to refill.
+func coldStartDeferralRequeueDelay(deferrals int) time.Duration {
+	if deferrals < 5 {
+		return adoptionCacheLagRequeueDelay
+	}
+	d := adoptionCacheLagRequeueDelay * time.Duration(deferrals-3)
+	if d > coldStartDeferralMaxRequeueDelay {
+		return coldStartDeferralMaxRequeueDelay
+	}
+	return d
+}
+
 // maxColdStartDeferrals bounds how many consecutive reconcile passes a claim
 // may defer cold start while the cache reports adoptable warm-pool members
-// that never become available through the adoption queue (~2s at the 50ms
-// requeue delay). After the cap the claim cold-starts so it cannot loop
-// forever on e.g. a stuck queue or members that are perpetually contended.
+// that never become available through the adoption queue (~16s worst case
+// under the adaptive coldStartDeferralRequeueDelay schedule, ~2s when every
+// pass stays at the 50ms base). After the cap the claim cold-starts so it
+// cannot loop forever on e.g. a stuck queue or members that are perpetually
+// contended.
 const maxColdStartDeferrals = 40
 
 var restrictedDomains = []string{"kubernetes.io", "k8s.io", "agents.x-k8s.io"}
@@ -407,6 +443,28 @@ type SandboxClaimReconciler struct {
 	// when nil, deferred patches are applied synchronously at enqueue time so
 	// correctness never depends on the worker being wired.
 	adoptionFlusher *adoptionFlusher
+	// DirectReader reads straight from the API server, bypassing the informer
+	// cache. Set to mgr.GetAPIReader() by SetupWithManager; nil falls back to
+	// the (cached) Client. It exists for the one-write adoption recovery
+	// paths, whose decisions MUST NOT depend on informer convergence: under a
+	// sustained-overload watch backlog the cache can lag the server by
+	// seconds, and every cache-based recovery read then misclassifies —
+	// the flusher's post-409 re-verify sees a stale pool-owned sandbox and
+	// burns its attempts on "benign conflict" retries, and the lost-binding
+	// clear waits forever for its own status write to appear (leg S
+	// 2026-07-20: ~4,300 claims stayed wedged on stolen sandboxes for their
+	// full 300s timeout because recovery gave up against the lagging cache).
+	DirectReader client.Reader
+}
+
+// directGet reads an object bypassing the informer cache when a DirectReader
+// is wired, falling back to the cached client otherwise (tests, or callers
+// that constructed the reconciler bare).
+func (r *SandboxClaimReconciler) directGet(ctx context.Context, key client.ObjectKey, obj client.Object) error {
+	if r.DirectReader != nil {
+		return r.DirectReader.Get(ctx, key, obj)
+	}
+	return r.Get(ctx, key, obj)
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;update;patch;delete
@@ -701,6 +759,13 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		errors.Is(reconcileErr, errColdStartDeferredRetry) {
 		logger.V(4).Info("Adoption retry requested; requeueing with bounded delay", "claim", claim.Name, "error", reconcileErr)
 		requeueDelay := adoptionCacheLagRequeueDelay
+		if errors.Is(reconcileErr, errColdStartDeferredRetry) {
+			// Backlog-aware pacing: while the pool stays empty for this claim,
+			// consecutive deferrals stretch the poll interval so thousands of
+			// waiting claims do not starve the pool controller's refill (see
+			// coldStartDeferralRequeueDelay).
+			requeueDelay = coldStartDeferralRequeueDelay(trace.coldStartDeferrals)
+		}
 		if result.RequeueAfter > 0 && result.RequeueAfter < requeueDelay {
 			requeueDelay = result.RequeueAfter
 		}
@@ -1283,13 +1348,15 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 	var adoptingFallback bool
 
 	// Instantly returns unused keys the moment we find a valid/ready candidate!
+	// Release (not Add): popping reserved the keys, and a give-back must clear
+	// the reservation or the key could never re-enter the queue.
 	defer func() {
 		for _, key := range skipped {
-			r.WarmSandboxQueue.Add(namespacedWarmPoolName, key)
+			r.WarmSandboxQueue.Release(namespacedWarmPoolName, key)
 		}
 		// If we parked a fallback sandbox but never ended up adopting it (due to error or adopting a ready one), requeue it.
 		if fallbackSandbox != nil && !adoptingFallback {
-			r.WarmSandboxQueue.Add(namespacedWarmPoolName, fallbackKey)
+			r.WarmSandboxQueue.Release(namespacedWarmPoolName, fallbackKey)
 		}
 	}()
 
@@ -1367,7 +1434,9 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 		if err != nil {
 			if k8errors.IsNotFound(err) {
 				// Ghost Pod detected: It was deleted from the cluster but was still in our queue.
-				// Ignore it and instantly pop the next one.
+				// Ignore it and instantly pop the next one. Forget clears the
+				// pop's reservation without re-queueing.
+				r.WarmSandboxQueue.Forget(adoptedKey.Namespace, adoptedKey.Name)
 				if trace != nil {
 					trace.rejected++
 					trace.lastReject = "sandbox no longer exists (ghost queue entry)"
@@ -1375,7 +1444,7 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 				continue
 			}
 			// For real errors, put the key back in line and error out
-			r.WarmSandboxQueue.Add(namespacedWarmPoolName, adoptedKey)
+			r.WarmSandboxQueue.Release(namespacedWarmPoolName, adoptedKey)
 			return nil, queue.SandboxKey{}, err
 		}
 
@@ -1389,6 +1458,11 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 			// (Though pickSmart makes this impossible, we keep it for safety).
 			if errors.Is(err, ErrCrossNamespaceAdoption) {
 				skipped = append(skipped, adoptedKey)
+			} else {
+				// Rejected for another reason (mid-adoption by another owner,
+				// being deleted, broken labels): drop the reservation so a
+				// future genuine adoptable transition can re-queue it.
+				r.WarmSandboxQueue.Forget(adoptedKey.Namespace, adoptedKey.Name)
 			}
 			continue
 		}
@@ -1468,9 +1542,10 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 					// exit to defer to — fall back to the synchronous patch.
 					if err := r.completeAdoption(ctx, claim, adopted); err != nil {
 						if k8errors.IsNotFound(err) {
+							r.WarmSandboxQueue.Forget(adoptedKey.Namespace, adoptedKey.Name)
 							return false, nil
 						}
-						r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
+						r.WarmSandboxQueue.Release(namespacedWarmPoolNameForQueue, adoptedKey)
 						if k8errors.IsConflict(err) {
 							return false, nil
 						}
@@ -1483,7 +1558,7 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 						// user/config errors surfaced before any API write —
 						// same handling as a non-conflict completeAdoption
 						// failure on the 2-write path.
-						r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
+						r.WarmSandboxQueue.Release(namespacedWarmPoolNameForQueue, adoptedKey)
 						logger.Error(err, "Failed to prepare one-write adoption for candidate sandbox", "sandbox candidate", adopted.Name, "claim", claim.Name)
 						return false, err
 					}
@@ -1497,9 +1572,10 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 				}
 			} else if err := r.completeAdoption(ctx, claim, adopted); err != nil {
 				if k8errors.IsNotFound(err) {
+					r.WarmSandboxQueue.Forget(adoptedKey.Namespace, adoptedKey.Name)
 					return false, nil
 				}
-				r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
+				r.WarmSandboxQueue.Release(namespacedWarmPoolNameForQueue, adoptedKey)
 				if k8errors.IsConflict(err) {
 					return false, nil
 				}
@@ -2447,11 +2523,40 @@ func (r *SandboxClaimReconciler) recoverStatusFirstBinding(ctx context.Context, 
 	}
 	if err := r.completeAdoption(ctx, claim, sandbox); err != nil {
 		if k8errors.IsConflict(err) || k8errors.IsNotFound(err) {
-			// Raced another writer (or wrote from a stale cache view): requeue
-			// and re-classify against a fresher read next pass.
-			logger.Info("ONE-WRITE ADOPTION: crash-window recovery patch conflicted; requeueing to re-verify",
-				"claim", claim.Name, "sandbox", statusName, "error", err.Error())
-			return true, fmt.Errorf("%w: sandbox %s (crash-window recovery conflict)", errAdoptionTriggeredRetry, statusName)
+			// Raced another writer, or (far more often under load) the cached
+			// view this pass patched from was stale. Re-classify against a
+			// DIRECT read now instead of requeueing to retry against the same
+			// lagging cache: under a sustained watch backlog the stale view
+			// can persist for seconds, and each 50ms retry pass then fires
+			// another doomed optimistic-lock patch — the leg-S "adoption
+			// retry storm" (hundreds of 409 writes/s) that starved pool
+			// refill.
+			fresh := &v1beta1.Sandbox{}
+			gerr := r.directGet(ctx, client.ObjectKey{Namespace: sandbox.Namespace, Name: sandbox.Name}, fresh)
+			switch {
+			case k8errors.IsNotFound(gerr):
+				logger.Info("ONE-WRITE ADOPTION: status-bound sandbox is gone (direct read); falling through to re-adoption",
+					"claim", claim.Name, "sandbox", statusName)
+				return false, nil
+			case gerr != nil:
+				return true, fmt.Errorf("failed to re-verify one-write adoption of %q after conflict: %w", statusName, gerr)
+			case metav1.IsControlledBy(fresh, claim):
+				// The patch we lost to was our own (flusher/another pass):
+				// binding is in place, wait for the cache to converge.
+				r.triggeredAdoptions.Store(adoptionKey, triggeredAdoptionEntry{uid: claim.UID, sandbox: statusName})
+				return true, fmt.Errorf("%w: sandbox %s", errAdoptionTriggeredRetry, statusName)
+			default:
+				if ref := metav1.GetControllerOf(fresh); ref == nil || ref.Kind != "SandboxWarmPool" {
+					logger.Info("ONE-WRITE ADOPTION: status-bound sandbox was taken by another owner (direct read); falling through to re-adoption",
+						"claim", claim.Name, "sandbox", statusName, "owner", ref)
+					return false, nil
+				}
+				// Still pool-owned on the server: a genuine racing writer bumped
+				// the RV. Requeue and re-classify next pass.
+				logger.Info("ONE-WRITE ADOPTION: crash-window recovery patch conflicted with the sandbox still pool-owned; requeueing to re-verify",
+					"claim", claim.Name, "sandbox", statusName, "error", err.Error())
+				return true, fmt.Errorf("%w: sandbox %s (crash-window recovery conflict)", errAdoptionTriggeredRetry, statusName)
+			}
 		}
 		return true, fmt.Errorf("failed to recover one-write adoption of %q: %w", statusName, err)
 	}
@@ -2510,7 +2615,16 @@ func (r *SandboxClaimReconciler) shouldDeferColdStart(ctx context.Context, claim
 
 	adoptable := 0
 	for i := range members.Items {
-		if verifySandboxCandidate(&members.Items[i], claim) == nil {
+		member := &members.Items[i]
+		// Reserved members are already inside another claim's adoption
+		// transaction: with one-write adoption they stay pool-owned and
+		// adoptable in the cache for the whole async-patch window, so
+		// counting them here made exhausted pools look stocked and deferred
+		// cold starts against phantom capacity (leg S 2026-07-20).
+		if r.WarmSandboxQueue.IsReserved(member.Namespace, member.Name) {
+			continue
+		}
+		if verifySandboxCandidate(member, claim) == nil {
 			adoptable++
 		}
 	}
@@ -2524,6 +2638,11 @@ func (r *SandboxClaimReconciler) shouldDeferColdStart(ctx context.Context, claim
 		entry = coldStartDeferralEntry{uid: claim.UID}
 	}
 	entry.attempts++
+	// Surface the running deferral count so Reconcile can pace the bounded
+	// requeue adaptively (coldStartDeferralRequeueDelay).
+	if trace := adoptionTraceFrom(ctx); trace != nil {
+		trace.coldStartDeferrals = entry.attempts
+	}
 	if entry.attempts > maxColdStartDeferrals {
 		logger.Info("Warm pool still shows adoptable sandboxes but none could be adopted after the deferral cap; falling back to cold start",
 			"claim", claim.Name, "warmPool", claim.Spec.WarmPoolRef.Name,
@@ -2707,6 +2826,12 @@ func (r *SandboxClaimReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWo
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &v1beta1.Sandbox{},
 		sandboxClaimUIDLabelIndex, sandboxClaimUIDLabelIndexer); err != nil {
 		return fmt.Errorf("failed to index sandboxes by claim UID label: %w", err)
+	}
+
+	// Direct (non-cached) reads for the one-write adoption recovery paths:
+	// their classifications must not depend on informer convergence.
+	if r.DirectReader == nil {
+		r.DirectReader = mgr.GetAPIReader()
 	}
 
 	// One-write adoption: run the async sandbox-patch flush workers under the
@@ -3001,6 +3126,13 @@ func (h *sandboxEventHandler) Delete(ctx context.Context, e event.DeleteEvent, _
 	if !ok {
 		return
 	}
+
+	// Clear any adoption reservation regardless of the current owner: adopted
+	// sandboxes leave the pool with their reservation intact by design (it
+	// shields them from stale re-adds), and their DELETE event is where the
+	// entry is finally dropped. A later same-name sandbox is a new object and
+	// must be addable.
+	h.sandboxQueue.Forget(sandbox.Namespace, sandbox.Name)
 
 	warmPoolName := getWarmPoolName(sandbox)
 

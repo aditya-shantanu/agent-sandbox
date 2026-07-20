@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
@@ -734,5 +735,172 @@ func TestWarmPoolCountingAcrossOneWriteAsyncWindow(t *testing.T) {
 	}
 	if n := poolDeletes.Load(); n != 0 {
 		t.Errorf("expected the adopted sandbox left alone by the pool, got %d delete(s)", n)
+	}
+}
+
+// TestOneWriteAdoptionReservationBlocksDoubleBind reproduces the leg-S
+// (RESULTS.md 2026-07-20) double-bind: with one-write adoption, a popped
+// candidate stays pool-owned and adoptable in the informer cache for the
+// whole async-patch window, so a watch event observed during the window —
+// here the pod-scheduling NodeName status write, the exact re-add trigger in
+// sandboxEventHandler.Update — used to re-queue the key, and a SECOND claim
+// popped, verified against the same stale cache view, and status-bound the
+// same sandbox (3,204 of 5,457 bound sandboxes were double-bound in the
+// sustained-300 leg; the losers wedged until their 300s timeout). The pop's
+// reservation must make the re-add a no-op: claim B must not bind A's
+// candidate, and — because reserved members are also excluded from the
+// cold-start guard's adoptable count — must cold-start immediately instead
+// of deferring against phantom pool capacity.
+func TestOneWriteAdoptionReservationBlocksDoubleBind(t *testing.T) {
+	claimA := rrClaim("ow-res-a")
+	claimB := rrClaim("ow-res-b")
+	warm := owWarmSandbox("ow-res-warm")
+	rec := &opRecorder{}
+	c := owFakeClient(t, rec, nil, rrTemplate(), rrWarmPool(), claimA, claimB, warm)
+	r := owReconciler(t, c, true, warm.Name)
+
+	// Claim A reserves the candidate and commits the status-first bind; the
+	// sandbox-side patch stays queued (the async window is open).
+	owReconcile(t, r, claimA.Name)
+	boundA := &extensionsv1beta1.SandboxClaim{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: claimA.Name, Namespace: rrNamespace}, boundA); err != nil {
+		t.Fatalf("failed to get claim A: %v", err)
+	}
+	if boundA.Status.SandboxStatus.Name != warm.Name {
+		t.Fatalf("expected claim A bound to %s, got %q", warm.Name, boundA.Status.SandboxStatus.Name)
+	}
+	if r.adoptionFlusher.pending() != 1 {
+		t.Fatalf("expected the async window open (1 queued patch), got %d", r.adoptionFlusher.pending())
+	}
+
+	// Mid-window scheduling event: the sandbox is still pool-owned and
+	// adoptable in the cache, and its pod just got a node — exactly the
+	// nodeScheduled re-add path in sandboxEventHandler.Update.
+	oldView := owWarmSandbox(warm.Name)
+	newView := owWarmSandbox(warm.Name)
+	newView.Status.NodeName = "node-1"
+	h := &sandboxEventHandler{sandboxQueue: r.WarmSandboxQueue}
+	h.Update(context.Background(), event.UpdateEvent{ObjectOld: oldView, ObjectNew: newView}, nil)
+
+	// Claim B must NOT receive the reserved candidate; with the pool truly
+	// empty for it (the one member is reserved), it cold-starts its own
+	// sandbox in the same pass.
+	owReconcile(t, r, claimB.Name)
+	boundB := &extensionsv1beta1.SandboxClaim{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: claimB.Name, Namespace: rrNamespace}, boundB); err != nil {
+		t.Fatalf("failed to get claim B: %v", err)
+	}
+	if boundB.Status.SandboxStatus.Name == warm.Name {
+		t.Fatalf("DOUBLE-BIND: claim B bound to claim A's reserved candidate %s", warm.Name)
+	}
+	if boundB.Status.SandboxStatus.Name != claimB.Name {
+		t.Errorf("expected claim B to cold-start its own sandbox %q (reserved member excluded from the cold-start guard), got %q",
+			claimB.Name, boundB.Status.SandboxStatus.Name)
+	}
+
+	// Close the window: the candidate converges to claim A alone.
+	if !r.adoptionFlusher.processNext(context.Background()) {
+		t.Fatal("expected claim A's queued async patch")
+	}
+	assertSandboxAdoptionConverged(t, c, warm.Name, claimA)
+
+	// A's binding survived untouched.
+	finalA := &extensionsv1beta1.SandboxClaim{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: claimA.Name, Namespace: rrNamespace}, finalA); err != nil {
+		t.Fatalf("failed to get claim A: %v", err)
+	}
+	if finalA.Status.SandboxStatus.Name != warm.Name {
+		t.Errorf("expected claim A to keep %s, got %q", warm.Name, finalA.Status.SandboxStatus.Name)
+	}
+}
+
+// TestOneWriteStealRecoveryClearsBindingDespiteStaleClaimCache pins the
+// leg-S wedged-loser fix: the flusher's steal recovery must not depend on
+// informer convergence. The cached client here serves a permanently PRE-BIND
+// view of the claim (modeling the seconds of watch backlog measured in the
+// sustained-300 leg); the previous implementation read the claim through the
+// cache, concluded its own status write "hadn't appeared yet", burned all
+// bounded attempts sleeping, and left the claim advertising a sandbox it
+// lost — the ~4,300 claims that sat bound-but-never-Ready until their 300s
+// timeout. With direct (non-cached) reads the recovery clears the binding in
+// one round regardless of cache lag.
+func TestOneWriteStealRecoveryClearsBindingDespiteStaleClaimCache(t *testing.T) {
+	claim := rrClaim("ow-lag-claim")
+	thief := rrClaim("ow-lag-thief")
+	warm := owWarmSandbox("ow-lag-warm")
+
+	base := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(rrTemplate(), rrWarmPool(), claim, thief, warm).
+		WithStatusSubresource(&extensionsv1beta1.SandboxClaim{}).
+		WithIndex(&sandboxv1beta1.Sandbox{}, sandboxClaimUIDLabelIndex, sandboxClaimUIDLabelIndexer).
+		WithIndex(&sandboxv1beta1.Sandbox{}, sandboxWarmPoolLabelIndex, sandboxWarmPoolLabelIndexer).
+		Build()
+
+	// Freeze the claim's cached view at its pre-bind state: every cached GET
+	// of the claim returns this snapshot, no matter what lands on the server.
+	staleClaim := &extensionsv1beta1.SandboxClaim{}
+	if err := base.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: rrNamespace}, staleClaim); err != nil {
+		t.Fatalf("failed to snapshot pre-bind claim: %v", err)
+	}
+	cached := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if target, ok := obj.(*extensionsv1beta1.SandboxClaim); ok && key.Name == claim.Name {
+				staleClaim.DeepCopyInto(target)
+				return nil
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	q := queue.NewSimpleSandboxQueue()
+	q.Add(queue.GetNamespacedWarmPoolName(rrNamespace, rrPoolName), queue.SandboxKey{Namespace: rrNamespace, Name: warm.Name})
+	r := rrReconciler(cached, t, q)
+	r.OneWriteAdoption = true
+	r.adoptionFlusher = newAdoptionFlusher(r)
+	r.DirectReader = base
+
+	// Bind (status-first commit); async window open.
+	owReconcile(t, r, claim.Name)
+	bound := &extensionsv1beta1.SandboxClaim{}
+	if err := base.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: rrNamespace}, bound); err != nil {
+		t.Fatalf("failed to get claim: %v", err)
+	}
+	if bound.Status.SandboxStatus.Name != warm.Name {
+		t.Fatalf("expected claim bound to %s, got %q", warm.Name, bound.Status.SandboxStatus.Name)
+	}
+
+	// Steal during the window.
+	stolen := &sandboxv1beta1.Sandbox{}
+	if err := base.Get(context.Background(), types.NamespacedName{Name: warm.Name, Namespace: rrNamespace}, stolen); err != nil {
+		t.Fatalf("failed to get sandbox: %v", err)
+	}
+	delete(stolen.Labels, warmPoolSandboxLabel)
+	stolen.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "extensions.agents.x-k8s.io/v1beta1",
+		Kind:       "SandboxClaim",
+		Name:       thief.Name,
+		UID:        thief.UID,
+		Controller: ptr.To(true), // nolint:modernize
+	}}
+	if err := base.Update(context.Background(), stolen); err != nil {
+		t.Fatalf("failed to apply the steal: %v", err)
+	}
+
+	// Drain the flusher: 409 -> direct re-verify -> steal -> the binding must
+	// be cleared on the SERVER even though the cached claim never converges.
+	if !r.adoptionFlusher.processNext(context.Background()) {
+		t.Fatal("expected a queued flush request")
+	}
+	cleared := &extensionsv1beta1.SandboxClaim{}
+	if err := base.Get(context.Background(), types.NamespacedName{Name: claim.Name, Namespace: rrNamespace}, cleared); err != nil {
+		t.Fatalf("failed to get claim: %v", err)
+	}
+	if cleared.Status.SandboxStatus.Name != "" {
+		t.Fatalf("wedged loser: stale binding to %q not cleared despite the lagging claim cache", cleared.Status.SandboxStatus.Name)
+	}
+	ready := meta.FindStatusCondition(cleared.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != "AdoptionLost" {
+		t.Fatalf("expected Ready=False/AdoptionLost after the steal, got %+v", ready)
 	}
 }

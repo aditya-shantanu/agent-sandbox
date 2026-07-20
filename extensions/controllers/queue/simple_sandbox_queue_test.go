@@ -223,13 +223,107 @@ func TestSimpleSandboxQueue_NoLegacyFallback(t *testing.T) {
 		t.Errorf("Expected item to still be in queue after RemoveItem with namespace-agnostic name")
 	}
 
-	// Re-add item since Get popped it
-	q.Add(namespacedName, key1)
+	// Re-add item since Get popped it (Release: the pop reserved the key, so
+	// a bare Add would be dropped).
+	q.Release(namespacedName, key1)
 
 	// Verify that namespace-agnostic warm pool name does NOT work to RemoveQueue
 	q.RemoveQueue(wpName)
 	_, ok = q.Get(namespacedName)
 	if !ok {
 		t.Errorf("Expected queue to still exist after RemoveQueue with namespace-agnostic name")
+	}
+}
+
+// TestSimpleSandboxQueue_PopReservesAgainstReAdd pins the round-8 double-bind
+// fix: a popped key is reserved, so watch-event re-adds during the adoption
+// window are dropped instead of handing the same sandbox to a second claim.
+func TestSimpleSandboxQueue_PopReservesAgainstReAdd(t *testing.T) {
+	q := NewSimpleSandboxQueue()
+	pool := "default/pool-1"
+	key := SandboxKey{Namespace: "default", Name: "sb-1"}
+
+	q.Add(pool, key)
+	got, ok := q.Get(pool)
+	if !ok || got != key {
+		t.Fatalf("expected to pop %v, got %v (ok=%v)", key, got, ok)
+	}
+	if !q.IsReserved(key.Namespace, key.Name) {
+		t.Fatal("expected the popped key to be reserved")
+	}
+
+	// The leg-S re-add shape: same sandbox, now with a NodeName.
+	q.Add(pool, SandboxKey{Namespace: "default", Name: "sb-1", NodeName: "node-1"})
+	if _, ok := q.Get(pool); ok {
+		t.Fatal("reserved key was re-queued by Add: a second claim could pop it (double-bind)")
+	}
+
+	// GetWithStrategy must reserve too.
+	key2 := SandboxKey{Namespace: "default", Name: "sb-2"}
+	q.Add(pool, key2)
+	if _, ok := q.GetWithStrategy(pool, func(items []SandboxKey) (SandboxKey, bool) { return items[0], true }); !ok {
+		t.Fatal("expected to pop sb-2 via GetWithStrategy")
+	}
+	if !q.IsReserved("default", "sb-2") {
+		t.Fatal("expected GetWithStrategy to reserve the popped key")
+	}
+}
+
+// TestSimpleSandboxQueue_ReleaseAndForget pins the two reservation exits:
+// Release gives the candidate back (unreserve + re-queue); Forget drops the
+// reservation without re-queueing, allowing a future legitimate Add.
+func TestSimpleSandboxQueue_ReleaseAndForget(t *testing.T) {
+	q := NewSimpleSandboxQueue()
+	pool := "default/pool-1"
+	key := SandboxKey{Namespace: "default", Name: "sb-1"}
+
+	q.Add(pool, key)
+	if _, ok := q.Get(pool); !ok {
+		t.Fatal("expected to pop the key")
+	}
+
+	// Release: back in the queue, reservation gone.
+	q.Release(pool, key)
+	if q.IsReserved(key.Namespace, key.Name) {
+		t.Fatal("expected Release to clear the reservation")
+	}
+	got, ok := q.Get(pool)
+	if !ok || got != key {
+		t.Fatalf("expected the released key back, got %v (ok=%v)", got, ok)
+	}
+
+	// Forget: reservation gone, queue stays empty until a fresh Add.
+	q.Forget(key.Namespace, key.Name)
+	if q.IsReserved(key.Namespace, key.Name) {
+		t.Fatal("expected Forget to clear the reservation")
+	}
+	if _, ok := q.Get(pool); ok {
+		t.Fatal("Forget must not re-queue the key")
+	}
+	q.Add(pool, key)
+	if _, ok := q.Get(pool); !ok {
+		t.Fatal("expected Add to work again after Forget")
+	}
+}
+
+// TestSimpleSandboxQueue_RemoveItemClearsReservation: a sandbox DELETE while
+// its key is reserved must clear the reservation — a same-name recreation is
+// a new object and must be addable.
+func TestSimpleSandboxQueue_RemoveItemClearsReservation(t *testing.T) {
+	q := NewSimpleSandboxQueue()
+	pool := "default/pool-1"
+	key := SandboxKey{Namespace: "default", Name: "sb-1"}
+
+	q.Add(pool, key)
+	if _, ok := q.Get(pool); !ok {
+		t.Fatal("expected to pop the key")
+	}
+	q.RemoveItem(pool, key)
+	if q.IsReserved(key.Namespace, key.Name) {
+		t.Fatal("expected RemoveItem to clear the reservation")
+	}
+	q.Add(pool, key)
+	if _, ok := q.Get(pool); !ok {
+		t.Fatal("expected Add to work after RemoveItem cleared the reservation")
 	}
 }

@@ -5880,8 +5880,11 @@ func TestSandboxClaimColdStartDeferredWhilePoolHasAdoptableMembers(t *testing.T)
 		if err != nil {
 			t.Fatalf("pass %d: expected nil error while deferring cold start, got: %v", pass, err)
 		}
-		if res.RequeueAfter != adoptionCacheLagRequeueDelay {
-			t.Fatalf("pass %d: expected bounded requeue %v while pool has adoptable members, got %v", pass, adoptionCacheLagRequeueDelay, res.RequeueAfter)
+		// The requeue delay follows the adaptive schedule (round-8): 50ms for
+		// the first few passes, then growing to the 500ms cap so mass
+		// deferrals cannot starve the pool controller.
+		if want := coldStartDeferralRequeueDelay(pass); res.RequeueAfter != want {
+			t.Fatalf("pass %d: expected bounded requeue %v while pool has adoptable members, got %v", pass, want, res.RequeueAfter)
 		}
 		coldSb := &sandboxv1beta1.Sandbox{}
 		if err := fakeClient.Get(ctx, types.NamespacedName{Name: "test-claim", Namespace: "default"}, coldSb); !k8errors.IsNotFound(err) {
@@ -6759,5 +6762,30 @@ func TestSandboxClaimStalePassOnBoundClaimNoReadoptionNoColdStart(t *testing.T) 
 	}
 	if _, ok := finalSb2.Labels[warmPoolSandboxLabel]; !ok {
 		t.Error("expected warm-sb-2 to remain in the warm pool (not burned by a stale pass)")
+	}
+}
+
+// TestColdStartDeferralRequeueDelaySchedule pins the backlog-aware pacing of
+// cold-start deferral polls (round-8 leg-S starvation fix): the first few
+// deferrals keep the low-latency 50ms cadence, then the delay grows and
+// saturates at 500ms so claims stuck behind an exhausted pool poll at 2/s
+// instead of 20/s.
+func TestColdStartDeferralRequeueDelaySchedule(t *testing.T) {
+	cases := []struct {
+		deferrals int
+		want      time.Duration
+	}{
+		{0, 50 * time.Millisecond},
+		{1, 50 * time.Millisecond},
+		{4, 50 * time.Millisecond},
+		{5, 100 * time.Millisecond},
+		{8, 250 * time.Millisecond},
+		{13, 500 * time.Millisecond},
+		{40, 500 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		if got := coldStartDeferralRequeueDelay(tc.deferrals); got != tc.want {
+			t.Errorf("coldStartDeferralRequeueDelay(%d) = %v, want %v", tc.deferrals, got, tc.want)
+		}
 	}
 }

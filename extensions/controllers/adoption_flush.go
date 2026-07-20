@@ -56,16 +56,25 @@ import (
 //
 // CORRECTNESS INVENTORY (each item has a pinned test):
 //
+//   - In-process exclusivity across the WHOLE window: the queue pop that
+//     selected the candidate also RESERVED it (queue.SandboxQueue reservation
+//     semantics, round-8) — watch events observed while the sandbox still
+//     looks pool-owned in the cache (NodeName scheduling writes, adoptable
+//     transitions replayed from stale object states) cannot re-queue it for
+//     a second claim. Reservations end only via explicit Release (give-back)
+//     or the sandbox DELETE event.
+//
 //   - Cross-process safety net: the async patch keeps the optimistic lock.
 //     If ANOTHER writer took the sandbox during the window, the patch 409s;
-//     the flusher re-verifies against a fresh read and either retries (benign
-//     resourceVersion bump — e.g. a sandbox status write — with the sandbox
-//     still pool-owned) or, on a genuine steal, clears the claim's stale
-//     binding (status re-write) so the claim re-adopts. Bounded retries, loud
-//     logging. NOTE: multi-process operation over the same namespaces
-//     (no leader election, overlapping --watch-namespaces shards) widens this
-//     window from "leader-failover only" to "every adoption"; leader election
-//     makes steals rare, namespace sharding removes them by construction.
+//     the flusher re-verifies against a fresh DIRECT (non-cached) read and
+//     either retries (benign resourceVersion bump — e.g. a sandbox status
+//     write — with the sandbox still pool-owned) or, on a genuine steal,
+//     clears the claim's stale binding (status re-write, also via direct
+//     reads) so the claim re-adopts. Bounded retries, loud logging. NOTE:
+//     multi-process operation over the same namespaces (no leader election,
+//     overlapping --watch-namespaces shards) widens this window from
+//     "leader-failover only" to "every adoption"; leader election makes
+//     steals rare, namespace sharding removes them by construction.
 //
 //   - Crash window (status written, sandbox unpatched, process died): the
 //     status-name fast path in getOrCreateSandbox tolerates a still-pool-owned
@@ -113,10 +122,10 @@ const (
 	// keeps the worst-case async window (attempts x (RTT + delay)) inside the
 	// sub-second bound the flag documents.
 	adoptionFlushRetryDelay = 100 * time.Millisecond
-	// adoptionFlushClearAttempts bounds the lost-binding status clear. It is
-	// more patient than the patch loop because its only enemy is our own
-	// informer lag (the fresh read must first observe the status this
-	// controller just wrote).
+	// adoptionFlushClearAttempts bounds the lost-binding status clear. Its
+	// reads bypass the informer cache (directGet), so retries only fire on
+	// transient API errors and genuine optimistic-lock conflicts — never on
+	// cache lag.
 	adoptionFlushClearAttempts = 10
 )
 
@@ -249,7 +258,10 @@ func (r *SandboxClaimReconciler) processAdoptionFlush(ctx context.Context, req *
 		if err == nil {
 			// The window is closed: ownership, labels and the safe-to-evict
 			// strip are on the server; the sandbox controller's next reconcile
-			// propagates them to the live pod.
+			// propagates them to the live pod. The warm-queue reservation
+			// taken at pop time is deliberately KEPT (cleared by the sandbox
+			// DELETE event): it shields the adopted sandbox from stale watch
+			// events re-queueing it during cache convergence.
 			if logger.V(1).Enabled() {
 				adoptionTimingLog.Info("adoption async patch",
 					uberzap.String("claim", req.claim.Namespace+"/"+req.claim.Name),
@@ -272,9 +284,15 @@ func (r *SandboxClaimReconciler) processAdoptionFlush(ctx context.Context, req *
 		}
 
 		// Optimistic-lock conflict or object gone: another writer touched the
-		// sandbox since it was reserved. Re-verify before deciding.
+		// sandbox since it was reserved. Re-verify before deciding — with a
+		// DIRECT read: under a sustained watch backlog the informer cache
+		// lags the server by seconds, and a cached re-read still shows the
+		// pre-conflict pool-owned sandbox, misclassifying every steal as a
+		// "benign conflict". The flusher then burned its attempts rebuilding
+		// stale patches and finally RE-QUEUED an already-adopted candidate
+		// (leg S 2026-07-20: double-bind amplifier + wedged losers).
 		fresh := &v1beta1.Sandbox{}
-		getErr := r.Get(ctx, client.ObjectKey{Namespace: req.mutated.Namespace, Name: req.mutated.Name}, fresh)
+		getErr := r.directGet(ctx, client.ObjectKey{Namespace: req.mutated.Namespace, Name: req.mutated.Name}, fresh)
 		switch {
 		case k8errors.IsNotFound(getErr):
 			// Deleted during the window (pool excess-deletion / stale-template
@@ -330,12 +348,14 @@ func (r *SandboxClaimReconciler) processAdoptionFlush(ctx context.Context, req *
 		}
 	}
 
-	// Attempts exhausted with the sandbox (last observed) still pool-owned:
-	// give the candidate back to the queue — it was never patched, so it is
-	// still a valid pool member — and clear the claim binding for re-adoption.
+	// Attempts exhausted with the sandbox (last observed, via direct read)
+	// still pool-owned: give the candidate back to the queue — it was never
+	// patched, so it is still a valid pool member — and clear the claim
+	// binding for re-adoption. Release (not Add) so the reservation taken at
+	// pop time is cleared with the give-back.
 	logger.Error(nil, "Async adoption sandbox patch attempts exhausted; returning candidate to the warm queue and clearing the claim binding",
 		"attempts", adoptionFlushMaxAttempts)
-	r.WarmSandboxQueue.Add(req.poolQueue, req.queueKey)
+	r.WarmSandboxQueue.Release(req.poolQueue, req.queueKey)
 	r.recoverLostAdoption(ctx, req, "async adoption patch attempts exhausted")
 }
 
@@ -358,8 +378,17 @@ func (r *SandboxClaimReconciler) recoverLostAdoption(ctx context.Context, req *a
 	}
 
 	for attempt := 1; attempt <= adoptionFlushClearAttempts; attempt++ {
+		// DIRECT read, never the informer cache: the claim status this
+		// recovery must clear was written by this controller moments ago, and
+		// under a sustained watch backlog the cache lags the server by
+		// seconds. The previous cache-based read either saw a pre-bind view
+		// and waited for "its own write to appear" until the bounded attempts
+		// ran out — leaving the claim wedged on a sandbox it will never own
+		// (leg S 2026-07-20: ~4,300 claims timed out this way) — or, worse,
+		// could mistake a stale unbound view for "already rebound". A direct
+		// GET is authoritative on both questions in one RTT.
 		claim := &extensionsv1beta1.SandboxClaim{}
-		if err := r.Get(ctx, key, claim); err != nil {
+		if err := r.directGet(ctx, key, claim); err != nil {
 			if k8errors.IsNotFound(err) {
 				return // claim gone; nothing to clear
 			}
@@ -373,18 +402,8 @@ func (r *SandboxClaimReconciler) recoverLostAdoption(ctx context.Context, req *a
 			return // deleted and recreated under the same name
 		}
 		if claim.Status.SandboxStatus.Name != sandboxName {
-			// Either the binding already moved on (a reconcile pass observed
-			// the steal and re-adopted — done), or the cached view predates the
-			// status write this controller itself made. Only the latter needs
-			// patience: our own last-written record tells the two apart.
-			if entry, ok := r.lastWrittenStatuses.Load(key); ok && entry.uid == claim.UID &&
-				entry.status.SandboxStatus.Name == sandboxName {
-				logger.V(1).Info("Lost-adoption recovery waiting for own status write to appear in the cache", "attempt", attempt)
-				if !sleepCtx(ctx, adoptionFlushRetryDelay) {
-					return
-				}
-				continue
-			}
+			// The binding already moved on: a reconcile pass observed the
+			// steal and re-adopted, or a concurrent recovery cleared it.
 			logger.Info("Lost-adoption recovery found the claim already rebound or cleared; nothing to do",
 				"boundSandbox", claim.Status.SandboxStatus.Name)
 			return

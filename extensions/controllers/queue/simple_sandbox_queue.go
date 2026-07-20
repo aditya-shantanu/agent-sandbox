@@ -27,51 +27,140 @@ type SandboxKey struct {
 
 // SandboxQueue defines the interface for managing a thread-safe,
 // highly concurrent queue of adoptable warm pool sandboxes.
+//
+// RESERVATION SEMANTICS (round-8 double-bind fix): popping a key (Get /
+// GetWithStrategy) also RESERVES it — until the reservation is cleared, Add
+// is a no-op for that sandbox. This closes the re-add leak that produced
+// double-bound sandboxes at sustained rate: with one-write adoption the
+// popped candidate stays pool-owned and adoptable in the informer cache for
+// the whole async-patch window, so watch events observed during the window
+// (most commonly the pod-scheduling NodeName status write re-triggering
+// sandboxEventHandler.Update) re-Added the key and a second claim popped and
+// status-bound the same sandbox (leg S 2026-07-20: 3,204 of 5,457 bound
+// sandboxes were bound by 2+ claims). A reservation is cleared only by:
+//   - Release: the holder gives the candidate back (verify failed
+//     cross-namespace, adoption attempt failed, flush attempts exhausted with
+//     the sandbox still pool-owned) — clears the reservation AND re-adds;
+//   - Forget: the sandbox is confirmed gone or no longer pool material
+//     (ghost pop, sandbox DELETE event) — clears without re-adding, so a
+//     later legitimate adoptable transition can re-add it.
+//
+// Terminal adoption outcomes (async patch landed, steal by another owner)
+// deliberately KEEP the reservation: the sandbox has permanently left the
+// pool, and holding the reservation until its DELETE event Forgets it makes
+// late stale watch events (delivered from pre-adoption object states)
+// harmless. Reservations are process-local, like the queue itself.
 type SandboxQueue interface {
 	Add(namespacedWarmPoolName string, item SandboxKey)
 	Get(namespacedWarmPoolName string) (SandboxKey, bool)
 	GetWithStrategy(namespacedWarmPoolName string, pick func([]SandboxKey) (SandboxKey, bool)) (SandboxKey, bool)
 	RemoveQueue(namespacedWarmPoolName string)
 	RemoveItem(namespacedWarmPoolName string, item SandboxKey)
+	// Release clears the item's reservation and returns it to the queue.
+	Release(namespacedWarmPoolName string, item SandboxKey)
+	// Forget clears any reservation for the sandbox without re-queueing it.
+	Forget(namespace, name string)
+	// IsReserved reports whether the sandbox is currently reserved (popped by
+	// an adoption transaction whose outcome is not yet terminal).
+	IsReserved(namespace, name string) bool
 }
 
 // SimpleSandboxQueue implements SandboxQueue using simple synchronized slices.
 type SimpleSandboxQueue struct {
 	// queues is a thread-safe dictionary from warm pool name to a synchronizedQueue
 	queues sync.Map
+
+	// reservedMu guards reserved.
+	reservedMu sync.Mutex
+	// reserved holds "namespace/name" keys popped from any pool queue whose
+	// adoption transaction has not reached a terminal state. Reserved keys
+	// cannot re-enter any queue via Add. See the interface comment.
+	reserved map[string]struct{}
 }
 
 // NewSimpleSandboxQueue initializes a new SimpleSandboxQueue.
 func NewSimpleSandboxQueue() *SimpleSandboxQueue {
-	return &SimpleSandboxQueue{}
+	return &SimpleSandboxQueue{reserved: make(map[string]struct{})}
 }
 
-// Add pushes an item to the specific warm pool's queue.
+func reservationID(namespace, name string) string { return namespace + "/" + name }
+
+func (s *SimpleSandboxQueue) reserve(item SandboxKey) {
+	s.reservedMu.Lock()
+	defer s.reservedMu.Unlock()
+	s.reserved[reservationID(item.Namespace, item.Name)] = struct{}{}
+}
+
+func (s *SimpleSandboxQueue) unreserve(namespace, name string) {
+	s.reservedMu.Lock()
+	defer s.reservedMu.Unlock()
+	delete(s.reserved, reservationID(namespace, name))
+}
+
+// IsReserved reports whether the sandbox is currently reserved.
+func (s *SimpleSandboxQueue) IsReserved(namespace, name string) bool {
+	s.reservedMu.Lock()
+	defer s.reservedMu.Unlock()
+	_, ok := s.reserved[reservationID(namespace, name)]
+	return ok
+}
+
+// Add pushes an item to the specific warm pool's queue. Reserved items are
+// silently dropped: they are in an in-flight adoption transaction and must
+// not be handed to a second claim (the double-bind fix).
 func (s *SimpleSandboxQueue) Add(namespacedWarmPoolName string, item SandboxKey) {
+	if s.IsReserved(item.Namespace, item.Name) {
+		return
+	}
 	q, _ := s.queues.LoadOrStore(namespacedWarmPoolName, newSynchronizedQueue())
 	q.(*synchronizedQueue).Push(item)
 }
 
-// Get pops an item from the specific warm pool's queue.
+// Release clears the item's reservation and returns it to the queue. Callers
+// use it on every intentional give-back of a popped candidate.
+func (s *SimpleSandboxQueue) Release(namespacedWarmPoolName string, item SandboxKey) {
+	s.unreserve(item.Namespace, item.Name)
+	s.Add(namespacedWarmPoolName, item)
+}
+
+// Forget clears any reservation for the sandbox without re-queueing it.
+// Called on sandbox deletion (any owner) and on ghost pops.
+func (s *SimpleSandboxQueue) Forget(namespace, name string) {
+	s.unreserve(namespace, name)
+}
+
+// Get pops an item from the specific warm pool's queue and reserves it.
 func (s *SimpleSandboxQueue) Get(namespacedWarmPoolName string) (SandboxKey, bool) {
 	q, ok := s.queues.Load(namespacedWarmPoolName)
 	if !ok {
 		return SandboxKey{}, false
 	}
-	return q.(*synchronizedQueue).Pop()
+	item, ok := q.(*synchronizedQueue).Pop()
+	if ok {
+		s.reserve(item)
+	}
+	return item, ok
 }
 
-// GetWithStrategy pops an item from the specific warm pool's queue using a custom strategy.
+// GetWithStrategy pops an item from the specific warm pool's queue using a
+// custom strategy, and reserves it.
 func (s *SimpleSandboxQueue) GetWithStrategy(namespacedWarmPoolName string, pick func([]SandboxKey) (SandboxKey, bool)) (SandboxKey, bool) {
 	q, ok := s.queues.Load(namespacedWarmPoolName)
 	if !ok {
 		return SandboxKey{}, false
 	}
-	return q.(*synchronizedQueue).PopWithStrategy(pick)
+	item, ok := q.(*synchronizedQueue).PopWithStrategy(pick)
+	if ok {
+		s.reserve(item)
+	}
+	return item, ok
 }
 
-// RemoveItem deletes a specific sandbox from a warm pool's queue.
+// RemoveItem deletes a specific sandbox from a warm pool's queue and clears
+// any reservation (the sandbox is gone; a same-name recreation is a new
+// object and must be addable).
 func (s *SimpleSandboxQueue) RemoveItem(namespacedWarmPoolName string, item SandboxKey) {
+	s.unreserve(item.Namespace, item.Name)
 	if q, ok := s.queues.Load(namespacedWarmPoolName); ok {
 		sq := q.(*synchronizedQueue)
 		sq.Remove(item)
@@ -210,6 +299,8 @@ func (q *synchronizedQueue) PopWithStrategy(pick func([]SandboxKey) (SandboxKey,
 
 // RemoveQueue completely deletes a warm pool's queue from the sync.Map
 // to prevent memory leaks when SandboxTemplates or WarmPools are deleted.
+// Reservations are deliberately left intact: they belong to in-flight
+// adoption transactions, not to the pool's queue.
 func (s *SimpleSandboxQueue) RemoveQueue(namespacedWarmPoolName string) {
 	s.queues.Delete(namespacedWarmPoolName)
 }
