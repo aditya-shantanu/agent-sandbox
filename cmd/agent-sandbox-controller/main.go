@@ -128,16 +128,16 @@ func main() {
 			"<=0 disables; 1 samples all events; N>1 samples ~1/N events (e.g. 10 ~= 1/10, 100 ~= 1/100).")
 	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", -1.0, "Client-side QPS limit for the Kubernetes API client (default: -1, no client-side rate limiting)")
 	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 10, "The maximum burst for client-side throttling of the Kubernetes API client.")
-	flag.IntVar(&apiConnections, "api-connections", 1,
+	flag.IntVar(&apiConnections, "api-connections", 4,
 		"Number of independent HTTP/2 connections to the API server for non-watch traffic (writes, uncached reads, events, leader election). "+
 			"The kube-apiserver allows at most ~100 concurrent in-flight requests per HTTP/2 connection (SETTINGS_MAX_CONCURRENT_STREAMS, "+
 			"server default 100), so a single connection caps effective concurrency at ~100 regardless of worker count or QPS settings. "+
 			"Values > 1 shard requests round-robin across that many pre-established connections (~N*100 in-flight ceiling). "+
-			"1 (default) preserves the stock single-connection client exactly.")
-	flag.BoolVar(&separateWatchConnection, "separate-watch-connection", false,
+			"Default 4 (validated in the gate-zero A/B benchmark); set =1 to restore the legacy single-connection client.")
+	flag.BoolVar(&separateWatchConnection, "separate-watch-connection", true,
 		"Give the manager's informer cache (list/watch streams) a dedicated HTTP/2 connection to the API server, isolated from write traffic. "+
 			"Prevents watch event delivery to informers from stalling behind bursts of concurrent writes that saturate the shared "+
-			"connection's HTTP/2 stream budget. Default false preserves the stock shared-connection behavior.")
+			"connection's HTTP/2 stream budget. Default on (validated in the gate-zero A/B benchmark); set =false to restore the legacy shared-connection behavior.")
 	flag.IntVar(&sandboxConcurrentWorkers, "sandbox-concurrent-workers", 1, "Max concurrent reconciles for the Sandbox controller")
 	flag.IntVar(&sandboxClaimConcurrentWorkers, "sandbox-claim-concurrent-workers", 50, "Max concurrent reconciles for the SandboxClaim controller")
 	flag.IntVar(&sandboxWarmPoolConcurrentWorkers, "sandbox-warm-pool-concurrent-workers", 1, "Max concurrent reconciles for the SandboxWarmPool controller")
@@ -169,7 +169,7 @@ func main() {
 			"same-process metrics and trace propagation, and adoption crash recovery is unaffected (it uses the "+
 			"claim-UID label index on Sandboxes, not the annotation). Costs the on-object debugging breadcrumbs and, "+
 			"after a controller restart, the startup-latency metric for claims first observed by the previous process.")
-	flag.BoolVar(&oneWriteAdoption, "one-write-adoption", false,
+	flag.BoolVar(&oneWriteAdoption, "one-write-adoption", true,
 		"Commit warm-pool adoption with a single critical write: the claim status patch (sandbox binding + podIPs + forwarded "+
 			"Ready) is written FIRST, and the sandbox-side patch (ownership transfer, warm-pool label removal, claim-uid label, "+
 			"safe-to-evict strip) is applied asynchronously by a bounded flush worker (sub-second target), so claims observe Ready "+
@@ -179,8 +179,8 @@ func main() {
 			"on the in-process adoption queue — keep leader election on (default) and use disjoint --watch-namespaces shards for "+
 			"multi-instance deployments; running multiple active instances over the SAME namespaces widens the steal window from "+
 			"leader-failover-only to every adoption. The claimed pod also keeps the cluster-autoscaler safe-to-evict=true annotation "+
-			"until the async patch and the next sandbox reconcile land (sub-second exposure to scale-down eviction). Default false "+
-			"preserves today's 2-write adoption transaction exactly.")
+			"until the async patch and the next sandbox reconcile land (sub-second exposure to scale-down eviction). Default on "+
+			"(validated in the gate-zero A/B benchmark); set =false to restore the legacy 2-write adoption transaction exactly.")
 	flag.BoolVar(&cacheLabelSelectors, "cache-label-selectors", false,
 		"Scope the manager's Pod and Service informer caches to objects carrying the sandbox tracking label ("+
 			controllers.SandboxNameHashLabel+"). The controller only ever creates/looks up pods and Services it "+
@@ -188,16 +188,16 @@ func main() {
 			"CPU, and cache memory from O(cluster) to O(sandboxes). CAVEAT: externally pre-provisioned resources "+
 			"that rely on the "+"agents.x-k8s.io/adoptable=true adoption path MUST also carry the tracking label "+
 			"(value = the owning sandbox's name hash) to remain visible to the controller when this flag is enabled.")
-	flag.DurationVar(&sandboxWriteBehindWindow, "sandbox-write-behind-window", 0,
+	flag.DurationVar(&sandboxWriteBehindWindow, "sandbox-write-behind-window", 250*time.Millisecond,
 		"Coalescing window for the Sandbox controller's recoverable metadata-only writes (the pod label/annotation "+
 			"reconciliation patch and the sandbox pod-name annotation). When > 0, multiple pending mutations to the "+
 			"same object are merged into ONE merge patch flushed within the window; the pod metadata patch is "+
 			"additionally capped at 1s so the adoption-path safe-to-evict strip cannot lag the cluster autoscaler. "+
 			"Mutations lost in a crash are recomputed by the next level-based reconcile (informer state is the source "+
-			"of truth), and pending patches are drained on graceful shutdown. 0 (default) keeps every write "+
-			"synchronous, exactly the stock behavior. Status writes, creates/deletes, and ownership transfers are "+
-			"never deferred.")
-	flag.BoolVar(&noSpecAdoption, "no-spec-adoption", false,
+			"of truth), and pending patches are drained on graceful shutdown. Default 250ms (validated in the "+
+			"gate-zero A/B benchmark); set =0 to restore the legacy fully-synchronous write path. Status writes, "+
+			"creates/deletes, and ownership transfers are never deferred.")
+	flag.BoolVar(&noSpecAdoption, "no-spec-adoption", true,
 		"Enable ownership-derived pod hygiene in the Sandbox controller (the sandbox-side half of the no-spec-adoption "+
 			"protocol, see optimizations/ROUND6-COALESCING.md): when a Sandbox is controlled by a SandboxClaim, the "+
 			"cluster-autoscaler.kubernetes.io/safe-to-evict=\"true\" template annotation is treated as absent — never "+
@@ -205,7 +205,8 @@ func main() {
 			"rewrote spec.podTemplate during adoption. This is the prerequisite for a claim controller that adopts "+
 			"with a metadata-only patch (no spec rewrite -> no generation bump -> no forced sandbox status write, "+
 			"-1 write per adoption). Safe to enable standalone; behavioral delta: claim-owned cold-start pods whose "+
-			"template explicitly sets safe-to-evict=true also have the marker suppressed (strictly safer). Default off.")
+			"template explicitly sets safe-to-evict=true also have the marker suppressed (strictly safer). Default on "+
+			"(validated in the gate-zero A/B benchmark); set =false to restore the legacy behavior.")
 	opts := zap.Options{
 		Development: false,
 	}
