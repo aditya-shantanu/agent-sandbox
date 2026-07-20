@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	"sigs.k8s.io/agent-sandbox/internal/version"
+	"sigs.k8s.io/agent-sandbox/internal/writebehind"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -88,6 +89,8 @@ func main() {
 	var disableClaimObservabilityAnnotations bool
 	var oneWriteAdoption bool
 	var cacheLabelSelectors bool
+	var sandboxWriteBehindWindow time.Duration
+	var noSpecAdoption bool
 	var printVersion bool
 	var webhookPort int
 	var webhookCertDir string
@@ -185,6 +188,24 @@ func main() {
 			"CPU, and cache memory from O(cluster) to O(sandboxes). CAVEAT: externally pre-provisioned resources "+
 			"that rely on the "+"agents.x-k8s.io/adoptable=true adoption path MUST also carry the tracking label "+
 			"(value = the owning sandbox's name hash) to remain visible to the controller when this flag is enabled.")
+	flag.DurationVar(&sandboxWriteBehindWindow, "sandbox-write-behind-window", 0,
+		"Coalescing window for the Sandbox controller's recoverable metadata-only writes (the pod label/annotation "+
+			"reconciliation patch and the sandbox pod-name annotation). When > 0, multiple pending mutations to the "+
+			"same object are merged into ONE merge patch flushed within the window; the pod metadata patch is "+
+			"additionally capped at 1s so the adoption-path safe-to-evict strip cannot lag the cluster autoscaler. "+
+			"Mutations lost in a crash are recomputed by the next level-based reconcile (informer state is the source "+
+			"of truth), and pending patches are drained on graceful shutdown. 0 (default) keeps every write "+
+			"synchronous, exactly the stock behavior. Status writes, creates/deletes, and ownership transfers are "+
+			"never deferred.")
+	flag.BoolVar(&noSpecAdoption, "no-spec-adoption", false,
+		"Enable ownership-derived pod hygiene in the Sandbox controller (the sandbox-side half of the no-spec-adoption "+
+			"protocol, see optimizations/ROUND6-COALESCING.md): when a Sandbox is controlled by a SandboxClaim, the "+
+			"cluster-autoscaler.kubernetes.io/safe-to-evict=\"true\" template annotation is treated as absent — never "+
+			"propagated to the Pod and stripped from a Pod carrying it — regardless of whether the claim controller "+
+			"rewrote spec.podTemplate during adoption. This is the prerequisite for a claim controller that adopts "+
+			"with a metadata-only patch (no spec rewrite -> no generation bump -> no forced sandbox status write, "+
+			"-1 write per adoption). Safe to enable standalone; behavioral delta: claim-owned cold-start pods whose "+
+			"template explicitly sets safe-to-evict=true also have the marker suppressed (strictly safer). Default off.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -461,11 +482,33 @@ func main() {
 	// Register the custom Sandbox metric collector globally.
 	asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
 
+	var writeBehindFlusher *writebehind.Flusher
+	if sandboxWriteBehindWindow > 0 {
+		writeBehindFlusher, err = writebehind.New(mgr.GetClient(), mgr.GetScheme(), writebehind.Options{
+			Window: sandboxWriteBehindWindow,
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to build write-behind flusher")
+			os.Exit(1)
+		}
+		if err := mgr.Add(writeBehindFlusher); err != nil {
+			setupLog.Error(err, "unable to register write-behind flusher with manager")
+			os.Exit(1)
+		}
+		setupLog.Info("Sandbox controller write-behind coalescing enabled (--sandbox-write-behind-window)",
+			"window", sandboxWriteBehindWindow, "podPatchBound", "1s")
+	}
+	if noSpecAdoption {
+		setupLog.Info("ownership-derived pod hygiene enabled (--no-spec-adoption): claim-owned pods never carry safe-to-evict=true")
+	}
+
 	if err = (&controllers.SandboxReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Tracer:        instrumenter,
-		ClusterDomain: clusterDomain,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Tracer:         instrumenter,
+		ClusterDomain:  clusterDomain,
+		WriteBehind:    writeBehindFlusher,
+		NoSpecAdoption: noSpecAdoption,
 	}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)

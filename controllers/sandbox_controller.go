@@ -45,6 +45,7 @@ import (
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	"sigs.k8s.io/agent-sandbox/internal/rawpatch"
+	"sigs.k8s.io/agent-sandbox/internal/writebehind"
 )
 
 const (
@@ -59,6 +60,19 @@ const (
 	podSandboxNameHashIndex     = ".metadata.labels[" + sandboxLabel + "]"
 	sandboxControllerFieldOwner = "sandbox-controller"
 	immediateRequeueDelay       = time.Millisecond
+	// autoscalerSafeToEvictAnnotation marks a pod as evictable by the cluster
+	// autoscaler. The warm pool stamps it "true" on pool-owned pods so idle
+	// warm capacity can be scaled down; once a pod backs a claimed sandbox it
+	// must NOT carry the marker (an eviction would kill an in-use sandbox).
+	// Kept in sync with the identical const in extensions/controllers.
+	autoscalerSafeToEvictAnnotation = "cluster-autoscaler.kubernetes.io/safe-to-evict"
+	// podMetadataFlushBound caps how long a write-behind pod metadata patch
+	// may stay pending. The pod metadata patch on the adoption path is what
+	// strips autoscalerSafeToEvictAnnotation from the live Pod; the agreed
+	// risk bound for that eviction window is <1s (cluster-autoscaler scan
+	// intervals are 10s+, so a sub-second deferral cannot realistically lose
+	// the race), hence pod patches always flush within min(window, 1s).
+	podMetadataFlushBound = time.Second
 )
 
 // PodCacheTransform is a client-go informer transform for the manager's Pod
@@ -162,6 +176,32 @@ type SandboxReconciler struct {
 	Scheme        *runtime.Scheme
 	Tracer        asmetrics.Instrumenter
 	ClusterDomain string
+
+	// WriteBehind, when non-nil, coalesces this controller's RECOVERABLE
+	// metadata-only writes — the pod label/annotation reconciliation patch
+	// and the sandbox pod-name annotation — into one merge patch per object,
+	// flushed within a bounded window (--sandbox-write-behind-window). nil
+	// (the default) preserves the fully synchronous legacy behavior on the
+	// exact same code paths. Only writes that the next level-based reconcile
+	// recomputes verbatim from informer state are routed here, so a crash
+	// before flush is self-healing: the replacement leader's first reconcile
+	// of the object re-detects the drift and re-issues the mutation. Writes
+	// that are NOT recoverable this way (status writes, ownerRef changes,
+	// creates/deletes) never go through WriteBehind.
+	WriteBehind *writebehind.Flusher
+
+	// NoSpecAdoption enables ownership-derived pod hygiene, the sandbox-side
+	// half of the no-spec-adoption protocol (see
+	// optimizations/ROUND6-COALESCING.md): when a Sandbox is controlled by a
+	// SandboxClaim, the safe-to-evict=true annotation is treated as absent
+	// from spec.podTemplate — not propagated to the Pod, and stripped from a
+	// Pod that carries it — regardless of whether the claim controller
+	// rewrote the spec during adoption. This makes it safe for the claim
+	// controller to skip the spec.podTemplate.ObjectMeta rewrite (and with it
+	// the generation bump + forced sandbox status write) for claims without
+	// AdditionalPodMetadata. Default off: stock behavior derives the strip
+	// purely from the spec rewrite.
+	NoSpecAdoption bool
 }
 
 //+kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
@@ -594,6 +634,51 @@ func computeExtensionPodLabels(sandbox *sandboxv1beta1.Sandbox) map[string]strin
 	return labels
 }
 
+// isClaimControlled reports whether the Sandbox's controller reference points
+// at an extensions-group SandboxClaim, i.e. the sandbox backs a claimed,
+// in-use workload (as opposed to idle warm-pool inventory or a standalone
+// sandbox). Ownership is metadata, not spec: it is stamped atomically by the
+// claim controller's optimistic-locked adoption patch, so this predicate is
+// exactly as trustworthy as the adoption lock itself.
+func isClaimControlled(sandbox *sandboxv1beta1.Sandbox) bool {
+	ref := metav1.GetControllerOf(sandbox)
+	if ref == nil {
+		return false
+	}
+	gvk := schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind)
+	return gvk.Group == extensionsv1beta1.GroupVersion.Group && gvk.Kind == "SandboxClaim"
+}
+
+// metadataDiff converts a before/after snapshot of one object's labels and
+// annotations into a writebehind.Mutation carrying exactly the delta —
+// changed/added keys as sets, removed keys as deletes. Used to route the pod
+// metadata reconciliation through the write-behind coalescer: the resulting
+// merge patch is semantically identical to what client.MergeFrom would have
+// diffed out of the same mutation (sets plus JSON-null deletes on
+// metadata.labels/annotations only).
+func metadataDiff(beforeLabels, afterLabels, beforeAnnotations, afterAnnotations map[string]string) writebehind.Mutation {
+	var mut writebehind.Mutation
+	diff := func(before, after map[string]string) (set map[string]string, del []string) {
+		for k, v := range after {
+			if old, ok := before[k]; !ok || old != v {
+				if set == nil {
+					set = make(map[string]string)
+				}
+				set[k] = v
+			}
+		}
+		for k := range before {
+			if _, ok := after[k]; !ok {
+				del = append(del, k)
+			}
+		}
+		return set, del
+	}
+	mut.SetLabels, mut.DeleteLabels = diff(beforeLabels, afterLabels)
+	mut.SetAnnotations, mut.DeleteAnnotations = diff(beforeAnnotations, afterAnnotations)
+	return mut
+}
+
 // isSystemAnnotation reports whether an annotation key is reserved for the sandbox
 // system and therefore must not be settable through a user-supplied PodTemplate.
 func isSystemAnnotation(key string) bool {
@@ -878,6 +963,22 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			return nil
 		}
 
+		if sandbox.Annotations == nil {
+			sandbox.Annotations = make(map[string]string)
+		}
+		sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation] = podName
+
+		// Recoverable write: the annotation is a pure function of observed
+		// state (the pod's name), the in-memory copy above already serves
+		// THIS pass, and resolvePodName falls back to sandbox.Name — so a
+		// deferred flush lost in a crash is recomputed and re-enqueued by the
+		// next reconcile. Safe to write-behind with the full window.
+		if r.WriteBehind != nil {
+			return r.WriteBehind.Enqueue(ctx, sandbox, writebehind.Mutation{
+				SetAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: podName},
+			}, 0)
+		}
+
 		// Raw single-annotation merge patch: byte-identical to what
 		// DeepCopy+MergeFrom computed here, without serializing the whole
 		// sandbox twice to diff out one annotation (see internal/rawpatch).
@@ -885,10 +986,6 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 		if err != nil {
 			return fmt.Errorf("failed to build pod name annotation patch: %w", err)
 		}
-		if sandbox.Annotations == nil {
-			sandbox.Annotations = make(map[string]string)
-		}
-		sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation] = podName
 		if err := r.Patch(ctx, sandbox, patch); err != nil {
 			return fmt.Errorf("failed to set pod name annotation: %w", err)
 		}
@@ -942,27 +1039,42 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			// No additional action needed — label applied below.
 		}
 
-		// This pod metadata patch must remain synchronous on the adoption path
-		// (it is always a real patch there: the adoption merge adds the
-		// claim-uid label and drops the warm-pool label/safe-to-evict marker
-		// from the template). Deferring or coalescing it is NOT safe:
-		//   - The warm pool marks its pods with
-		//     cluster-autoscaler.kubernetes.io/safe-to-evict=true; adoption
-		//     removes that from the template, and this patch is what strips it
-		//     from the live Pod. A deferral window would let the cluster
-		//     autoscaler evict a pod that is already backing a claimed,
-		//     in-use sandbox.
-		//   - The claim-uid label (agents.x-k8s.io/claim-uid) propagated here
-		//     is used for discovery and shared-template NetworkPolicy pod
-		//     targeting; delaying it leaves the adopted pod outside its
-		//     claim's network-policy selection.
-		// Nothing on the Sandbox-Ready path gates on these labels (the Service
-		// selector uses the name-hash label, which never changes), and the
-		// patch is a single optimistic-lock-free merge patch, so its
-		// synchronous cost is one API round-trip with no 409/backoff risk.
+		// The pod metadata patch on the adoption path is always a real patch:
+		// the adoption merge drops the warm-pool label from the pod and
+		// strips the safe-to-evict marker the pool stamped on it, and updates
+		// the propagated-keys tracking annotations. (Pods do NOT carry the
+		// claim-uid label — agents.x-k8s.io/claim-uid is a system-reserved
+		// key that isSystemLabel blocks from template→pod propagation; claim
+		// discovery uses the SANDBOX's top-level label index.)
+		//
+		// Nothing on the Sandbox-Ready path gates on this patch (the Service
+		// selector uses the name-hash label, which never changes), and every
+		// key it touches is recomputed from informer state on the next
+		// reconcile — so it is RECOVERABLE and eligible for write-behind
+		// coalescing, with one bound: the safe-to-evict strip protects the
+		// adopted pod from cluster-autoscaler eviction, so a deferred flush
+		// must land within podMetadataFlushBound (<1s), well inside any
+		// realistic autoscaler scan interval. Synchronous mode (WriteBehind
+		// nil, the default) keeps the legacy single optimistic-lock-free
+		// merge patch: one API round-trip, no 409/backoff risk.
+		//
+		// Write-behind only applies when the pod is already owned by this
+		// sandbox: ownership transfers (SetControllerReference above,
+		// needsUpdate=true) are adoption-lock-adjacent and stay synchronous.
+		var beforeLabels, beforeAnnotations map[string]string
+		useWriteBehind := r.WriteBehind != nil && ownership == resourceOwnedBySandbox && !needsUpdate
+		if useWriteBehind {
+			beforeLabels = maps.Clone(pod.Labels)
+			beforeAnnotations = maps.Clone(pod.Annotations)
+		}
 		metadataUpdated := r.updatePodMetadata(ctx, pod, sandbox, nameHash)
 		if metadataUpdated || needsUpdate {
-			if err := r.Patch(ctx, pod, patch); err != nil {
+			if useWriteBehind {
+				mut := metadataDiff(beforeLabels, pod.Labels, beforeAnnotations, pod.Annotations)
+				if err := r.WriteBehind.Enqueue(ctx, pod, mut, podMetadataFlushBound); err != nil {
+					return nil, fmt.Errorf("failed to enqueue pod metadata patch: %w", err)
+				}
+			} else if err := r.Patch(ctx, pod, patch); err != nil {
 				return nil, fmt.Errorf("failed to patch pod: %w", err)
 			}
 		}
@@ -1010,10 +1122,17 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 
 	annotations := map[string]string{}
 	var managedAnnotationKeys []string
+	suppressSafeToEvict := r.suppressSafeToEvictForClaim(sandbox)
 	for k, v := range sandbox.Spec.PodTemplate.ObjectMeta.Annotations {
 		// Never let a user-supplied template set system-reserved annotations.
 		if isSystemAnnotation(k) {
 			logger.V(1).Info("Ignoring system-reserved annotation in Sandbox PodTemplate", "key", k)
+			continue
+		}
+		// Ownership-derived hygiene (--no-spec-adoption): claim-owned pods
+		// are created without the autoscaler eviction marker even if the
+		// template still carries it (see suppressSafeToEvictForClaim).
+		if suppressSafeToEvict && k == autoscalerSafeToEvictAnnotation {
 			continue
 		}
 		annotations[k] = v
@@ -1085,9 +1204,42 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	return pod, nil
 }
 
+// suppressSafeToEvictForClaim reports whether the pod-template annotation
+// cluster-autoscaler.kubernetes.io/safe-to-evict="true" must be treated as
+// absent for this sandbox's Pod. This is the sandbox-side half of the
+// no-spec-adoption protocol (flag --no-spec-adoption, default off):
+//
+// Stock adoption rewrites spec.podTemplate.ObjectMeta — deleting the pool's
+// safe-to-evict=true marker from the template — which bumps
+// metadata.generation (any non-metadata change increments generation for CRs
+// with the status subresource: apiextensions-apiserver
+// customresource/strategy.go PrepareForUpdate) and thereby forces one extra
+// sandbox status write per adoption just to refresh
+// conditions[].observedGeneration (see the kstatus rationale on
+// computeReadyCondition). If the claim controller instead adopts with a
+// METADATA-ONLY patch (labels/annotations/ownerRef — no generation bump, no
+// forced status write), the template still carries safe-to-evict=true after
+// adoption; this predicate lets the Pod-side strip key off OWNERSHIP instead
+// of the template rewrite. It mirrors the claim controller's rule exactly
+// ("delete when the template value is 'true'; explicit overrides like
+// 'false' are kept"), so with the flag ON the Pod's final state is identical
+// whether or not the claim controller rewrote the spec — making the two
+// controller flags independently deployable.
+//
+// Behavioral delta when enabled (documented, deliberate): a claim-owned
+// COLD-START sandbox whose template explicitly sets safe-to-evict="true"
+// also has the marker suppressed on its Pod. Stock behavior would keep it;
+// suppressing it is strictly safer (a claim-backed pod is in-use by
+// definition) and keeps warm and cold pods uniform.
+func (r *SandboxReconciler) suppressSafeToEvictForClaim(sandbox *sandboxv1beta1.Sandbox) bool {
+	return r.NoSpecAdoption && isClaimControlled(sandbox) &&
+		sandbox.Spec.PodTemplate.ObjectMeta.Annotations[autoscalerSafeToEvictAnnotation] == "true"
+}
+
 func (r *SandboxReconciler) updatePodMetadata(ctx context.Context, pod *corev1.Pod, sandbox *sandboxv1beta1.Sandbox, nameHash string) bool {
 	logger := log.FromContext(ctx)
 	updated := false
+	suppressSafeToEvict := r.suppressSafeToEvictForClaim(sandbox)
 	if pod.Labels == nil {
 		pod.Labels = make(map[string]string)
 	}
@@ -1178,6 +1330,14 @@ func (r *SandboxReconciler) updatePodMetadata(ctx context.Context, pod *corev1.P
 				logger.V(1).Info("Ignoring system-reserved annotation in Sandbox PodTemplate", "pod", pod.Name, "key", k)
 				continue
 			}
+			// Ownership-derived hygiene (--no-spec-adoption): a claim-owned
+			// pod must not carry the autoscaler eviction marker even while
+			// the (un-rewritten) template still does. Skipping the key here
+			// also keeps it out of managedAnnotationKeys, so the pruning pass
+			// below removes it from the Pod like any other de-templated key.
+			if suppressSafeToEvict && k == autoscalerSafeToEvictAnnotation {
+				continue
+			}
 			if pod.Annotations[k] != v {
 				pod.Annotations[k] = v
 				updated = true
@@ -1205,7 +1365,8 @@ func (r *SandboxReconciler) updatePodMetadata(ctx context.Context, pod *corev1.P
 				}
 				continue
 			}
-			if _, ok := sandbox.Spec.PodTemplate.ObjectMeta.Annotations[k]; !ok {
+			if _, ok := sandbox.Spec.PodTemplate.ObjectMeta.Annotations[k]; !ok ||
+				(suppressSafeToEvict && k == autoscalerSafeToEvictAnnotation) {
 				delete(pod.Annotations, k)
 				updated = true
 			}
