@@ -2932,3 +2932,71 @@ func TestReconcilePoolDeleteConflictRequeues(t *testing.T) {
 	require.NoError(t, c.Get(ctx, types.NamespacedName{Namespace: poolNamespace, Name: member.Name}, got),
 		"member must survive the conflicted delete")
 }
+
+// TestPoolWriterRoutesRefillWritesThroughWriteClient pins the round-8 supply
+// isolation: with WriteClient wired (--pool-dedicated-connection), refill
+// CREATEs and member DELETEs go through it — never through the shared manager
+// client whose connections the claim workers saturate — while reads and
+// status writes stay on the manager client. Nil WriteClient preserves the
+// previous single-client behavior byte-for-byte.
+func TestPoolWriterRoutesRefillWritesThroughWriteClient(t *testing.T) {
+	scheme := newTestScheme()
+	store := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	var mainCreates, mainDeletes, writeCreates, writeDeletes atomic.Int64
+	mainClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			mainCreates.Add(1)
+			return store.Create(ctx, obj, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			mainDeletes.Add(1)
+			return store.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+	writeClient := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			writeCreates.Add(1)
+			return store.Create(ctx, obj, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			writeDeletes.Add(1)
+			return store.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+
+	pool := &extensionsv1beta1.SandboxWarmPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "wp", Namespace: "default", UID: types.UID("wp-uid")},
+	}
+	blueprint := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "wp-member", Namespace: "default"}}
+
+	r := &SandboxWarmPoolReconciler{Client: mainClient, Scheme: scheme, WriteClient: writeClient}
+	if err := r.createPoolSandbox(context.Background(), pool, blueprint); err != nil {
+		t.Fatalf("createPoolSandbox: %v", err)
+	}
+	created := &sandboxv1beta1.Sandbox{}
+	if err := store.Get(context.Background(), types.NamespacedName{Name: "wp-member", Namespace: "default"}, created); err != nil {
+		t.Fatalf("expected the member created in the store: %v", err)
+	}
+	if err := r.deletePoolSandbox(context.Background(), created); err != nil {
+		t.Fatalf("deletePoolSandbox: %v", err)
+	}
+	if writeCreates.Load() != 1 || writeDeletes.Load() != 1 {
+		t.Errorf("expected create+delete on the dedicated write client, got creates=%d deletes=%d",
+			writeCreates.Load(), writeDeletes.Load())
+	}
+	if mainCreates.Load() != 0 || mainDeletes.Load() != 0 {
+		t.Errorf("pool member writes leaked onto the shared manager client: creates=%d deletes=%d",
+			mainCreates.Load(), mainDeletes.Load())
+	}
+
+	// Nil WriteClient: legacy routing through the manager client.
+	r2 := &SandboxWarmPoolReconciler{Client: mainClient, Scheme: scheme}
+	blueprint2 := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "wp-member-2", Namespace: "default"}}
+	if err := r2.createPoolSandbox(context.Background(), pool, blueprint2); err != nil {
+		t.Fatalf("createPoolSandbox (nil WriteClient): %v", err)
+	}
+	if mainCreates.Load() != 1 {
+		t.Errorf("expected the nil-WriteClient create on the manager client, got %d", mainCreates.Load())
+	}
+}

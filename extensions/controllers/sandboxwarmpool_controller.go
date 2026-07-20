@@ -77,6 +77,21 @@ type SandboxWarmPoolReconciler struct {
 	MaxBatchSize           int
 	EnableWarmPoolEviction bool
 
+	// WriteClient, when non-nil, carries the pool's refill CREATEs and member
+	// DELETEs on its own client — wired by main.go to a client with a
+	// DEDICATED HTTP/2 connection (--pool-dedicated-connection). Rationale
+	// (round-8, leg-S supply-collapse fix): the refill writes otherwise share
+	// the round-robin transport shards with every claim-worker write; under a
+	// sustained claim backlog hundreds of concurrent claim-side writes queue
+	// on those connections' stream budgets and the pool's few creates-per-
+	// pass wait behind them, collapsing observed refill to ~2-3 creates/s per
+	// pool against a 100/s token budget (RESULTS.md 2026-07-20 leg S §5).
+	// Server-side the creates already ride the dedicated agent-sandbox-bulk
+	// APF level; this isolates the client side the same way
+	// --separate-watch-connection isolates the watch path. Reads (cache) and
+	// pool status writes stay on the manager client. Nil = previous behavior.
+	WriteClient client.Client
+
 	// ReplenishDelay defers creation of replacement sandboxes after pool
 	// members drop out of the pool (e.g. a burst of SandboxClaims adopting
 	// warm sandboxes). Deferring lets the claim burst consume the API server
@@ -729,10 +744,19 @@ func (r *SandboxWarmPoolReconciler) buildSandboxCR(
 }
 
 // createPoolSandbox creates a full Sandbox CR for the warm pool using a pre-built sandboxCR.
+// poolWriter returns the client for pool-member creates/deletes: the
+// dedicated-connection WriteClient when wired, the manager client otherwise.
+func (r *SandboxWarmPoolReconciler) poolWriter() client.Client {
+	if r.WriteClient != nil {
+		return r.WriteClient
+	}
+	return r.Client
+}
+
 func (r *SandboxWarmPoolReconciler) createPoolSandbox(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool, sandboxCR *sandboxv1beta1.Sandbox) error {
 	logger := log.FromContext(ctx)
 	sandbox := sandboxCR.DeepCopy()
-	if err := r.Create(ctx, sandbox); err != nil {
+	if err := r.poolWriter().Create(ctx, sandbox); err != nil {
 		logger.Error(err, "Failed to create pool sandbox")
 		return err
 	}
@@ -759,7 +783,7 @@ func (r *SandboxWarmPoolReconciler) deletePoolSandbox(ctx context.Context, sb *s
 	logger := log.FromContext(ctx)
 	uid := sb.UID
 	rv := sb.ResourceVersion
-	err := r.Delete(ctx, sb, client.Preconditions{UID: &uid, ResourceVersion: &rv})
+	err := r.poolWriter().Delete(ctx, sb, client.Preconditions{UID: &uid, ResourceVersion: &rv})
 	switch {
 	case err == nil, k8serrors.IsNotFound(err):
 		return nil

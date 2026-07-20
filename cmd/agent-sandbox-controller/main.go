@@ -84,6 +84,7 @@ func main() {
 	var sandboxWarmPoolReplenishDelay time.Duration
 	var sandboxWarmPoolMaxRefillRate float64
 	var enableWarmPoolEviction bool
+	var poolDedicatedConnection bool
 	var disableClaimEvents bool
 	var watchNamespaces string
 	var disableClaimObservabilityAnnotations bool
@@ -153,6 +154,13 @@ func main() {
 			"Composes with --sandbox-warm-pool-replenish-delay: the delay defers the start of refill, the rate shapes its flow. "+
 			"0 (default) leaves refill unpaced (whole deficit per reconcile).")
 	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
+	flag.BoolVar(&poolDedicatedConnection, "pool-dedicated-connection", true,
+		"Give the SandboxWarmPool controller's refill creates and member deletes their own HTTP/2 connection to the API "+
+			"server, isolated from the claim controllers' write traffic. Under a sustained claim backlog the shared "+
+			"round-robin write connections carry hundreds of concurrent claim-side requests; pool refill creates queueing "+
+			"behind them is a measured supply-collapse mode (refill fell to ~2-3 creates/s per pool against a 100/s budget "+
+			"at 300 claims/s sustained). The client-side analogue of --separate-watch-connection for the supply path; "+
+			"server-side APF classification is unchanged. Set =false to restore the shared-connection behavior.")
 	flag.BoolVar(&disableClaimEvents, "disable-claim-events", false,
 		"Disable Kubernetes Event emission from the SandboxClaim controller (hot-path Eventf calls become no-ops), "+
 			"reducing API server writes during large claim bursts.")
@@ -574,6 +582,31 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Dedicated write connection for pool refill (--pool-dedicated-connection):
+		// a client whose HTTP/2 connection is shared with nothing else, so the
+		// supply path's creates never queue behind the claim workers' write storm
+		// on the round-robin shards. newIsolatedHTTPClient copies restConfig and
+		// strips the sharding WrapTransport; a distinct dialer forces a distinct
+		// transport cache entry (same mechanism as --separate-watch-connection).
+		var poolWriteClient client.Client
+		if poolDedicatedConnection {
+			poolHTTPClient, err := newIsolatedHTTPClient(restConfig)
+			if err != nil {
+				setupLog.Error(err, "unable to build dedicated pool write connection client")
+				os.Exit(1)
+			}
+			poolWriteClient, err = client.New(restConfig, client.Options{
+				HTTPClient: poolHTTPClient,
+				Scheme:     mgr.GetScheme(),
+				Mapper:     mgr.GetRESTMapper(),
+			})
+			if err != nil {
+				setupLog.Error(err, "unable to build dedicated pool write client")
+				os.Exit(1)
+			}
+			setupLog.Info("warm-pool refill creates/deletes separated onto a dedicated HTTP/2 connection (--pool-dedicated-connection)")
+		}
+
 		if err = (&extensionscontrollers.SandboxWarmPoolReconciler{
 			Client:                 mgr.GetClient(),
 			Scheme:                 mgr.GetScheme(),
@@ -581,6 +614,7 @@ func main() {
 			EnableWarmPoolEviction: enableWarmPoolEviction,
 			ReplenishDelay:         sandboxWarmPoolReplenishDelay,
 			MaxRefillRate:          sandboxWarmPoolMaxRefillRate,
+			WriteClient:            poolWriteClient,
 		}).SetupWithManager(mgr, sandboxWarmPoolConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxWarmPool")
 			os.Exit(1)
