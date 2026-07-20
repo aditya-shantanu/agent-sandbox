@@ -144,6 +144,17 @@ echo "Using CNI: ${CNI}"
 NODE_COUNT="${NODE_COUNT:-3}"
 echo "Using node count: ${NODE_COUNT}"
 
+# NODE_MACHINE_TYPE (default n2-standard-8) sets the worker node instance
+# type. Exists because node-scale supply runs (RESULTS.md round-8 verdict
+# path 1: 100+ workers for sustained 300/s) exceed the bench project's
+# N2_CPUS regional quota (measured 7708/8000 in use, 2026-07-20 — the
+# effective 34-worker cap of rounds gate-0..8); e2-standard-8 draws from the
+# far-larger general CPUS quota instead. E2's gVisor-era caveats in
+# scaling-guide.pdf (runsc syscall thread pools) do not apply to the runc
+# bench pods.
+NODE_MACHINE_TYPE="${NODE_MACHINE_TYPE:-n2-standard-8}"
+echo "Using node machine type: ${NODE_MACHINE_TYPE}"
+
 # CONTROLLER_ARGS injects extra agent-sandbox-controller flags via
 # deploy-to-kube --controller-args. Empty by default (stock controller
 # configuration). Recommended flags for claim-burst perf runs:
@@ -290,7 +301,13 @@ if [[ "${TUNE_NODES}" == "true" ]]; then
       "--set" "cluster.spec.kubeAPIServer.eventTTL=15m0s"
       "--set" "cluster.spec.kubelet.podPidsLimit=4096"
     )
-    NODE_VOLUME_FLAGS+=("--node-volume-size=200")
+    # NODE_VOLUME_SIZE (default 200, the scaling-guide value) is overridable
+    # because at node scale the 200GB pd-ssd boot disks hit the SSD_TOTAL_GB
+    # regional quota (e.g. 150 workers x 200GB = 30TB vs ~21TB free measured
+    # 2026-07-20). 100GB pd-ssd still provides 3,000 IOPS — round-8 sustained
+    # ~4.4 pod starts/s/node on 6,000-IOPS disks, so at <=2-3 starts/s/node
+    # the halved ceiling keeps the same per-start IOPS margin.
+    NODE_VOLUME_FLAGS+=("--node-volume-size=${NODE_VOLUME_SIZE:-200}")
 fi
 kops create cluster \
   --cloud=gce \
@@ -302,7 +319,7 @@ kops create cluster \
   --control-plane-count=1 \
   --control-plane-size="${CP_MACHINE_TYPE}" \
   --node-count="${NODE_COUNT}" \
-  --node-size=n2-standard-8 \
+  --node-size="${NODE_MACHINE_TYPE}" \
   --set cluster.spec.kubeControllerManager.authorizationAlwaysAllowPaths=/healthz \
   --set cluster.spec.kubeControllerManager.authorizationAlwaysAllowPaths=/readyz \
   --set cluster.spec.kubeControllerManager.authorizationAlwaysAllowPaths=/livez \

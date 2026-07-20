@@ -605,3 +605,60 @@ now confirmed with numbers. The three recorded paths forward:
   pods-to-Ready throughput problem (cluster sizing per paths 1-3 above),
   not a controller defect. Feasibility rule confirmed:
   `nodes × per-node-ready-rate ≥ arrival rate` once the pool drains.
+
+---
+
+## 2026-07-20 — ROUND 9b: sustained-300 with supply ≥ demand (node-scale leg SUST3) — PENDING
+
+Goal: make sustained 300/s DEMONSTRABLE for the full 60s window (supply ≥
+demand) and quantify the supply ceiling. Single leg `SUST3-sustained300`,
+v10 orchestrator (v9 archived), fresh cluster, controller code held at the
+round-8-verified tree (no controller changes in this round — 9a owns those).
+
+**Supply math that sized the config (new forensics on round-8 artifacts):**
+
+- `timeseries.jsonl` shows **livePods peaked at 12,549 pod objects against
+  3,740 slots** — the 34-node cluster was slot-saturated with a ~9k Pending
+  queue. The measured ~47-65 ready/s was **slot turnover**
+  (slots ÷ residence, with residence inflated to ~60-75s by the
+  delete-pipeline backlog), NOT a kubelet/scheduler per-node pipeline limit:
+  scheduled→running held p50 1.1s while nodes absorbed ~4.4 pod starts/s
+  each whenever slots freed. Node/slot count therefore scales the ceiling
+  ~linearly; the "1.5-2 ready/s/node" figure was an artifact of the
+  collapsed regime, and §1.4's 150-200-node estimate is the
+  worst-case-pessimistic bound, not the expectation.
+- Healthy-regime slot demand at 300/s: pool 3,000 + 300/s × ~10s residence
+  (start 1.1s + ready + dwell 1.5s + delete pipeline + termination grace 1s)
+  ≈ **6,000 slots**; 150 workers provide ~16,180 spare slots (2.7×
+  headroom against residence inflation).
+- **Quota reality check (us-central1, measured 2026-07-20):** N2_CPUS
+  7,708/8,000 used — the true reason every round ran 34 workers; ~292 free
+  N2 vCPUs cannot host a node-scale leg at all. CPUS (E2/N1 pool)
+  3,386/10,000 → 150 × e2-standard-8 = 1,200 vCPUs fits; SSD_TOTAL_GB
+  163,251/184,305 → 200GB pd-ssd × 150 (30TB) does NOT fit, 100GB (15TB)
+  does; IN_USE_ADDRESSES 328/575 → 151 more fits. Hence two new run-script
+  knobs: `NODE_MACHINE_TYPE` (e2-standard-8 here) and `NODE_VOLUME_SIZE`
+  (100). Cost ≈ $45/h all-in, ~2.5h ≈ ~$115/run.
+- Refill per R4.6 / the MaxRefillRate sizing comment: pools ≥
+  ceil(300 / 70-85 isolated per-pool rate) = 5; run **8 pools** (8
+  namespaces × 375 replicas, headroom 10s) × cap 100/s, pool workers = 8 —
+  aggregate cap 800/s, expected ≥560/s isolated, ≥208-368/s even at
+  round-8's worst-case contended 26-46/s/pool, vs 300/s demand.
+- Capacity-check formula (tool refuses otherwise): pool 8×ceil(37.5×10s) =
+  3,000 + in-flight ceil(300×(1.5s+5)) = 1,950 → 4,950 ≤ spare ≈ 150×110 −
+  ~320 system ≈ 16,180 (31%, under the 90% warning line).
+
+Config: NODE_COUNT=150 NODE_MACHINE_TYPE=e2-standard-8 NODE_VOLUME_SIZE=100,
+CP n2-standard-16, TUNE_CONTROL_PLANE + TUNE_NODES, composed defaults on,
+clean instrumentation (GAP-1), smoke 20 first;
+`--sustained-rate=300 --sustained-seconds=60 --sustained-namespaces=8
+--claim-dwell=1500ms --sustained-pool-headroom=10s`; controller args as
+round-8 v9 with `--sandbox-warm-pool-concurrent-workers=8`.
+
+Success criteria: ≥95% of ~18,000 ready; steady-state ready throughput
+≥295/s; rolling-window p90s flat across the 60s (no degradation cliff);
+plus a measured supply-ceiling estimate (slot residence, refill margin,
+per-node rates) for SCALE-ROADMAP §1.4.
+
+Artifacts: `gs://kops-state-142966328212/perf-bench-results/round9b/`.
+Results: PENDING.
