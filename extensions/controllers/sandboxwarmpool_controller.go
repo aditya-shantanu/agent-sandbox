@@ -44,6 +44,7 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
+	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
 const (
@@ -756,7 +757,13 @@ func (r *SandboxWarmPoolReconciler) poolWriter() client.Client {
 func (r *SandboxWarmPoolReconciler) createPoolSandbox(ctx context.Context, warmPool *extensionsv1beta1.SandboxWarmPool, sandboxCR *sandboxv1beta1.Sandbox) error {
 	logger := log.FromContext(ctx)
 	sandbox := sandboxCR.DeepCopy()
-	if err := r.poolWriter().Create(ctx, sandbox); err != nil {
+	// Supply-segment decomposition (round 10): the refill CREATE RTT is the
+	// first stage of the ~100-150/s supply pipeline ceiling — client-side
+	// queueing behind claim traffic shows up here (leg-S collapse signature).
+	createStart := time.Now()
+	err := r.poolWriter().Create(ctx, sandbox)
+	asmetrics.RecordSupplySegment("pool_member_create", time.Since(createStart))
+	if err != nil {
 		logger.Error(err, "Failed to create pool sandbox")
 		return err
 	}

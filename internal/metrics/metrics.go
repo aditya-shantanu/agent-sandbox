@@ -144,6 +144,43 @@ var (
 		[]string{"segment"},
 	)
 
+	// SupplySegmentLatency decomposes the warm-pool SUPPLY pipeline — the
+	// round-9b binding constraint (~100-150/s aggregate: refill issuance +
+	// ready marking, RESULTS.md round-9b ladder item 3) — so sustained legs
+	// can attribute a supply ceiling from the standard /metrics scrape,
+	// mirroring AdoptionSegmentLatency on the demand side.
+	//
+	// Segments (label "segment", bounded cardinality):
+	//   - pool_member_create:          warm-pool controller replacement
+	//                                  sandbox CREATE RTT (per create inside
+	//                                  slowStartBatch; queueing behind claim
+	//                                  traffic shows up here);
+	//   - sandbox_create_to_pod_create: sandbox CreationTimestamp -> pod
+	//                                  CREATE issued by the sandbox
+	//                                  controller (informer + workqueue +
+	//                                  reconcile lag; the "refill issuance"
+	//                                  half of the round-9b claim→pod-created
+	//                                  41.9s p50). CreationTimestamp is
+	//                                  SECOND-truncated, so values carry up
+	//                                  to +1s inflation — fine at the
+	//                                  multi-second scales this decomposes;
+	//   - pod_ready_to_sandbox_ready:  pod PodReady lastTransitionTime ->
+	//                                  the sandbox controller pass that first
+	//                                  marks the Sandbox Ready (the
+	//                                  ready-marking half, p50 50.5s in
+	//                                  SUST4; also second-truncated base).
+	//
+	// Buckets run 1ms..600s: healthy values are ms-scale, and the failure
+	// modes being decomposed are tens of seconds to minutes.
+	SupplySegmentLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "agent_sandbox_supply_segment_latency_ms",
+			Help:    "Warm-pool supply pipeline segment latencies in milliseconds, labeled by segment (pool_member_create, sandbox_create_to_pod_create, pod_ready_to_sandbox_ready). Segments with a *_to_* name are measured from second-truncated API timestamps (up to +1s inflation).",
+			Buckets: []float64{1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 200000, 400000, 600000},
+		},
+		[]string{"segment"},
+	)
+
 	buildVersionInfo = version.Get()
 
 	// BuildInfo exposes agent-sandbox-controller build metadata as a constant gauge.
@@ -171,12 +208,24 @@ func init() {
 	metrics.Registry.MustRegister(SandboxCreationLatency)
 	metrics.Registry.MustRegister(SandboxClaimCreationTotal)
 	metrics.Registry.MustRegister(AdoptionSegmentLatency)
+	metrics.Registry.MustRegister(SupplySegmentLatency)
 	metrics.Registry.MustRegister(BuildInfo)
 }
 
 // RecordAdoptionSegment records one warm-adoption hot-path segment duration.
 func RecordAdoptionSegment(segment string, d time.Duration) {
 	AdoptionSegmentLatency.WithLabelValues(segment).Observe(float64(d.Nanoseconds()) / 1e6)
+}
+
+// RecordSupplySegment records one warm-pool supply pipeline segment duration.
+// Negative durations (possible when the base timestamp is second-truncated
+// and the segment is sub-second) are clamped to zero rather than dropped, so
+// counts still reflect one observation per event.
+func RecordSupplySegment(segment string, d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	SupplySegmentLatency.WithLabelValues(segment).Observe(float64(d.Nanoseconds()) / 1e6)
 }
 
 // RecordClaimStartupLatency records the duration since the provided start time.

@@ -216,6 +216,15 @@ CP_MACHINE_TYPE="${CP_MACHINE_TYPE:-n2-standard-8}"
 #     controllers fall behind per-sandbox Service churn by design; 200/400
 #     keeps teardown/refill from backlogging into the next burst.
 #
+# etcd (round 10): TUNE_CONTROL_PLANE now ALSO raises etcd's storage quota
+#     to 8GiB and enables 2m periodic auto-compaction on both the main and
+#     events clusters (via etcdClusters[*].manager.env — see the post-create
+#     cluster-spec patch below). Round-9b measured the default 2GiB
+#     quota-backend-bytes as a hard DURATION wall: ~3.2MB/s of main-DB
+#     revision growth at 300 claims/s churn ⇒ etcd NOSPACE (cluster-wide
+#     write rejection) in ~10 minutes. Overridable via
+#     ETCD_QUOTA_BACKEND_BYTES (bytes) and ETCD_COMPACTION_RETENTION.
+#
 # etcd note: kops already provisions SEPARATE main and events etcd clusters
 # by default (etcd-events), so the "--etcd-servers-overrides=/events#..."
 # split from the scale roadmap is in place without extra flags here. Further
@@ -332,15 +341,12 @@ if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
       "--set" "cluster.spec.kubeControllerManager.kubeAPIBurst=400"
     )
 fi
-CBOR_KOPS_FLAGS=()
-if [[ "${TUNE_CBOR}" == "true" ]]; then
-    # See the TUNE_CBOR comment above. Feature-gate map keys ARE addressable
-    # via `kops create cluster --set` on kops v1.35 (unlike
-    # kubelet.systemReserved — verified in the ROUND7 research pass), so no
-    # cluster-yaml patching is needed here.
-    echo "TUNE_CBOR=true: enabling kube-apiserver CBORServingAndStorage (alpha) at creation"
-    CBOR_KOPS_FLAGS+=("--set" "cluster.spec.kubeAPIServer.featureGates.CBORServingAndStorage=true")
-fi
+# TUNE_CBOR server gate: kops v1.35 `--set` can NOT address featureGates map
+# keys — `--set cluster.spec.kubeAPIServer.featureGates.CBORServingAndStorage=true`
+# fails with "field not found in *Cluster" (measured, round-9b SUST5 abort;
+# the ROUND7 research note claiming otherwise was wrong). The gate is applied
+# through the post-create cluster-spec patch below instead (same mechanism as
+# kubelet.systemReserved and the etcd knobs).
 NODE_TUNE_KOPS_FLAGS=()
 NODE_VOLUME_FLAGS=()
 if [[ "${TUNE_NODES}" == "true" ]]; then
@@ -384,9 +390,63 @@ kops create cluster \
   ${CNI_KOPS_FLAGS[@]+"${CNI_KOPS_FLAGS[@]}"} \
   ${INSTRUMENT_KOPS_FLAGS[@]+"${INSTRUMENT_KOPS_FLAGS[@]}"} \
   ${TUNE_KOPS_FLAGS[@]+"${TUNE_KOPS_FLAGS[@]}"} \
-  ${CBOR_KOPS_FLAGS[@]+"${CBOR_KOPS_FLAGS[@]}"} \
   ${NODE_TUNE_KOPS_FLAGS[@]+"${NODE_TUNE_KOPS_FLAGS[@]}"} \
   ${NODE_VOLUME_FLAGS[@]+"${NODE_VOLUME_FLAGS[@]}"}
+
+# Post-create cluster-spec surgery for settings `kops --set` cannot express
+# (map keys and list-of-struct fields). Mechanism: `kops get -o json` → jq →
+# `kops replace` (JSON is valid YAML input to kops replace) — the structured
+# sibling of the TUNE_NODES sed patches below. Applied BEFORE
+# `kops update cluster --yes`, so the settings are present at bring-up.
+#
+# TUNE_CONTROL_PLANE etcd knobs (round-9b supply-wall ladder item 4 /
+# SCALE-ROADMAP R4.5, never previously applied):
+#   - ETCD_QUOTA_BACKEND_BYTES=8GiB (default 2GiB): at 300/s churn the main
+#     DB grows ~3.2MB/s of revisions — the default quota NOSPACEs the whole
+#     control plane in ~10 minutes (round-9b SUST4: binds → 0 at 20:15,
+#     cleanup deletes failed). 8GiB buys ~40+ min even with compaction lag.
+#   - ETCD_AUTO_COMPACTION_MODE=periodic + RETENTION=2m: bounds the revision
+#     window etcd retains, so the quota holds a steady state instead of a
+#     countdown (the apiserver's own --etcd-compaction-interval has no kops
+#     v1.35 spec field — verified: zero hits for 'compaction' in
+#     pkg/apis/kops — so compaction is enforced etcd-side; the apiserver's
+#     default 5m compactions remain, harmlessly redundant).
+#   Both ride etcdClusters[*].manager.env: etcd-manager passes ETCD_*
+#   variables down to the etcd process (documented EtcdManagerSpec.Env
+#   behavior). Applied to BOTH main and events clusters.
+#   Override via ETCD_QUOTA_BACKEND_BYTES / ETCD_COMPACTION_RETENTION.
+if [[ "${TUNE_CONTROL_PLANE}" == "true" || "${TUNE_CBOR}" == "true" ]]; then
+  CLUSTER_JSON="${WORKDIR}/cluster-${CLUSTER_NAME}.json"
+  kops get cluster --name "${CLUSTER_NAME}" -o json > "${CLUSTER_JSON}"
+  SPEC_FILTER='.'
+  if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
+    ETCD_QUOTA="${ETCD_QUOTA_BACKEND_BYTES:-8589934592}"
+    ETCD_RETENTION="${ETCD_COMPACTION_RETENTION:-2m}"
+    echo "TUNE_CONTROL_PLANE: patching etcdClusters manager.env (quota=${ETCD_QUOTA}, auto-compaction=${ETCD_RETENTION})"
+    SPEC_FILTER+=" | .spec.etcdClusters |= map(.manager = ((.manager // {}) + {env: (((.manager // {}).env // []) + [
+        {name: \"ETCD_QUOTA_BACKEND_BYTES\", value: \"${ETCD_QUOTA}\"},
+        {name: \"ETCD_AUTO_COMPACTION_MODE\", value: \"periodic\"},
+        {name: \"ETCD_AUTO_COMPACTION_RETENTION\", value: \"${ETCD_RETENTION}\"}])}))"
+  fi
+  if [[ "${TUNE_CBOR}" == "true" ]]; then
+    echo "TUNE_CBOR=true: patching kube-apiserver CBORServingAndStorage=true (alpha) into the cluster spec"
+    SPEC_FILTER+=' | .spec.kubeAPIServer.featureGates = ((.spec.kubeAPIServer.featureGates // {}) + {CBORServingAndStorage: "true"})'
+  fi
+  jq "${SPEC_FILTER}" "${CLUSTER_JSON}" > "${CLUSTER_JSON}.patched"
+  kops replace -f "${CLUSTER_JSON}.patched"
+  # Verify the patch round-tripped through the kops API (the round-9b lesson:
+  # a silently-dropped setting mis-attributes an entire leg — fail HARD).
+  kops get cluster --name "${CLUSTER_NAME}" -o yaml > "${CLUSTER_JSON}.check"
+  if [[ "${TUNE_CONTROL_PLANE}" == "true" ]] && \
+     [[ "$(grep -c 'ETCD_QUOTA_BACKEND_BYTES' "${CLUSTER_JSON}.check")" -lt 2 ]]; then
+    echo "FATAL: etcd manager.env patch did not persist in the cluster spec (expected on main+events)"; exit 1
+  fi
+  if [[ "${TUNE_CBOR}" == "true" ]] && \
+     ! grep -q 'CBORServingAndStorage' "${CLUSTER_JSON}.check"; then
+    echo "FATAL: CBORServingAndStorage featureGate patch did not persist in the cluster spec"; exit 1
+  fi
+  echo "Cluster-spec patch verified."
+fi
 
 if [[ "${TUNE_NODES}" == "true" ]]; then
   # kubelet static system reserves: map-valued spec.kubelet.systemReserved
@@ -501,9 +561,53 @@ if [[ "${TUNE_CBOR}" == "true" ]]; then
     KUBE_FEATURE_ClientsAllowCBOR=true KUBE_FEATURE_ClientsPreferCBOR=true
 fi
 
+# SHARD_B_NAMESPACES (default empty) — two-shard controller topology for the
+# sharding-at-rate leg (SCALE-ROADMAP R4.4; the
+# k8s/namespace-sharding-example.yaml recipe, adapted to CLONE the
+# freshly-deployed Deployment so image, resources, priorityClass, and env —
+# including the TUNE_CBOR client gates set above — stay identical between
+# shards). Usage:
+#   CONTROLLER_ARGS="... --watch-namespaces=<listA>"   # stock Deployment = shard A
+#   SHARD_B_NAMESPACES="<listB>"                       # spawns shard 2
+# Requires --watch-namespaces in CONTROLLER_ARGS: a cluster-wide shard A
+# would double-reconcile shard 2's namespaces (safe but invalidates the
+# sharding measurement). The clone is named agent-sandbox-controller-shard2
+# to avoid colliding with the example manifest's replicas:0
+# agent-sandbox-controller-shard-{a,b} Deployments (immutable selectors).
+# Leader election needs no care: each shard's Lease ID is auto-suffixed with
+# a hash of its namespace list (see --watch-namespaces help). Shard-2 pods
+# keep the app label, so the stress tool's controller metrics scrape and the
+# per-pod log capture cover both shards.
+if [[ -z "${SHARD_B_NAMESPACES:-}" ]]; then
+  # Defensive: a reused cluster may carry a shard2 Deployment from a previous
+  # sharded leg — an unsharded run alongside it would double-reconcile.
+  kubectl delete deployment agent-sandbox-controller-shard2 --namespace agent-sandbox-system --ignore-not-found=true
+fi
+if [[ -n "${SHARD_B_NAMESPACES:-}" ]]; then
+  if [[ "${CONTROLLER_ARGS}" != *"--watch-namespaces="* ]]; then
+    echo "FATAL: SHARD_B_NAMESPACES requires --watch-namespaces=<listA> in CONTROLLER_ARGS (the stock Deployment becomes shard A)"
+    exit 1
+  fi
+  echo "SHARD_B_NAMESPACES: cloning controller Deployment as agent-sandbox-controller-shard2 (namespaces: ${SHARD_B_NAMESPACES})..."
+  kubectl get deployment agent-sandbox-controller --namespace agent-sandbox-system -o json \
+    | jq --arg ns "${SHARD_B_NAMESPACES}" '
+        .metadata = {name: "agent-sandbox-controller-shard2",
+                     namespace: .metadata.namespace,
+                     labels: ((.metadata.labels // {}) + {"sharding.agent-sandbox.x-k8s.io/shard": "shard2"})}
+        | .spec.selector.matchLabels += {"sharding.agent-sandbox.x-k8s.io/shard": "shard2"}
+        | .spec.template.metadata.labels += {"sharding.agent-sandbox.x-k8s.io/shard": "shard2"}
+        | .spec.template.spec.containers[0].args |= map(
+            if startswith("--watch-namespaces=") then "--watch-namespaces=" + $ns else . end)
+        | del(.status)' \
+    | kubectl apply -f -
+fi
+
 # Wait for controller to be ready
 echo "Waiting for controller to be ready..."
 kubectl rollout status deployment agent-sandbox-controller --namespace agent-sandbox-system --timeout=10m
+if [[ -n "${SHARD_B_NAMESPACES:-}" ]]; then
+  kubectl rollout status deployment agent-sandbox-controller-shard2 --namespace agent-sandbox-system --timeout=10m
+fi
 
 # Run the benchmarks
 # SKIP_E2E_SUITE=true skips the Go/Python e2e benchmark suite (which requires a

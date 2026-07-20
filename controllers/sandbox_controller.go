@@ -331,12 +331,29 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	allErrors = errors.Join(allErrors, err)
 
 	// compute and set overall conditions
+	wasReady := meta.IsStatusConditionTrue(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
 	conditions := r.computeConditions(sandbox, allErrors, svc, pod)
 	hasFinished := false
 	for _, condition := range conditions {
 		meta.SetStatusCondition(&sandbox.Status.Conditions, condition)
 		if condition.Type == string(sandboxv1beta1.SandboxConditionFinished) {
 			hasFinished = true
+		}
+	}
+
+	// Supply-segment decomposition (round 10): pod PodReady -> the pass that
+	// first marks the Sandbox Ready. Covers pod-status informer delivery +
+	// workqueue wait in this controller — the "ready marking" half of the
+	// round-9b supply ceiling (pod-Ready->sandbox-Ready p50 50.5s at ~13k
+	// live pods). PodReady lastTransitionTime is second-truncated (up to +1s
+	// inflation; clamped at 0 in the recorder). Recorded once per transition.
+	if !wasReady && pod != nil &&
+		meta.IsStatusConditionTrue(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady)) {
+		for _, pc := range pod.Status.Conditions {
+			if pc.Type == corev1.PodReady && pc.Status == corev1.ConditionTrue {
+				asmetrics.RecordSupplySegment("pod_ready_to_sandbox_ready", time.Since(pc.LastTransitionTime.Time))
+				break
+			}
 		}
 	}
 
@@ -1193,6 +1210,13 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	if err := ensurePodNameAnnotation(pod.Name); err != nil {
 		return nil, err
 	}
+
+	// Supply-segment decomposition (round 10): sandbox CREATE -> pod CREATE
+	// issued. Covers informer delivery + workqueue wait + reconcile passes in
+	// this controller — the "refill issuance" half of the round-9b supply
+	// ceiling (claim->pod-created p50 41.9s under backlog). CreationTimestamp
+	// is second-truncated (up to +1s inflation; clamped at 0 in the recorder).
+	asmetrics.RecordSupplySegment("sandbox_create_to_pod_create", time.Since(sandbox.CreationTimestamp.Time))
 
 	if r.Tracer.IsRecording(ctx) {
 		r.Tracer.AddEvent(ctx, "NewPodStatusObserved", map[string]string{
