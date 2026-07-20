@@ -108,11 +108,32 @@ spec:
         app: agent-sandbox-controller
     spec:
       serviceAccountName: agent-sandbox-controller
+      # The controller is the single latency-critical component on the claim
+      # hot path: give it guaranteed CPU/memory (no BestEffort QoS, no
+      # first-in-line eviction) and system-critical scheduling priority so
+      # churning sandbox pods can neither starve nor preempt it (GAP-2).
+      # Keep in lockstep with extensions.controller.yaml.
+      priorityClassName: system-cluster-critical
       containers:
       - name: agent-sandbox-controller
         image: ko://sigs.k8s.io/agent-sandbox/cmd/agent-sandbox-controller # placeholder value, replaced by deployment scripts
         args:
         - --leader-elect=true
+        env:
+        # Soft memory ceiling at 75% of the container limit so the Go GC
+        # backs off allocation growth before the kernel OOM-kills the only
+        # replica (GAP-7). Requires the memory limit below to stay in sync.
+        - name: GOMEMLIMIT
+          value: "6GiB"
+        resources:
+          requests:
+            cpu: "4"
+            memory: 8Gi
+          # Memory-only limit: an equal memory request+limit avoids OOM
+          # surprises, while deliberately NOT setting a CPU limit avoids
+          # throttling the hot path (bursting above 4 CPUs is fine).
+          limits:
+            memory: 8Gi
         ports:
         - name: metrics
           containerPort: 8080
