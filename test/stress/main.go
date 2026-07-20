@@ -125,6 +125,10 @@ type Summary struct {
 	Config    Config          `json:"config"`
 	Cluster   *ClusterInfo    `json:"cluster,omitempty"`
 	Phases    []*PhaseSummary `json:"phases"` // ordered by run sequence
+	// APFVerification records which APF flow schema / priority level the
+	// harness's claim POSTs classified into (preflight dry-run; claims
+	// phases only). The create-ack calibration contract is Exempt=true.
+	APFVerification *APFVerification `json:"apfVerification,omitempty"`
 }
 
 // Config holds the test parameters.
@@ -310,6 +314,15 @@ func run(ctx context.Context) error {
 		}
 		log.Printf("Mutating requests sharded across %d dedicated HTTP/2 connections (watches keep their own connection)", cfg.ClientConnections)
 	}
+	// Connection calibration (ROUND7-PLAN item 3b): the apiserver caps each
+	// HTTP/2 connection at ~100 concurrent streams, so a create concurrency
+	// above 100*connections queues on the client's own transport and inflates
+	// the measured create-ack (S0) without touching the server. Warn instead
+	// of failing: some legs deliberately probe the congested shape.
+	if minConns := (cfg.CreateConcurrency + 99) / 100; cfg.ClientConnections < minConns {
+		log.Printf("WARNING: --client-connections=%d < ceil(create-concurrency %d / 100)=%d — create-ack latency will include client-side HTTP/2 stream queueing",
+			cfg.ClientConnections, cfg.CreateConcurrency, minConns)
+	}
 
 	clusterInfo, err := inspectCluster(ctx, restConfig, dynamicClient)
 	if err != nil {
@@ -351,6 +364,15 @@ func run(ctx context.Context) error {
 				log.Printf("failed to delete namespace %s: %v", cfg.Namespace, err)
 			}
 		}()
+	}
+
+	// APF preflight (claims phases only): verify the harness's claim POSTs
+	// classify into the exempt priority level before any latency-bearing
+	// phase runs; the verdict is logged and recorded in summary.json.
+	var apfVerification *APFVerification
+	if hasClaimsPhase(cfg.Phases) {
+		apfVerification = verifyClaimPostPriorityLevel(ctx, restConfig, cfg.Namespace)
+		logAPFVerification(apfVerification)
 	}
 
 	tracker := NewTracker()
@@ -513,6 +535,7 @@ func run(ctx context.Context) error {
 
 	// Write outputs even if a phase failed: partial data is still useful.
 	summary := buildSummary(runID, testStartTime, cfg, clusterInfo, tracker, phaseResults)
+	summary.APFVerification = apfVerification
 	if err := writeOutputs(cfg.OutputDir, summary, tracker); err != nil {
 		if phaseErr == nil {
 			phaseErr = err
