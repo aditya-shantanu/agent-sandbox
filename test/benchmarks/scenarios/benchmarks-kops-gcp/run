@@ -212,6 +212,24 @@ CP_MACHINE_TYPE="${CP_MACHINE_TYPE:-n2-standard-8}"
 # surgery and are deliberately out of scope for this knob.
 TUNE_CONTROL_PLANE="${TUNE_CONTROL_PLANE:-false}"
 
+# TUNE_NODES=true (default false; creation-time only, like TUNE_CONTROL_PLANE)
+# applies the scaling-guide.pdf first-wave node/etcd-events deltas
+# (optimizations/SCALING-GUIDE-NOTES.md §4):
+#   - kube-apiserver eventTTL 1h -> 15m: bounds etcd-events growth during
+#     sustained churn (PDF pp. 14-15);
+#   - kubelet static system reserves (2 vCPU + 8Gi) + podPidsLimit=4096 so
+#     refill storms cannot starve kubelet/containerd/cilium-agent on
+#     high-density nodes (PDF pp. 5, 9; deliberately WITHOUT
+#     cpuManagerPolicy=static, see notes §3.4);
+#   - worker boot disks 200GB pd-ssd: pd-balanced/small disks cap at 3,000
+#     IOPS, which the PDF names as the first refill-throughput wall
+#     (CRI "context deadline exceeded", pp. 4-5, 14). Size comes from
+#     --node-volume-size; the type has no create-cluster flag, so the node
+#     InstanceGroups are patched (rootVolumeType: pd-ssd) before
+#     `kops update cluster --yes`, with a graceful skip if the IG yaml does
+#     not look as expected.
+TUNE_NODES="${TUNE_NODES:-false}"
+
 if [[ -z "${EXISTING_CLUSTER:-}" ]]; then
 
 echo "Creating kOps cluster configuration..."
@@ -259,6 +277,21 @@ if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
       "--set" "cluster.spec.kubeControllerManager.kubeAPIBurst=400"
     )
 fi
+NODE_TUNE_KOPS_FLAGS=()
+NODE_VOLUME_FLAGS=()
+if [[ "${TUNE_NODES}" == "true" ]]; then
+    # See the TUNE_NODES comment above for the rationale (scaling-guide §4).
+    echo "TUNE_NODES=true: eventTTL=15m, kubelet reserves, 200GB pd-ssd node boot disks"
+    # NOTE: kubelet.systemReserved is map-valued and kops 1.35's --set cannot
+    # address map keys ("field spec.kubelet.systemReserved.cpu not found",
+    # verified against kops v1.35.0); it is patched into the cluster spec
+    # below, after `kops create cluster`.
+    NODE_TUNE_KOPS_FLAGS+=(
+      "--set" "cluster.spec.kubeAPIServer.eventTTL=15m0s"
+      "--set" "cluster.spec.kubelet.podPidsLimit=4096"
+    )
+    NODE_VOLUME_FLAGS+=("--node-volume-size=200")
+fi
 kops create cluster \
   --cloud=gce \
   --gce-service-account=default \
@@ -280,7 +313,43 @@ kops create cluster \
   --set cluster.spec.kubeScheduler.authorizationAlwaysAllowPaths=/metrics \
   ${CNI_KOPS_FLAGS[@]+"${CNI_KOPS_FLAGS[@]}"} \
   ${INSTRUMENT_KOPS_FLAGS[@]+"${INSTRUMENT_KOPS_FLAGS[@]}"} \
-  ${TUNE_KOPS_FLAGS[@]+"${TUNE_KOPS_FLAGS[@]}"}
+  ${TUNE_KOPS_FLAGS[@]+"${TUNE_KOPS_FLAGS[@]}"} \
+  ${NODE_TUNE_KOPS_FLAGS[@]+"${NODE_TUNE_KOPS_FLAGS[@]}"} \
+  ${NODE_VOLUME_FLAGS[@]+"${NODE_VOLUME_FLAGS[@]}"}
+
+if [[ "${TUNE_NODES}" == "true" ]]; then
+  # kubelet static system reserves: map-valued spec.kubelet.systemReserved
+  # cannot be expressed via `kops create cluster --set` (see note above), so
+  # patch the cluster spec before it is applied. Skip with a warning if the
+  # yaml does not look as expected, rather than risking bring-up.
+  CLUSTER_YAML="${WORKDIR}/cluster-${CLUSTER_NAME}.yaml"
+  kops get cluster --name "${CLUSTER_NAME}" -o yaml > "${CLUSTER_YAML}"
+  if grep -q '^  kubelet:$' "${CLUSTER_YAML}" && ! grep -q 'systemReserved' "${CLUSTER_YAML}"; then
+    sed -i.bak 's/^  kubelet:$/  kubelet:\n    systemReserved:\n      cpu: 2000m\n      memory: 8Gi/' "${CLUSTER_YAML}"
+    kops replace -f "${CLUSTER_YAML}"
+    echo "TUNE_NODES: set kubelet.systemReserved cpu=2000m,memory=8Gi"
+  else
+    echo "TUNE_NODES WARNING: skipping kubelet.systemReserved patch (unexpected cluster yaml shape); nodes keep default reserves"
+  fi
+
+  # pd-ssd worker boot disks: rootVolumeType is an InstanceGroup field with
+  # no `kops create cluster` flag, so patch the node IG(s) before the cluster
+  # is applied. Insert the type right below the rootVolumeSize line that
+  # --node-volume-size just materialized; skip (with a warning) if the IG
+  # yaml does not match that expectation, rather than risking bring-up.
+  for ig in $(kops get instancegroups --name "${CLUSTER_NAME}" -o json \
+                | jq -r 'if type=="array" then .[] else . end | select(.spec.role=="Node") | .metadata.name'); do
+    IG_YAML="${WORKDIR}/ig-${ig}.yaml"
+    kops get instancegroups --name "${CLUSTER_NAME}" "${ig}" -o yaml > "${IG_YAML}"
+    if grep -q '^  rootVolumeSize:' "${IG_YAML}" && ! grep -q '^  rootVolumeType:' "${IG_YAML}"; then
+      sed -i.bak 's/^\(  rootVolumeSize:.*\)/\1\n  rootVolumeType: pd-ssd/' "${IG_YAML}"
+      kops replace -f "${IG_YAML}"
+      echo "TUNE_NODES: set rootVolumeType=pd-ssd on InstanceGroup ${ig}"
+    else
+      echo "TUNE_NODES WARNING: skipping rootVolumeType patch on IG ${ig} (unexpected IG yaml shape); nodes keep the default volume type"
+    fi
+  done
+fi
 
 echo "Applying cluster configuration..."
 kops update cluster --name "${CLUSTER_NAME}" --yes
@@ -329,6 +398,10 @@ else
   if [[ "${TUNE_CONTROL_PLANE}" == "true" ]]; then
     echo "NOTE: TUNE_CONTROL_PLANE=true only applies at cluster creation; the reused cluster"
     echo "keeps its original apiserver inflight limits and scheduler/KCM QPS settings."
+  fi
+  if [[ "${TUNE_NODES}" == "true" ]]; then
+    echo "NOTE: TUNE_NODES=true only applies at cluster creation; the reused cluster keeps"
+    echo "its original eventTTL, kubelet reserves, and node boot-disk configuration."
   fi
   kops export kubeconfig --name "${CLUSTER_NAME}" --admin
 fi
