@@ -49,7 +49,8 @@ the move to the runner VM, cleaned).
 ## Registries and artifacts
 
 - Images: `gcr.io/gke-ai-eco-dev/agent-sandbox/{agent-sandbox-controller,chrome-sandbox}:<git-describe>` plus `:buildcache` tags.
-- Benchmark results: `gs://kops-state-142966328212/perf-bench-results/latest/` — per-run folders (`candidate1`, `baseline2`, `candidate2`) with `RESULTS.txt`, `run.log`, `summary.json`, `metrics.jsonl.gz`; `heartbeat-*.log` refreshed every 3 min while runs are live.
+- Benchmark results: `gs://kops-state-142966328212/perf-bench-results/latest/` — per-run folders (`candidate1`, `baseline2`, `candidate2`) with `RESULTS.txt`, `run.log`, `summary.json`, `metrics.jsonl.gz`; `heartbeat-*.log` refreshed every 3 min while runs are live. Later rounds use per-round folders (`round2/`, `round3/`, ..., `gate0/`) with the same shape plus `STATUS.txt` (one line per orchestrator state change) and `hb-<leg>-run.log` heartbeats. Superseded orchestrators are archived under `perf-bench-scripts/archive/`.
+- Startup-script marker: the VM startup script is idempotent via `/root/.bench-started-vN`; bump the marker (v8 = gate zero), `gcloud compute instances add-metadata perf-bench-runner --metadata-from-file startup-script=/tmp/vm-startup.sh`, then `reset` the VM to relaunch.
 - Baseline1 artifacts (run from the laptop before the VM existed): local only, `/tmp/bench-artifacts-baseline/stress-test/` on the operator's Mac.
 
 ## Standard invocation

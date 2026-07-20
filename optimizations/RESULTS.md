@@ -232,3 +232,50 @@ p90 584ms sits just above round-4's 230-340ms prediction: the residual is create
 (49ms) + watch hops + 2 write RTTs at ~100-150ms each under burst — exactly the L1
 (one-write adoption) + create-path territory forecast. Next: L1 prototype + sustained
 500/s runs (multi-pool + max-refill-rate + sharding per SCALE-ROADMAP).
+
+---
+
+## 2026-07-20 — GATE ZERO (ROUND7-PLAN §3 + GAP-AUDIT riders) — PENDING
+
+Launched 06:23 UTC from the v8 orchestrator (perf-bench-runner reset; scripts
+in `gs://kops-state-142966328212/perf-bench-scripts/`, canonical copies in
+`optimizations/infra/`). Image/code: `perf-investigation-master` @ **2b60967**
+(includes the pre-run GAP fixes: GAP-4 pool-delete UID+RV preconditions,
+GAP-2/7 guaranteed controller pod + system-cluster-critical + GOMEMLIMIT=6GiB,
+GAP-5 SDK watch resourceVersion fix, and the TUNE_NODES bench knob).
+
+One cluster, three sequential legs, all with **CLEAN instrumentation**
+(GAP-1: no `--zap-log-level=debug`, no `--zap-encoder=json`, no
+`--enable-pprof-debug`, no client qps/burst pins → binary default -1, no
+apiserver `-v=3`), `--profile-controller=false --client-connections=4` on the
+stress client, 20-claim smoke before every leg:
+
+- Cluster: NODE_COUNT=34 (n2-standard-8), CP n2-standard-16,
+  TUNE_CONTROL_PLANE=true, **TUNE_NODES=true** (new: eventTTL=15m, kubelet
+  systemReserved 2CPU/8Gi + podPidsLimit=4096, 200GB pd-ssd worker boot
+  disks — SCALING-GUIDE-NOTES §4).
+- **Leg A (CLEAN-A)** — burst-300 on the round-4/5 flag set (workers
+  400/400/1, webhook off, separate-watch-connection, api-connections=4,
+  cache-label-selectors, claim observability annotations+events off,
+  replenish-delay=20s). Purpose: re-anchor the 584ms headline without the
+  instrumentation tax; the clean smoke floor re-measures the ROUND7 §7
+  physics floor.
+- **Leg B (CLEAN-B)** — same + `--one-write-adoption
+  --sandbox-write-behind-window=250ms --no-spec-adoption`. Purpose: first
+  benchmark of the fully-composed tree (the §1.2 predictions have never been
+  measured); A→B isolates the composed-flag delta on a clean anchor.
+- **Leg SUST** — `claims-warm-sustained` only: 300/s Poisson × 60s across 4
+  namespaces, replenish-delay=0, `--sandbox-warm-pool-max-refill-rate=100`,
+  pool workers=4, dwell=1500ms, pool-headroom=5s. Purpose: the sustained-300
+  number the <100ms p90 target is actually stated against, plus the GAP-3
+  teardown-decomposition ride-along (dwell→delete ≈ 300 deletes/s).
+  Capacity per the tool's own formula: pool 4×ceil(75×5)=1500 +
+  in-flight ceil(300×(1.5+5))=1950 → 3450 ≤ spare ≈ 34×110 − ~72 system
+  pods ≈ 3668. The originally-specified headroom 6s + dwell 2s computes to
+  3900 > spare — exactly the round-6 capacity refusal — hence the
+  adjustment. Cluster deleted after this leg.
+
+Results land in `gs://kops-state-142966328212/perf-bench-results/gate0/`
+(`STATUS.txt` + `hb-*` heartbeats every 3 min; per-leg folders
+`A-clean-burst/`, `B-clean-composed/`, `S-sustained300/` with RESULTS.txt,
+run.log, summary.json, metrics.jsonl.gz). Results: PENDING.
