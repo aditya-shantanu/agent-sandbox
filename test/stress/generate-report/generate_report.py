@@ -204,8 +204,6 @@ def main():
             "end_ts": p_end.strftime('%Y-%m-%dT%H:%M:%SZ')
         })
 
-    phase_order_map_early = {name: i for i, (name, _, _) in enumerate(phases)}
-
     start_time_iso = start_time.strftime('%Y-%m-%d %H:%M:%S.%f')
     end_time_iso = end_time.strftime('%Y-%m-%d %H:%M:%S.%f')
 
@@ -288,69 +286,6 @@ def main():
     controller_chart_data = [
         {"ts": row[0], "controller": row[1], "reconcile_rate": row[2] / 15.0}
         for row in controller_ts_raw
-    ]
-
-    # Sandbox controller workqueue: queue time is latency the controller adds
-    # before it even starts reconciling, and depth is the backlog. Work time
-    # vs queue time separates "reconciles are slow" from "reconciles are
-    # queued" (the fix differs: reconcile cost vs worker concurrency).
-    print("Querying controller workqueue by phase...")
-    controller_queue_raw = metrics_by_phase(
-        conn, metrics_path_str,
-        metrics=["workqueue_queue_duration_seconds_count",
-                 "workqueue_queue_duration_seconds_sum",
-                 "workqueue_work_duration_seconds_count",
-                 "workqueue_work_duration_seconds_sum",
-                 "workqueue_retries_total"],
-        labels={"qname": "name"},
-        group_by=[],
-        where="qname = 'sandbox' AND source = 'agent-sandbox-controller'")
-
-    print("Querying controller workqueue depth...")
-    controller_depth_raw = conn.execute(f"""
-        WITH raw AS (
-            SELECT CAST(ts AS TIMESTAMP) as ts, value
-            FROM read_json_auto('{metrics_path_str}')
-            WHERE source = 'agent-sandbox-controller' AND metric = 'workqueue_depth'
-              AND CAST(labels->>'name' AS VARCHAR) = 'sandbox'
-        )
-        SELECT p.name as phase_name, AVG(r.value), MAX(r.value)
-        FROM raw r JOIN phases p ON r.ts >= p.start_time AND r.ts < p.end_time
-        GROUP BY p.name
-    """).fetchall()
-    depth_by_phase = {row[0]: (row[1], row[2]) for row in controller_depth_raw}
-
-    controller_queue = []
-    for row in controller_queue_raw:
-        phase_name, qn, qsum, wn, wsum, retries = row
-        if qn <= 0:
-            continue
-        depth_avg, depth_max = depth_by_phase.get(phase_name, (0.0, 0.0))
-        controller_queue.append({
-            "phase_name": phase_name,
-            "items": int(qn),
-            "avg_queue_ms": qsum / qn * 1000,
-            "avg_work_ms": (wsum / wn * 1000) if wn > 0 else 0.0,
-            "retries": int(retries),
-            "depth_avg": depth_avg,
-            "depth_max": int(depth_max),
-        })
-    controller_queue.sort(key=lambda r: (phase_order_map_early.get(r["phase_name"], 99)))
-
-    print("Querying controller workqueue depth timeseries...")
-    controller_depth_ts = conn.execute(f"""
-        WITH raw AS (
-            SELECT CAST(ts AS TIMESTAMP) as ts, value
-            FROM read_json_auto('{metrics_path_str}')
-            WHERE source = 'agent-sandbox-controller' AND metric = 'workqueue_depth'
-              AND CAST(labels->>'name' AS VARCHAR) = 'sandbox'
-        )
-        SELECT strftime(time_bucket(INTERVAL '15 seconds', ts), '%Y-%m-%dT%H:%M:%SZ') as tsb,
-               MAX(value)
-        FROM raw GROUP BY tsb ORDER BY tsb
-    """).fetchall()
-    controller_depth_chart = [
-        {"ts": row[0], "depth": row[1]} for row in controller_depth_ts
     ]
 
     print("Querying apiserver operations by phase...")
@@ -637,6 +572,19 @@ def main():
 
     if watch_file.exists():
         watch_path_str = str(watch_file).replace("'", "''")
+        # Schema-pinned watch-stream scan. read_json_auto infers a nested
+        # STRUCT for `object` from a sample of lines; any later line whose
+        # object carries a key absent from the sampled shapes (e.g. the
+        # sustained phase's sandboxclaims events with `status.sandbox`) makes
+        # the transform fail with `unknown key` and killed the whole report
+        # (gate-zero leg S, 2026-07-20). Only the envelope is typed; `object`
+        # stays raw JSON so any watched resource shape is tolerated, and
+        # ignore_errors skips truncated trailing lines from interrupted runs.
+        watch_scan = (
+            f"read_json('{watch_path_str}', format='newline_delimited', "
+            "columns={timestamp: 'TIMESTAMP', resource: 'VARCHAR', "
+            "type: 'VARCHAR', object: 'JSON'}, ignore_errors=true)"
+        )
         print("Querying capacity timeseries from watch stream...")
         capacity_ts_raw = conn.execute(f"""
             WITH raw_events AS (
@@ -647,7 +595,7 @@ def main():
                     -- name is two objects, not one long-lived one.
                     CAST(object->'metadata'->>'uid' AS VARCHAR) as uid,
                     type
-                FROM read_json_auto('{watch_path_str}')
+                FROM {watch_scan}
                 WHERE resource IN ('pods', 'sandboxes')
             ),
             lifecycle_ends AS (
@@ -715,7 +663,7 @@ def main():
                     -- name is two objects, not one long-lived one.
                     CAST(object->'metadata'->>'uid' AS VARCHAR) as uid,
                     type
-                FROM read_json_auto('{watch_path_str}')
+                FROM {watch_scan}
                 WHERE resource IN ('pods', 'sandboxes')
             ),
             lifecycle_ends AS (
@@ -824,23 +772,6 @@ def main():
             "severity": "warning",
             "title": f"High Reconciler Churn ({max_reconciles_per_created:.1f} reconciles/object)",
             "desc": f"The Sandbox controller reconciliation count per sandbox object created reached {max_reconciles_per_created:.1f} in phase {max_reconciles_per_created_phase} ({max_reconciles:,} reconciles for {max_created:,} objects). This indicates high reconciliation redundancy, where a single sandbox object launch triggers excessive watch event updates in a short window.",
-            "link": "agent-sandbox-controller.html"
-        })
-
-    # Sandbox controller workqueue backlog check: items waiting in the queue
-    # add launch latency before the controller even starts reconciling.
-    queue_worst = None
-    for row in controller_queue:
-        if row['phase_name'].startswith('throughput'):
-            if queue_worst is None or row['avg_queue_ms'] > queue_worst['avg_queue_ms']:
-                queue_worst = row
-
-    if queue_worst and queue_worst['avg_queue_ms'] > 250:
-        w = queue_worst
-        findings.append({
-            "severity": "critical" if w['avg_queue_ms'] > 1000 else "warning",
-            "title": f"Sandbox Controller Workqueue Backlog ({w['avg_queue_ms']/1000:.2f}s avg queue time)",
-            "desc": f"During phase {w['phase_name']}, items waited an average of {w['avg_queue_ms']/1000:.2f}s in the sandbox controller's workqueue (depth averaged {w['depth_avg']:.0f}, peaking at {w['depth_max']}), while actual reconcile work took only {w['avg_work_ms']:.1f}ms per item — the controller is queueing, not slow. Consider raising the controller's reconcile concurrency (MaxConcurrentReconciles) and checking its client-side QPS limits.",
             "link": "agent-sandbox-controller.html"
         })
 
@@ -1011,19 +942,6 @@ def main():
         shutil.copy(f, output_dir / f.name)
         print(f"Copied CPU profile: {output_dir / f.name}")
 
-    # Copy the watch stream so watch.html can fetch and parse it client-side.
-    # Always name the copy watch.jsonl, even when the input is watch.jsonl.gz:
-    # prow's GCS artifact uploader strips a .gz suffix on upload (the run
-    # artifacts show watch.jsonl.gz stored as watch.jsonl), so a page
-    # referencing the .gz name 404s in CI. The client detects gzip by magic
-    # bytes rather than by extension, so the bare name works for both
-    # compressed and uncompressed inputs.
-    watch_log_name = None
-    if watch_file.exists():
-        watch_log_name = "watch.jsonl"
-        shutil.copy(watch_file, output_dir / watch_log_name)
-        print(f"Copied watch log: {output_dir / watch_log_name}")
-
     def render_page(template_name, output_filename, context):
         template = env.get_template(template_name)
         rendered = template.render(context)
@@ -1059,8 +977,6 @@ def main():
         "active_page": "controller",
         "summary": summary,
         "controller_ops": controller_ops,
-        "controller_queue": controller_queue,
-        "depth_chart_data": controller_depth_chart,
         "chart_data": controller_chart_data,
         "phases": js_phases
     }
@@ -1128,15 +1044,6 @@ def main():
         "pprof_profiles": pprof_profiles
     }
     render_page("pprof.html", "pprof.html", pprof_ctx)
-
-    # Watch events context
-    watch_ctx = {
-        "active_page": "watch",
-        "summary": summary,
-        "watch_log": watch_log_name,
-        "phases": js_phases
-    }
-    render_page("watch.html", "watch.html", watch_ctx)
 
     print("All report pages generated successfully!")
 
