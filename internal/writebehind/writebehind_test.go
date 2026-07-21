@@ -331,3 +331,94 @@ func TestZeroWindowRejected(t *testing.T) {
 		t.Fatal("New with zero window should fail")
 	}
 }
+
+// TestEnqueueDuringInFlightFlushStaysOrdered: a mutation enqueued while the
+// object's patch is on the wire must merge into the still-pending entry and
+// go out in a SECOND patch after the first resolves — never as a concurrent,
+// unordered patch that could let the older payload land last and win.
+func TestEnqueueDuringInFlightFlushStaysOrdered(t *testing.T) {
+	pod := testPod("pod-1")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var payloads [][]byte
+	blockFirst := true
+	cl := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithObjects(pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				data, err := patch.Data(obj)
+				if err != nil {
+					return err
+				}
+				mu.Lock()
+				payloads = append(payloads, data)
+				first := blockFirst
+				blockFirst = false
+				mu.Unlock()
+				if first {
+					close(entered)
+					<-release
+				}
+				return c.Patch(ctx, obj, patch, opts...)
+			},
+		}).Build()
+	f, err := New(cl, clientgoscheme.Scheme, Options{Window: time.Hour})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := f.Enqueue(ctx, pod, Mutation{SetLabels: map[string]string{"k": "old"}}, 0); err != nil {
+		t.Fatalf("enqueue old: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- f.FlushAll(ctx) }()
+	<-entered // the k=old patch is on the wire and blocked
+
+	// A newer value arriving mid-flight must coalesce into the pending entry.
+	if err := f.Enqueue(ctx, pod, Mutation{SetLabels: map[string]string{"k": "new"}}, 0); err != nil {
+		t.Fatalf("enqueue new: %v", err)
+	}
+	if got := f.Pending(); got != 1 {
+		t.Fatalf("pending = %d, want 1 (merged into the in-flight entry)", got)
+	}
+	mu.Lock()
+	inFlight := len(payloads)
+	mu.Unlock()
+	if inFlight != 1 {
+		t.Fatalf("patches on the wire during the blocked flush = %d, want 1 (no concurrent second patch)", inFlight)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+	if got := f.Pending(); got != 1 {
+		t.Fatalf("pending after first flush = %d, want 1 (follow-up mutation retained)", got)
+	}
+	if err := f.FlushAll(ctx); err != nil {
+		t.Fatalf("follow-up FlushAll: %v", err)
+	}
+
+	mu.Lock()
+	total := len(payloads)
+	last := payloads[len(payloads)-1]
+	mu.Unlock()
+	if total != 2 {
+		t.Fatalf("total patches = %d, want 2 (old, then new — strictly ordered)", total)
+	}
+	var doc map[string]map[string]map[string]*string
+	if err := json.Unmarshal(last, &doc); err != nil {
+		t.Fatalf("unmarshal last payload %s: %v", last, err)
+	}
+	if v := doc["metadata"]["labels"]["k"]; v == nil || *v != "new" {
+		t.Errorf("last patch label k = %v, want the newer value %q", v, "new")
+	}
+	got := &corev1.Pod{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "pod-1"}, got); err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	if got.Labels["k"] != "new" {
+		t.Errorf("final label k = %q, want %q (newer value must win)", got.Labels["k"], "new")
+	}
+}

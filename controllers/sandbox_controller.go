@@ -945,9 +945,12 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 				sandbox.Annotations = make(map[string]string)
 			}
 			sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation] = podName
-			return r.WriteBehind.Enqueue(ctx, sandbox, writebehind.Mutation{
+			if err := r.WriteBehind.Enqueue(ctx, sandbox, writebehind.Mutation{
 				SetAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: podName},
-			}, 0)
+			}, 0); err != nil {
+				return fmt.Errorf("failed to enqueue pod name annotation write: %w", err)
+			}
+			return nil
 		}
 
 		patch := client.MergeFrom(sandbox.DeepCopy())

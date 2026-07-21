@@ -31,6 +31,11 @@
 // Safety properties:
 //   - Per-object coalescing: N Enqueue calls for the same object merge into
 //     ONE JSON merge patch (last write wins per key), flushed once.
+//   - Ordered per object: mutations enqueued while an object's patch is on
+//     the wire merge into the still-pending entry and go out in a SECOND
+//     patch after the first resolves — two patches for the same object are
+//     never in flight concurrently, so a retry-delayed older patch can never
+//     overwrite a newer value.
 //   - Bounded staleness: each entry flushes no later than
 //     min(Window, per-call maxDelay) after its FIRST enqueue; later enqueues
 //     never extend an entry's deadline (they can only tighten it).
@@ -118,6 +123,19 @@ type entry struct {
 	labels      map[string]*string
 	annotations map[string]*string
 	deadline    time.Time
+	// flushing marks the entry's snapshot as on the wire. The entry stays in
+	// pending so concurrent Enqueues merge into it (instead of creating a
+	// second, unordered patch for the same object); it is only removed once
+	// the patch attempt resolves with no new mutations accumulated.
+	flushing bool
+}
+
+// flushItem is the locked-snapshot of an entry handed to the patch call.
+type flushItem struct {
+	key         objKey
+	target      client.Object
+	labels      map[string]*string
+	annotations map[string]*string
 }
 
 // Flusher coalesces metadata mutations per object and flushes them as single
@@ -303,6 +321,12 @@ func (f *Flusher) Start(ctx context.Context) error {
 		f.mu.Lock()
 		var next time.Time
 		for _, e := range f.pending {
+			if e.flushing {
+				// On the wire elsewhere (concurrent FlushAll); finish()
+				// kicks the wake channel when it resolves, so don't spin
+				// on its already-past deadline here.
+				continue
+			}
 			if next.IsZero() || e.deadline.Before(next) {
 				next = e.deadline
 			}
@@ -326,9 +350,16 @@ func (f *Flusher) Start(ctx context.Context) error {
 			// Graceful drain: crash-consistency does not REQUIRE this (the
 			// next process's reconciles recompute everything), but flushing
 			// cheaply here avoids paying reconcile latency after failover.
+			// Best-effort by the same argument: a drain failure (e.g. the
+			// apiserver is already unreachable during shutdown) must not
+			// make the manager exit with an error — log and return nil.
 			drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 			defer cancel()
-			return f.FlushAll(drainCtx)
+			if err := f.FlushAll(drainCtx); err != nil {
+				ctrl.Log.WithName("writebehind").Error(err,
+					"best-effort shutdown drain incomplete; dropped mutations are recomputed by the next leader's reconciles")
+			}
+			return nil
 		case <-f.wake:
 		case <-timer.C:
 		}
@@ -336,50 +367,88 @@ func (f *Flusher) Start(ctx context.Context) error {
 	}
 }
 
+// takeSnapshot marks e as flushing and returns its mutation snapshot for the
+// wire, leaving the (emptied) entry in pending so concurrent Enqueues merge
+// into it rather than creating a second unordered patch. Caller holds f.mu.
+func takeSnapshot(k objKey, e *entry) flushItem {
+	it := flushItem{key: k, target: e.target, labels: e.labels, annotations: e.annotations}
+	e.flushing = true
+	e.labels, e.annotations = nil, nil
+	return it
+}
+
+// finish clears an entry's in-flight mark once its patch attempt resolved.
+// If new mutations coalesced into the entry while the patch was on the wire,
+// the entry stays pending (its deadline is already due) and the flush loop is
+// woken — the follow-up patch goes out strictly after the resolved one, which
+// is what keeps per-object patches ordered. Otherwise the entry is removed.
+func (f *Flusher) finish(key objKey) {
+	f.mu.Lock()
+	e, ok := f.pending[key]
+	if !ok {
+		f.mu.Unlock()
+		return
+	}
+	e.flushing = false
+	if e.labels == nil && e.annotations == nil {
+		delete(f.pending, key)
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Unlock()
+	f.kick()
+}
+
 // flushDue flushes every entry whose deadline has passed.
 func (f *Flusher) flushDue(ctx context.Context, now time.Time) {
 	f.mu.Lock()
-	var due []*entry
+	var due []flushItem
 	for k, e := range f.pending {
-		if !e.deadline.After(now) {
-			due = append(due, e)
-			delete(f.pending, k)
+		if e.flushing || e.deadline.After(now) {
+			continue
 		}
+		due = append(due, takeSnapshot(k, e))
 	}
 	f.mu.Unlock()
-	for _, e := range due {
+	for _, it := range due {
 		// flushEntry logs and drops on failure (the owning controller's next
 		// level-based reconcile recomputes the patch); the per-entry error is
 		// intentionally not propagated to the timer loop.
-		_ = f.flushEntry(ctx, e)
+		_ = f.flushEntry(ctx, it)
+		f.finish(it.key)
 	}
 }
 
 // FlushAll immediately flushes every pending entry. Used on shutdown drain
-// and by tests to make coalescing deterministic.
+// and by tests to make coalescing deterministic. Entries whose patch is
+// already on the wire in another goroutine are skipped — their in-flight
+// attempt is the flush.
 func (f *Flusher) FlushAll(ctx context.Context) error {
 	f.mu.Lock()
-	due := make([]*entry, 0, len(f.pending))
+	due := make([]flushItem, 0, len(f.pending))
 	for k, e := range f.pending {
-		due = append(due, e)
-		delete(f.pending, k)
+		if e.flushing {
+			continue
+		}
+		due = append(due, takeSnapshot(k, e))
 	}
 	f.mu.Unlock()
 	var firstErr error
-	for _, e := range due {
-		if err := f.flushEntry(ctx, e); err != nil && firstErr == nil {
+	for _, it := range due {
+		if err := f.flushEntry(ctx, it); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		f.finish(it.key)
 	}
 	return firstErr
 }
 
-func (f *Flusher) flushEntry(ctx context.Context, e *entry) error {
-	err := f.patch(ctx, e.target, e.labels, e.annotations)
+func (f *Flusher) flushEntry(ctx context.Context, it flushItem) error {
+	err := f.patch(ctx, it.target, it.labels, it.annotations)
 	if err != nil {
 		ctrl.Log.WithName("writebehind").Error(err,
 			"dropping unflushed coalesced patch; the owning controller's next reconcile recomputes it",
-			"namespace", e.target.GetNamespace(), "name", e.target.GetName())
+			"namespace", it.target.GetNamespace(), "name", it.target.GetName())
 	}
 	return err
 }
