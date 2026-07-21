@@ -45,6 +45,7 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
+	"sigs.k8s.io/agent-sandbox/internal/writebehind"
 )
 
 const (
@@ -59,6 +60,14 @@ const (
 	podSandboxNameHashIndex     = ".metadata.labels[" + sandboxLabel + "]"
 	sandboxControllerFieldOwner = "sandbox-controller"
 	immediateRequeueDelay       = time.Millisecond
+	// podMetadataFlushBound caps how long a write-behind pod metadata patch
+	// may stay pending. The pod metadata patch on the warm-pool adoption path
+	// is what strips the cluster-autoscaler.kubernetes.io/safe-to-evict
+	// annotation from the live Pod; the accepted risk bound for that eviction
+	// window is <1s (cluster-autoscaler scan intervals are 10s+, so a
+	// sub-second deferral cannot realistically lose the race), hence pod
+	// patches always flush within min(window, 1s).
+	podMetadataFlushBound = time.Second
 )
 
 // PodCacheTransform is a client-go informer transform for the manager's Pod
@@ -164,6 +173,19 @@ type SandboxReconciler struct {
 	Scheme        *runtime.Scheme
 	Tracer        asmetrics.Instrumenter
 	ClusterDomain string
+
+	// WriteBehind, when non-nil, coalesces this controller's RECOVERABLE
+	// metadata-only writes — the pod label/annotation reconciliation patch
+	// and the sandbox pod-name annotation — into one merge patch per object,
+	// flushed within a bounded window (--sandbox-write-behind-window). nil
+	// (the default) preserves the fully synchronous behavior on the exact
+	// same code paths. Only writes that the next level-based reconcile
+	// recomputes verbatim from informer state are routed here, so a crash
+	// before flush is self-healing: the replacement leader's first reconcile
+	// of the object re-detects the drift and re-issues the mutation. Writes
+	// that are NOT recoverable this way (status writes, ownerRef changes,
+	// creates/deletes) never go through WriteBehind.
+	WriteBehind *writebehind.Flusher
 }
 
 //+kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
@@ -599,6 +621,36 @@ func computeExtensionPodLabels(sandbox *sandboxv1beta1.Sandbox) map[string]strin
 	return labels
 }
 
+// metadataDiff converts a before/after snapshot of one object's labels and
+// annotations into a writebehind.Mutation carrying exactly the delta —
+// changed/added keys as sets, removed keys as deletes. Used to route the pod
+// metadata reconciliation through the write-behind coalescer: the resulting
+// merge patch is semantically identical to what client.MergeFrom would have
+// diffed out of the same mutation (sets plus JSON-null deletes on
+// metadata.labels/annotations only).
+func metadataDiff(beforeLabels, afterLabels, beforeAnnotations, afterAnnotations map[string]string) writebehind.Mutation {
+	var mut writebehind.Mutation
+	diff := func(before, after map[string]string) (set map[string]string, del []string) {
+		for k, v := range after {
+			if old, ok := before[k]; !ok || old != v {
+				if set == nil {
+					set = make(map[string]string)
+				}
+				set[k] = v
+			}
+		}
+		for k := range before {
+			if _, ok := after[k]; !ok {
+				del = append(del, k)
+			}
+		}
+		return set, del
+	}
+	mut.SetLabels, mut.DeleteLabels = diff(beforeLabels, afterLabels)
+	mut.SetAnnotations, mut.DeleteAnnotations = diff(beforeAnnotations, afterAnnotations)
+	return mut
+}
+
 // isSystemAnnotation reports whether an annotation key is reserved for the sandbox
 // system and therefore must not be settable through a user-supplied PodTemplate.
 func isSystemAnnotation(key string) bool {
@@ -883,6 +935,21 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			return nil
 		}
 
+		// Recoverable write: the annotation is a pure function of observed
+		// state (the pod's name), the in-memory copy below already serves
+		// THIS pass, and resolvePodName falls back to sandbox.Name — so a
+		// deferred flush lost in a crash is recomputed and re-enqueued by
+		// the next reconcile. Safe to write-behind with the full window.
+		if r.WriteBehind != nil {
+			if sandbox.Annotations == nil {
+				sandbox.Annotations = make(map[string]string)
+			}
+			sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation] = podName
+			return r.WriteBehind.Enqueue(ctx, sandbox, writebehind.Mutation{
+				SetAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: podName},
+			}, 0)
+		}
+
 		patch := client.MergeFrom(sandbox.DeepCopy())
 		if sandbox.Annotations == nil {
 			sandbox.Annotations = make(map[string]string)
@@ -941,9 +1008,39 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 			// No additional action needed — label applied below.
 		}
 
+		// The pod metadata patch on the warm-pool adoption path is always a
+		// real patch: the adoption merge drops the warm-pool label from the
+		// pod, strips the safe-to-evict marker the pool stamped on it, and
+		// updates the propagated-keys tracking annotations.
+		//
+		// Nothing on the Sandbox-Ready path gates on this patch (the Service
+		// selector uses the name-hash label, which never changes), and every
+		// key it touches is recomputed from informer state on the next
+		// reconcile — so it is RECOVERABLE and eligible for write-behind
+		// coalescing, with one bound: the safe-to-evict strip protects the
+		// adopted pod from cluster-autoscaler eviction, so a deferred flush
+		// must land within podMetadataFlushBound (<1s), well inside any
+		// realistic autoscaler scan interval. Synchronous mode (WriteBehind
+		// nil, the default) keeps the single optimistic-lock-free merge
+		// patch: one API round-trip, no 409/backoff risk.
+		//
+		// Write-behind only applies when the pod is already owned by this
+		// sandbox: ownership transfers (SetControllerReference above,
+		// needsUpdate=true) are adoption-lock-adjacent and stay synchronous.
+		var beforeLabels, beforeAnnotations map[string]string
+		useWriteBehind := r.WriteBehind != nil && ownership == resourceOwnedBySandbox && !needsUpdate
+		if useWriteBehind {
+			beforeLabels = maps.Clone(pod.Labels)
+			beforeAnnotations = maps.Clone(pod.Annotations)
+		}
 		metadataUpdated := r.updatePodMetadata(ctx, pod, sandbox, nameHash)
 		if metadataUpdated || needsUpdate {
-			if err := r.Patch(ctx, pod, patch); err != nil {
+			if useWriteBehind {
+				mut := metadataDiff(beforeLabels, pod.Labels, beforeAnnotations, pod.Annotations)
+				if err := r.WriteBehind.Enqueue(ctx, pod, mut, podMetadataFlushBound); err != nil {
+					return nil, fmt.Errorf("failed to enqueue pod metadata patch: %w", err)
+				}
+			} else if err := r.Patch(ctx, pod, patch); err != nil {
 				return nil, fmt.Errorf("failed to patch pod: %w", err)
 			}
 		}
