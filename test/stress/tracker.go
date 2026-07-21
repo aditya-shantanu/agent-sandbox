@@ -38,6 +38,13 @@ const (
 	PhaseProbe Phase = "probe"
 	// PhaseThroughput sandboxes are churned (create -> ready -> delete) to measure sustained throughput.
 	PhaseThroughput Phase = "throughput"
+	// PhaseClaimsWarm fires SandboxClaims simultaneously against a fully
+	// provisioned SandboxWarmPool, measuring claim-create -> claim-Ready latency.
+	PhaseClaimsWarm Phase = "claims-warm"
+	// PhaseClaimsWarmSustained streams SandboxClaims at a target rate with
+	// Poisson jitter against continuously replenished warm pools, measuring
+	// whether create -> Ready latency holds over time (see sustained.go).
+	PhaseClaimsWarmSustained Phase = "claims-warm-sustained"
 )
 
 // PhaseNumber is a 1-based index into the run's phase list (Config.Phases /
@@ -105,7 +112,20 @@ type SandboxRecord struct {
 	NodeName    string `json:"nodeName,omitempty"`
 	ContainerID string `json:"containerID,omitempty"`
 
+	// BoundSandbox is set for claims-warm records only: the name of the warm
+	// Sandbox the SandboxClaim was bound to (status.sandbox.name), for joining
+	// against the sandboxes/pods watch streams offline. The pool names its
+	// sandboxes itself, so claim records never correlate with pod milestones
+	// by name the way raw-sandbox records do.
+	BoundSandbox string `json:"boundSandbox,omitempty"`
+
 	// Client-observed milestones.
+	//
+	// For claims-warm records the tracked object is a SandboxClaim rather
+	// than a Sandbox: CreateCalled/CreateReturned bracket the claim Create
+	// call, SandboxReady is the claim observed with condition Ready=True,
+	// and SandboxDeleted is the claim's watch DELETED event. Pod milestones
+	// stay zero (the backing pod belongs to a pool-named Sandbox).
 	CreateCalled    time.Time `json:"createCalled,omitzero"`    // just before the Create API call
 	CreateReturned  time.Time `json:"createReturned,omitzero"`  // Create API call returned successfully
 	PodCreated      time.Time `json:"podCreated,omitzero"`      // first watch event for the backing Pod
@@ -319,6 +339,55 @@ func (t *Tracker) HandleWatchEvent(resource string, eventType watch.EventType, u
 		t.handleSandboxEvent(eventType, u)
 	case "pods":
 		t.handlePodEvent(eventType, u)
+	case "sandboxclaims":
+		t.handleClaimEvent(eventType, u)
+	}
+}
+
+// handleClaimEvent updates claims-warm records from SandboxClaim watch events.
+// Claim milestones are stored in the shared SandboxRecord fields (see the
+// field comments): the claim's Ready condition marks SandboxReady, so the
+// existing summary/report pipeline treats claim readiness like sandbox
+// readiness. Claim names (p<N>-claim-<i>) never collide with the names of
+// sandboxes or pods created by other phases, so keying by NamespacedName in
+// the same records map is safe.
+func (t *Tracker) handleClaimEvent(eventType watch.EventType, u *unstructured.Unstructured) {
+	id := types.NamespacedName{Name: u.GetName(), Namespace: u.GetNamespace()}
+	now := time.Now()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rec, ok := t.records[id]
+	if !ok {
+		return
+	}
+
+	if eventType == watch.Deleted {
+		if rec.SandboxDeleted.IsZero() {
+			rec.SandboxDeleted = now
+		}
+		// Claims never share a name with a tracked pod, so the claim's
+		// deletion is the last event we will see for this record.
+		rec.gone.Done(true)
+		return
+	}
+
+	if rec.ServerSandboxCreated.IsZero() {
+		rec.ServerSandboxCreated = u.GetCreationTimestamp().Time
+	}
+
+	if rec.BoundSandbox == "" {
+		if name, _, _ := unstructured.NestedString(u.Object, "status", "sandbox", "name"); name != "" {
+			rec.BoundSandbox = name
+		}
+	}
+
+	if ready, ltt := conditionTrue(u, "Ready"); ready && rec.SandboxReady.IsZero() {
+		rec.SandboxReady = now
+		// Server-side cross-check: the claim Ready condition's
+		// lastTransitionTime (1s granularity, controller clock).
+		rec.ServerSandboxReady = ltt
+		rec.ready.Done(true)
 	}
 }
 
