@@ -62,3 +62,43 @@ func TestPFHeaderCaptureRecordsClassification(t *testing.T) {
 		t.Errorf("captured (%q, %q), want (fs-uid-1, pl-uid-1)", fs, pl)
 	}
 }
+
+// TestClaimWatchNamespaces pins the shard set of --per-namespace-claim-watch:
+// always the run namespace, plus the sustained phase's deterministic
+// <ns>-sN namespaces only when that phase actually spreads across N>1.
+func TestClaimWatchNamespaces(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want []string
+	}{
+		{
+			name: "claims-warm only",
+			cfg:  Config{Namespace: "run", Phases: []string{"claims-warm"}, SustainedNamespaces: 4},
+			want: []string{"run"},
+		},
+		{
+			name: "sustained single namespace",
+			cfg:  Config{Namespace: "run", Phases: []string{"claims-warm-sustained"}, SustainedNamespaces: 1},
+			want: []string{"run"},
+		},
+		{
+			name: "sustained sharded",
+			cfg:  Config{Namespace: "run", Phases: []string{"claims-warm", "claims-warm-sustained"}, SustainedNamespaces: 3},
+			want: []string{"run", "run-s1", "run-s2", "run-s3"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := claimWatchNamespaces(tc.cfg)
+			if len(got) != len(tc.want) {
+				t.Fatalf("claimWatchNamespaces() = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("claimWatchNamespaces() = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
