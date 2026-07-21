@@ -70,6 +70,43 @@ var ErrSandboxNotOwned = errors.New("sandbox not owned by this claim")
 // ErrWarmPoolNotFound is a sentinel error indicating a SandboxWarmPool was not found.
 var ErrWarmPoolNotFound = errors.New("SandboxWarmPool not found")
 
+// errStaleClaimView signals that this reconcile pass read a cache view of the
+// claim (or of its bound sandbox) that predates a transition this controller
+// instance already committed and persisted. Such passes must perform zero
+// writes: re-entering adoption would burn a warm candidate on an optimistically
+// locked claim update that can only 409, re-entering the cold path would create
+// a duplicate sandbox for an already-bound claim, and recomputing status on the
+// stale base would regress the persisted status and re-record the Ready-latency
+// histograms (#940). It is a sentinel (not a generic error) so Reconcile can
+// convert it into a bounded requeue with a nil error instead of routing the
+// claim through the per-item exponential failure backoff.
+var errStaleClaimView = errors.New("stale cache view of an already-committed claim transition")
+
+// errAdoptionConflict wraps a 409 from the optimistically locked claim update
+// that records a warm-pool adoption. A conflict there is expected contention
+// (another writer touched the claim between our cached read and the update),
+// not a claim failure: the popped warm candidate has already been returned to
+// the queue, and the retry needs a fresh read of the claim. Surfaced as a
+// sentinel so Reconcile retries via a bounded requeue instead of the per-item
+// exponential failure backoff, whose synchronized retry waves re-collide the
+// same herd of claims that conflicted in the first place (same pattern as
+// #1042 / PR #1072 on the warm-pool controller).
+var errAdoptionConflict = errors.New("adoption write conflict")
+
+// staleViewRequeueDelay bounds the wait before re-checking a claim whose pass
+// was suppressed by errStaleClaimView. Convergence is event-driven — every
+// write that made the view stale produces a watch event that re-enqueues the
+// claim — so this requeue is only a backstop, far below the multi-second
+// exponential backoff an error return would compound into.
+const staleViewRequeueDelay = 50 * time.Millisecond
+
+// adoptionConflictRequeueDelay bounds the wait before retrying an adoption
+// whose optimistically locked claim update hit a 409. Long enough for the
+// conflicting write to land in the informer cache so the retry reads a fresh
+// claim, short enough that losing one race does not push a claim's latency out
+// by whole exponential-backoff steps.
+const adoptionConflictRequeueDelay = 50 * time.Millisecond
+
 var restrictedDomains = []string{"kubernetes.io", "k8s.io", "agents.x-k8s.io"}
 var exemptedMetadataKeys = []string{autoscalerSafeToEvictAnnotation}
 
@@ -130,6 +167,43 @@ func (m *observedTimeMap) LoadOrStore(key types.NamespacedName, entry observedTi
 	return actual.(observedTimeEntry), loaded
 }
 
+// lastWrittenStatusEntry records the last claim status this controller
+// instance successfully persisted (refreshed from the server response of the
+// status patch), keyed by claim UID to protect against a claim being deleted
+// and recreated with the same name. It lets reconcile passes that read a STALE
+// claim from the informer cache recognize that the state they are about to
+// re-establish was already committed — and therefore skip the redundant
+// writes, the re-entry into adoption or the cold path, and the duplicate
+// Ready-latency metric records (#940).
+type lastWrittenStatusEntry struct {
+	uid    types.UID
+	status *extensionsv1beta1.SandboxClaimStatus
+}
+
+// lastWrittenStatusMap is a type-safe wrapper around sync.Map that only stores
+// lastWrittenStatusEntry values. Growth is bounded by the number of live
+// claims: entries are evicted by the timing predicate's DeleteFunc and by the
+// claim-not-found fallback in Reconcile, mirroring observedTimes.
+type lastWrittenStatusMap struct {
+	inner sync.Map
+}
+
+func (m *lastWrittenStatusMap) Load(key types.NamespacedName) (lastWrittenStatusEntry, bool) {
+	val, ok := m.inner.Load(key)
+	if !ok {
+		return lastWrittenStatusEntry{}, false
+	}
+	return val.(lastWrittenStatusEntry), true
+}
+
+func (m *lastWrittenStatusMap) Store(key types.NamespacedName, entry lastWrittenStatusEntry) {
+	m.inner.Store(key, entry)
+}
+
+func (m *lastWrittenStatusMap) Delete(key types.NamespacedName) {
+	m.inner.Delete(key)
+}
+
 // SandboxClaimReconciler reconciles a SandboxClaim object.
 type SandboxClaimReconciler struct {
 	client.Client
@@ -139,7 +213,37 @@ type SandboxClaimReconciler struct {
 	Tracer                  asmetrics.Instrumenter
 	MaxConcurrentReconciles int
 	observedTimes           observedTimeMap
+	lastWrittenStatuses     lastWrittenStatusMap
 	AllowedLabelDomains     []string
+}
+
+// hasWrittenReadyStatus reports whether the last status this controller
+// instance persisted for this claim (same UID) already carried Ready=True.
+// Passes that read a stale (pre-Ready) claim view use it to avoid re-recording
+// the Ready-transition latency histograms: comparing against the pass's cached
+// oldStatus alone misdetects a fresh Ready transition on such passes (#940).
+func (r *SandboxClaimReconciler) hasWrittenReadyStatus(claim *extensionsv1beta1.SandboxClaim) bool {
+	entry, ok := r.lastWrittenStatuses.Load(types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace})
+	if !ok || entry.uid != claim.UID {
+		return false
+	}
+	ready := meta.FindStatusCondition(entry.status.Conditions, string(v1beta1.SandboxConditionReady))
+	return ready != nil && ready.Status == metav1.ConditionTrue
+}
+
+// claimAlreadyBound returns the sandbox name recorded in the last status this
+// controller instance persisted for this claim (same UID), if that status
+// recorded a bound sandbox. It is the stale-pass guard for reconciles that
+// read a PRE-adoption (or pre-cold-create) view of the claim from a lagging
+// cache: because the entry is only stored after a successful status write, a
+// claim view carrying no binding while an entry exists can only predate the
+// committed transition.
+func (r *SandboxClaimReconciler) claimAlreadyBound(claim *extensionsv1beta1.SandboxClaim) (string, bool) {
+	entry, ok := r.lastWrittenStatuses.Load(types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace})
+	if !ok || entry.uid != claim.UID || entry.status.SandboxStatus.Name == "" {
+		return "", false
+	}
+	return entry.status.SandboxStatus.Name, true
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxclaims,verbs=get;list;watch;create;update;patch;delete
@@ -163,6 +267,7 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if k8errors.IsNotFound(err) {
 			// Fallback cleanup to prevent memory leaks if the delete predicate was missed or a stale request is processed.
 			r.observedTimes.Delete(req.NamespacedName)
+			r.lastWrittenStatuses.Delete(req.NamespacedName)
 			logger.V(1).Info("SandboxClaim not found, ignoring", "request", req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
@@ -252,6 +357,19 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		sandbox, reconcileErr = r.reconcileActive(ctx, claim)
 	}
 
+	// A pass whose cache view predates a transition this controller instance
+	// already committed performs ZERO writes: no adoption re-entry, no cold
+	// start, no status recompute on the stale base (which would transiently
+	// regress the persisted status), and no duplicate latency-metric records.
+	// Convergence is event-driven — the committed writes each produce a watch
+	// event that re-enqueues the claim — so the bounded requeue is only a
+	// backstop, and the nil error keeps the claim out of the exponential
+	// failure backoff.
+	if errors.Is(reconcileErr, errStaleClaimView) {
+		logger.V(4).Info("Stale cache view of an already-committed claim transition; deferring to cache convergence", "claim", claim.Name, "reason", reconcileErr)
+		return ctrl.Result{RequeueAfter: staleViewRequeueDelay}, nil
+	}
+
 	// Update Status & Events
 	r.computeAndSetStatus(claim, sandbox, reconcileErr, claimExpired)
 	postExpiration, postTimeLeft := r.checkExpiration(claim)
@@ -268,13 +386,19 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: immediateRequeueDelay}, nil
 	}
 
+	// Capture whether this controller instance had already persisted a
+	// Ready=True status for this claim BEFORE this pass's status write, so the
+	// metric recorder can tell a genuine Ready transition apart from a stale
+	// (pre-Ready) cached view of one it already recorded.
+	readyAlreadyWritten := r.hasWrittenReadyStatus(claim)
+
 	if updateErr := r.updateStatus(ctx, originalClaimStatus, claim); updateErr != nil {
 		errs := errors.Join(reconcileErr, updateErr)
 		logger.V(1).Info("Sandboxclaim UpdateStatus error encountered", "errors", errs, "request", req.NamespacedName)
 		return ctrl.Result{}, errs
 	}
 
-	r.recordCreationLatencyMetric(ctx, claim, originalClaimStatus, sandbox)
+	r.recordCreationLatencyMetric(ctx, claim, originalClaimStatus, sandbox, readyAlreadyWritten)
 
 	// Determine Result
 	var result ctrl.Result
@@ -297,6 +421,23 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// TODO: This 1-minute requeue creates a latency regression vs an immediate watch trigger.
 		// Consider adding a lightweight SandboxTemplate -> claims map watch to reconcile promptly.
 		requeueDelay := 1 * time.Minute
+		if result.RequeueAfter > 0 && result.RequeueAfter < requeueDelay {
+			requeueDelay = result.RequeueAfter
+		}
+		return ctrl.Result{RequeueAfter: requeueDelay}, nil
+	}
+
+	// A 409 on the optimistically locked adoption write is expected contention,
+	// not a failure: the popped warm candidate was already returned to the
+	// queue, so the retry pass has a fresh candidate immediately. Convert to a
+	// bounded requeue with a nil error — returning the error would route the
+	// claim through the per-item exponential backoff (5ms*2^k), whose
+	// synchronized retry waves re-collide exactly the herd of claims that
+	// conflicted in the first place. The nil error lets the workqueue Forget
+	// the key, resetting the failure counter.
+	if errors.Is(reconcileErr, errAdoptionConflict) {
+		logger.V(4).Info("Adoption write conflicted; retrying with a bounded requeue", "claim", claim.Name, "error", reconcileErr)
+		requeueDelay := adoptionConflictRequeueDelay
 		if result.RequeueAfter > 0 && result.RequeueAfter < requeueDelay {
 			requeueDelay = result.RequeueAfter
 		}
@@ -502,6 +643,21 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 		return nil
 	}
 
+	// Stale-pass suppression: when the reconcile read a STALE claim from the
+	// informer cache (oldStatus predates our own last write), the recomputed
+	// status can differ from oldStatus while being identical to what this
+	// controller already persisted. Re-issuing the patch would be a no-op on
+	// the server but still spawns another watch event and thus another
+	// redundant pass. Skip the patch when the computed status equals the last
+	// status successfully written for this claim UID.
+	key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
+	if entry, ok := r.lastWrittenStatuses.Load(key); ok && entry.uid == claim.UID &&
+		equality.Semantic.DeepEqual(entry.status, &claim.Status) {
+		logger.V(4).Info("Skipping redundant sandboxclaim status patch: computed status equals last written status (stale cache view)",
+			"name", claim.Name, "namespace", claim.Namespace)
+		return nil
+	}
+
 	oldClaim := claim.DeepCopy()
 	oldClaim.Status = *oldStatus
 
@@ -511,6 +667,10 @@ func (r *SandboxClaimReconciler) updateStatus(ctx context.Context, oldStatus *ex
 		logger.Error(err, "Failed to patch sandboxclaim status")
 		return err
 	}
+
+	// Remember what was actually persisted (the patch refreshed claim.Status
+	// from the server response) so stale-cache passes can be recognized.
+	r.lastWrittenStatuses.Store(key, lastWrittenStatusEntry{uid: claim.UID, status: claim.Status.DeepCopy()})
 
 	logger.V(4).Info("Successfully patched sandboxclaim status",
 		"name", claim.Name,
@@ -540,6 +700,18 @@ func (r *SandboxClaimReconciler) computeReadyCondition(claim *extensionsv1beta1.
 				Status:             metav1.ConditionFalse,
 				Reason:             reason,
 				Message:            fmt.Sprintf("SandboxWarmPool %q not found", claim.Spec.WarmPoolRef.Name),
+				ObservedGeneration: claim.Generation,
+			}
+		}
+		if errors.Is(err, errAdoptionConflict) {
+			// Expected contention on the optimistically locked adoption write,
+			// not a claim failure: a bounded requeue retries with a fresh
+			// candidate and a fresh read of the claim.
+			return metav1.Condition{
+				Type:               string(v1beta1.SandboxConditionReady),
+				Status:             metav1.ConditionFalse,
+				Reason:             "AdoptionConflict",
+				Message:            "Warm-pool adoption write conflicted with a concurrent update; retrying",
 				ObservedGeneration: claim.Generation,
 			}
 		}
@@ -851,8 +1023,11 @@ func (r *SandboxClaimReconciler) adoptSandboxFromCandidates(ctx context.Context,
 			if err := r.Update(ctx, claim); err != nil {
 				r.WarmSandboxQueue.Add(namespacedWarmPoolNameForQueue, adoptedKey)
 				if k8errors.IsConflict(err) {
-					// Conflict means someone else updated the claim. We fail and retry.
-					return false, err
+					// Conflict means someone else updated the claim. The candidate was
+					// returned to the queue above; wrap in the sentinel so Reconcile
+					// retries via a bounded requeue instead of the exponential
+					// failure backoff.
+					return false, fmt.Errorf("%w: claim %s: %w", errAdoptionConflict, claim.Name, err)
 				}
 				logger.Error(err, "Failed to update claim for adoption", "claim", claim.Name, "sandbox", adopted.Name)
 				return false, err
@@ -1484,6 +1659,17 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 
 			controllerRef := metav1.GetControllerOf(sandbox)
 			if controllerRef != nil && controllerRef.Kind == "SandboxWarmPool" {
+				// The cached sandbox still shows the warm-pool owner. If this
+				// controller instance already persisted a bound status naming this
+				// exact sandbox, the ownership flip was committed and this pass is
+				// reading a pre-adoption view: skip the redundant (idempotent)
+				// re-patch and let the Owns() watch deliver the converged object.
+				// After a restart the in-memory record is empty and the pass
+				// degrades to the idempotent re-patch below (#1107).
+				if boundName, ok := r.claimAlreadyBound(claim); ok && boundName == sbName {
+					logger.V(4).Info("Adoption already committed for sandbox; stale cache view, awaiting convergence", "sandbox", sbName, "claim", claim.Name)
+					return nil, fmt.Errorf("%w: sandbox %s", errStaleClaimView, sbName)
+				}
 				// Still in warm pool. Try to complete adoption!
 				logger.Info("Sandbox found in claim metadata still in warm pool, trying to complete adoption", "sandbox", sbName, "claim", claim.Name)
 				if err := verifySandboxCandidate(sandbox, claim); err != nil {
@@ -1566,6 +1752,26 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 			return nil, fmt.Errorf("failed to initialize launch type label on sandbox %q: %w", sandbox.Name, err)
 		}
 		return sandbox, nil
+	}
+
+	// Stale-pass guard: reaching this point with a claim view that carries NO
+	// bound status, NO assigned-sandbox annotation and NO legacy label means
+	// either the claim is genuinely new, or the cache served a pre-adoption
+	// (or pre-cold-create) view of a claim this controller instance already
+	// bound — only the in-memory record of the last persisted status can tell
+	// the two apart, because the record is only stored after a successful
+	// status write and a converged view therefore always carries the binding.
+	// Without this guard such stale passes re-enter adoption (burning a warm
+	// candidate on an optimistically locked claim update that can only 409)
+	// or, with the warm queue momentarily empty, fall through to createSandbox
+	// and produce a duplicate cold sandbox for an already-bound claim.
+	if claim.Status.SandboxStatus.Name == "" &&
+		claim.Annotations[extensionsv1beta1.AssignedSandboxNameAnnotation] == "" &&
+		claim.Labels[extensionsv1beta1.DeprecatedAssignedSandboxNameLabel] == "" {
+		if boundName, ok := r.claimAlreadyBound(claim); ok {
+			logger.V(1).Info("Stale cache view of an already-bound claim; awaiting convergence instead of re-entering adoption or cold start", "claim", claim.Name, "boundSandbox", boundName)
+			return nil, fmt.Errorf("%w: claim %s already bound to %s", errStaleClaimView, claim.Name, boundName)
+		}
 	}
 
 	// Implicit Cold Start Detection (Bypassing the Queue):
@@ -1680,6 +1886,9 @@ func (r *SandboxClaimReconciler) getTimingPredicate() predicate.Funcs {
 			entry, ok := r.observedTimes.Load(key)
 			if ok && entry.uid == e.Object.GetUID() {
 				r.observedTimes.Delete(key)
+			}
+			if statusEntry, ok := r.lastWrittenStatuses.Load(key); ok && statusEntry.uid == e.Object.GetUID() {
+				r.lastWrittenStatuses.Delete(key)
 			}
 			return true
 		},
@@ -1837,11 +2046,17 @@ func (r *SandboxClaimReconciler) recordSandboxCreationLatency(sandbox *v1beta1.S
 }
 
 // recordCreationLatencyMetric detects and records transitions to Ready state.
+// readyAlreadyWritten must reflect whether this controller instance had
+// already persisted a Ready=True status for the claim BEFORE this pass's
+// status write: on passes that read a stale (pre-Ready) claim from the cache,
+// oldStatus alone would misdetect a fresh Ready transition and re-record the
+// latency histograms (#940).
 func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 	ctx context.Context,
 	claim *extensionsv1beta1.SandboxClaim,
 	oldStatus *extensionsv1beta1.SandboxClaimStatus,
 	sandbox *v1beta1.Sandbox,
+	readyAlreadyWritten bool,
 ) {
 	logger := log.FromContext(ctx)
 
@@ -1853,7 +2068,7 @@ func (r *SandboxClaimReconciler) recordCreationLatencyMetric(
 
 	// Do not record creation metric if we have already seen the ready state.
 	oldReady := meta.FindStatusCondition(oldStatus.Conditions, string(v1beta1.SandboxConditionReady))
-	if oldReady != nil && oldReady.Status == metav1.ConditionTrue {
+	if readyAlreadyWritten || (oldReady != nil && oldReady.Status == metav1.ConditionTrue) {
 		// Already Ready before this reconcile; drain any entry re-added by a post-Ready UpdateFunc.
 		key := types.NamespacedName{Name: claim.Name, Namespace: claim.Namespace}
 		if entry, ok := r.observedTimes.Load(key); ok && entry.uid == claim.UID {
