@@ -38,6 +38,12 @@ Ground rules for every upstream PR:
    overlap with open PR #1118, each either default-off or
    behavior-identical, spread across maintainer areas (controller
    transport, claim watch, manager lifecycle, Python SDK, router).
+   *Amendment (2026-07-21):* every PR we OPEN must carry a this-change-alone
+   A/B run (tuned 6-node kops cluster, one cluster reused, clean
+   instrumentation) — so only P1, P3, P9 are opened in wave 1, each after
+   its A/B leg; P8 and P10 are held fully prepared (branches validated +
+   pushed, complete bodies in `pr-drafts/P8.md` / `pr-drafts/P10.md` with
+   their deferred A/B protocols).
 2. **Wave 2 (after wave-1 review signals):** P2, P5, P6, P11 — claim/
    sandbox controller semantics; sequence so each rebases trivially.
 3. **Wave 3:** P7 (reuses P1's `newIsolatedHTTPClient`; send after P1
