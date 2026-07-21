@@ -44,6 +44,22 @@ Ground rules for every upstream PR:
    its A/B leg; P8 and P10 are held fully prepared (branches validated +
    pushed, complete bodies in `pr-drafts/P8.md` / `pr-drafts/P10.md` with
    their deferred A/B protocols).
+   **FILED (2026-07-21, each with per-PR same-cluster A/B evidence from
+   `perf-bench-results/wave-ab-3/`):**
+   - P1 → [PR #1240](https://github.com/kubernetes-sigs/agent-sandbox/pull/1240)
+     (p90 2684→2175ms −19%, all-ready 3.87→2.90s, claim workqueue
+     queue-duration p50 221.6→8.9ms at stock defaults; 400-worker forensic
+     2479→1740ms cited)
+   - P3 → [PR #1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245)
+     (claim reconciles −19% at stock 50 workers; at 400/400 workers −43%
+     (9,207→5,259), p90 1427→985ms, all-ready 8.39→6.42s; PAIR-P3HC)
+   - P9 → [PR #1241](https://github.com/kubernetes-sigs/agent-sandbox/pull/1241)
+     (SDK wait mean 68.4→54.9ms, p90 83.7→66.0ms, n=50/mode, same cluster)
+   A/B mechanics: parallel per-PR cluster pairs (BASE + change leg on the
+   same cluster), hybrid bench branches `bench-wave1-{base,p1,p3}` = leg
+   code + fork harness overlay; orchestrators v14-v16 archived in
+   `perf-bench-scripts/`. Post-filing stress validation (fill +
+   throughput-mif100/50 + sustained 40/s) runs as `wave-sv-1`.
 2. **Wave 2 (after wave-1 review signals):** P2, P5, P6, P11 — claim/
    sandbox controller semantics; sequence so each rebases trivially.
 3. **Wave 3:** P7 (reuses P1's `newIsolatedHTTPClient`; send after P1
