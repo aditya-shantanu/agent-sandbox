@@ -35,6 +35,7 @@ import (
 	"github.com/felixge/fgprof"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/events"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
@@ -83,6 +84,8 @@ func main() {
 	var webhookNamespace string
 	var manageWebhookCerts bool
 	var enableWebhook bool
+	var disableClaimEvents bool
+	var disableClaimObservabilityAnnotations bool
 
 	flag.BoolVar(&printVersion, "version", false, "Print version information and exit.")
 	flag.IntVar(&webhookPort, "webhook-port", 9443, "The port the webhook server binds to.")
@@ -119,6 +122,15 @@ func main() {
 	flag.IntVar(&sandboxTemplateConcurrentWorkers, "sandbox-template-concurrent-workers", 1, "Max concurrent reconciles for the SandboxTemplate controller")
 	flag.IntVar(&sandboxWarmPoolMaxBatchSize, "sandbox-warm-pool-max-batch-size", 300, "Max batch size for parallel sandbox creation and deletion in SandboxWarmPool controller. Default is 300.")
 	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
+	flag.BoolVar(&disableClaimEvents, "disable-claim-events", false,
+		"Disable Kubernetes Event emission from the SandboxClaim controller (its Eventf calls become no-ops), "+
+			"reducing API server writes during large claim bursts. Default false (events enabled).")
+	flag.BoolVar(&disableClaimObservabilityAnnotations, "disable-claim-observability-annotations", false,
+		"Skip persisting the SandboxClaim observability annotations (controller first-observed timestamp, trace context), "+
+			"removing one API write per claim. The values are still stamped on the in-memory object, so startup-latency "+
+			"metrics and trace propagation to the Sandbox keep working within the controller process. Costs the on-object "+
+			"debugging breadcrumbs and, after a controller restart, the startup-latency metric for claims first observed "+
+			"by the previous process. Default false (annotations persisted).")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -360,13 +372,27 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Every Eventf site in the claim controller is nil-guarded on the
+		// recorder, so a nil recorder cleanly disables event emission.
+		var claimRecorder events.EventRecorder
+		if disableClaimEvents {
+			setupLog.Info("SandboxClaim controller event emission disabled (--disable-claim-events)")
+		} else {
+			claimRecorder = mgr.GetEventRecorder("sandboxclaim-controller")
+		}
+
+		if disableClaimObservabilityAnnotations {
+			setupLog.Info("SandboxClaim observability annotation persistence disabled (--disable-claim-observability-annotations)")
+		}
+
 		if err = (&extensionscontrollers.SandboxClaimReconciler{
-			Client:              mgr.GetClient(),
-			Scheme:              mgr.GetScheme(),
-			WarmSandboxQueue:    warmSandboxQueue,
-			Recorder:            mgr.GetEventRecorder("sandboxclaim-controller"),
-			Tracer:              instrumenter,
-			AllowedLabelDomains: allowedDomains,
+			Client:                          mgr.GetClient(),
+			Scheme:                          mgr.GetScheme(),
+			WarmSandboxQueue:                warmSandboxQueue,
+			Recorder:                        claimRecorder,
+			Tracer:                          instrumenter,
+			AllowedLabelDomains:             allowedDomains,
+			DisableObservabilityAnnotations: disableClaimObservabilityAnnotations,
 		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
 			os.Exit(1)
