@@ -43,6 +43,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	"sigs.k8s.io/agent-sandbox/internal/version"
+	"sigs.k8s.io/agent-sandbox/internal/writebehind"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -75,6 +76,7 @@ func main() {
 	var sandboxWarmPoolConcurrentWorkers int
 	var sandboxTemplateConcurrentWorkers int
 	var sandboxWarmPoolMaxBatchSize int
+	var sandboxWriteBehindWindow time.Duration
 	var enableWarmPoolEviction bool
 	var printVersion bool
 	var webhookPort int
@@ -119,6 +121,12 @@ func main() {
 	flag.IntVar(&sandboxTemplateConcurrentWorkers, "sandbox-template-concurrent-workers", 1, "Max concurrent reconciles for the SandboxTemplate controller")
 	flag.IntVar(&sandboxWarmPoolMaxBatchSize, "sandbox-warm-pool-max-batch-size", 300, "Max batch size for parallel sandbox creation and deletion in SandboxWarmPool controller. Default is 300.")
 	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
+	flag.DurationVar(&sandboxWriteBehindWindow, "sandbox-write-behind-window", 0,
+		"Coalescing window for the Sandbox controller's recoverable metadata-only writes (the pod "+
+			"label/annotation reconciliation patch and the sandbox pod-name annotation). Pending mutations "+
+			"to the same object merge into one patch flushed within the window; pod patches additionally "+
+			"flush within min(window, 1s) so the safe-to-evict strip cannot lag the cluster autoscaler. "+
+			"0 disables coalescing (synchronous writes); e.g. 250ms enables coalescing.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -320,11 +328,32 @@ func main() {
 	// Register the custom Sandbox metric collector globally.
 	asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
 
+	// Write-behind coalescing for the Sandbox controller's recoverable
+	// metadata-only writes. Default (0) is fully synchronous: no Flusher is
+	// constructed and the controller keeps its stock write path.
+	var writeBehindFlusher *writebehind.Flusher
+	if sandboxWriteBehindWindow > 0 {
+		writeBehindFlusher, err = writebehind.New(mgr.GetClient(), mgr.GetScheme(), writebehind.Options{
+			Window: sandboxWriteBehindWindow,
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to build write-behind flusher")
+			os.Exit(1)
+		}
+		if err := mgr.Add(writeBehindFlusher); err != nil {
+			setupLog.Error(err, "unable to register write-behind flusher with manager")
+			os.Exit(1)
+		}
+		setupLog.Info("Sandbox controller write-behind coalescing enabled (--sandbox-write-behind-window)",
+			"window", sandboxWriteBehindWindow, "podPatchBound", "1s")
+	}
+
 	if err = (&controllers.SandboxReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		Tracer:        instrumenter,
 		ClusterDomain: clusterDomain,
+		WriteBehind:   writeBehindFlusher,
 	}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)
