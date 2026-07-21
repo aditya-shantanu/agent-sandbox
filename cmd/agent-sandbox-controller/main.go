@@ -167,6 +167,13 @@ func main() {
 		setupLog.Error(nil, "sandbox-warm-pool-max-batch-size must be greater than 0")
 		os.Exit(1)
 	}
+	// 0 means "write-behind disabled"; a negative window is always a
+	// misconfiguration, so fail fast instead of silently disabling.
+	if sandboxWriteBehindWindow < 0 {
+		setupLog.Error(nil, "sandbox-write-behind-window must be >= 0 (0 disables write-behind coalescing)",
+			"value", sandboxWriteBehindWindow)
+		os.Exit(1)
+	}
 	// A logical maximum (too much will create unnecessary load on the API server)
 	totalWorkers := sandboxConcurrentWorkers + sandboxClaimConcurrentWorkers + sandboxWarmPoolConcurrentWorkers + sandboxTemplateConcurrentWorkers
 	if totalWorkers > 1000 {
