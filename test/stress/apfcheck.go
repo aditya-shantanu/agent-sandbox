@@ -14,13 +14,14 @@
 
 package main
 
-// APF priority-level preflight.
+// APF priority-level preflight (ROUND7-PLAN item 3a, automated).
 //
-// The claims phases' create-ack numbers assume the harness's claim POSTs
-// ride the APF *exempt* priority level (admin kubeconfig -> system:masters
-// -> the built-in "exempt" FlowSchema). A mis-provisioned kubeconfig
-// silently shifts every create onto a queued priority level and poisons
-// the run's create-ack numbers without any visible error.
+// Every create-ack budget in the perf investigation assumes the harness's
+// claim POSTs ride the APF *exempt* priority level (admin kubeconfig ->
+// system:masters -> the built-in "exempt" FlowSchema). That assumption was
+// previously verified by hand per cluster; a mis-provisioned kubeconfig
+// silently shifts the whole S0 segment onto a queued priority level and
+// poisons the leg's numbers without any visible error.
 //
 // The apiserver reports the APF classification of EVERY request in the
 // X-Kubernetes-PF-FlowSchema-UID / X-Kubernetes-PF-PriorityLevel-UID
@@ -72,8 +73,8 @@ type APFVerification struct {
 	// Exempt reports whether the claim POST classified into the exempt
 	// priority level — the bench-calibration contract.
 	Exempt bool `json:"exempt"`
-	// Error records a non-fatal preflight failure (the run proceeds and is
-	// annotated as unverified rather than aborted).
+	// Error records a non-fatal preflight failure (the run proceeds; the
+	// leg is then annotated as PL-unverified rather than aborted).
 	Error string `json:"error,omitempty"`
 }
 
@@ -170,13 +171,13 @@ func resolveUIDToName(ctx context.Context, client dynamic.Interface, gvr schema.
 func logAPFVerification(v *APFVerification) {
 	switch {
 	case v.Error != "":
-		log.Printf("APF preflight: UNVERIFIED (%s) — create-ack numbers may include priority-level queueing", v.Error)
+		log.Printf("APF preflight: UNVERIFIED (%s) — create-ack (S0) numbers may include priority-level queueing", v.Error)
 	case v.Exempt:
 		log.Printf("APF preflight: claim POSTs ride flowSchema=%q priorityLevel=%q (exempt: no APF queueing on the create path)",
 			v.FlowSchema, v.PriorityLevel)
 	default:
 		log.Printf("APF preflight WARNING: claim POSTs classify into flowSchema=%q priorityLevel=%q (uid %s), NOT the exempt level — "+
-			"create-ack measurements will include APF seat contention; check the kubeconfig user (expected system:masters)",
+			"S0/create-ack measurements will include APF seat contention; check the kubeconfig user (expected system:masters)",
 			v.FlowSchema, v.PriorityLevel, v.PriorityLevelUID)
 	}
 }
