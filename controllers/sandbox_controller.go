@@ -175,9 +175,9 @@ type SandboxReconciler struct {
 	ClusterDomain string
 
 	// WriteBehind, when non-nil, coalesces this controller's RECOVERABLE
-	// metadata-only writes — the pod label/annotation reconciliation patch
-	// and the sandbox pod-name annotation — into one merge patch per object,
-	// flushed within a bounded window (--sandbox-write-behind-window). nil
+	// metadata-only writes — the pod label/annotation reconciliation patch —
+	// into one merge patch per object, flushed within a bounded window
+	// (--sandbox-write-behind-window). nil
 	// (the default) preserves the fully synchronous behavior on the exact
 	// same code paths. Only writes that the next level-based reconcile
 	// recomputes verbatim from informer state are routed here, so a crash
@@ -932,24 +932,6 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 
 		if annotatedPodName != "" {
 			logger.Info("Skipping pod name annotation update because sandbox already tracks a different pod", "trackedPodName", annotatedPodName, "podName", podName)
-			return nil
-		}
-
-		// Recoverable write: the annotation is a pure function of observed
-		// state (the pod's name), the in-memory copy below already serves
-		// THIS pass, and resolvePodName falls back to sandbox.Name — so a
-		// deferred flush lost in a crash is recomputed and re-enqueued by
-		// the next reconcile. Safe to write-behind with the full window.
-		if r.WriteBehind != nil {
-			if sandbox.Annotations == nil {
-				sandbox.Annotations = make(map[string]string)
-			}
-			sandbox.Annotations[sandboxv1beta1.SandboxPodNameAnnotation] = podName
-			if err := r.WriteBehind.Enqueue(ctx, sandbox, writebehind.Mutation{
-				SetAnnotations: map[string]string{sandboxv1beta1.SandboxPodNameAnnotation: podName},
-			}, 0); err != nil {
-				return fmt.Errorf("failed to enqueue pod name annotation write: %w", err)
-			}
 			return nil
 		}
 

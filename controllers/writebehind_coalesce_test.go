@@ -317,39 +317,3 @@ func TestWriteBehindCrashRecovery(t *testing.T) {
 		t.Error("warm-pool label not stripped by the recovery reconcile")
 	}
 }
-
-// TestWriteBehindPodNameAnnotation: the sandbox pod-name annotation is
-// write-behind-eligible with the full window; it lands after flush and the
-// current pass proceeds on the in-memory copy.
-func TestWriteBehindPodNameAnnotation(t *testing.T) {
-	counters := &wbCounters{}
-	sb, pod := postAdoptionFixture()
-	sb.Annotations = nil // cold-style: annotation not yet recorded
-	// Make the pod fully converged so the ONLY write left is the annotation.
-	pod.Labels = map[string]string{sandboxLabel: NameHash(wbSandbox)}
-	pod.Annotations = nil
-	sb.OwnerReferences = nil // standalone sandbox
-	cl := newWbClient(counters, sb, pod)
-	r := newWbReconciler(t, cl, time.Hour)
-
-	wbReconcile(t, r)
-	if counters.sandboxPatches != 0 {
-		t.Fatalf("sandbox (non-status) patches during reconcile: %d, want 0 (deferred)", counters.sandboxPatches)
-	}
-	if counters.podPatches != 0 {
-		t.Fatalf("pod patches during reconcile: %d, want 0 (pod converged)", counters.podPatches)
-	}
-	if err := r.WriteBehind.FlushAll(context.Background()); err != nil {
-		t.Fatalf("FlushAll: %v", err)
-	}
-	if counters.sandboxPatches != 1 {
-		t.Fatalf("sandbox patches after flush: %d, want 1", counters.sandboxPatches)
-	}
-	gotSb := &sandboxv1beta1.Sandbox{}
-	if err := cl.Get(context.Background(), types.NamespacedName{Name: wbSandbox, Namespace: wbNamespace}, gotSb); err != nil {
-		t.Fatalf("get sandbox: %v", err)
-	}
-	if gotSb.Annotations[sandboxv1beta1.SandboxPodNameAnnotation] != wbSandbox {
-		t.Errorf("pod-name annotation not flushed: %v", gotSb.Annotations)
-	}
-}
