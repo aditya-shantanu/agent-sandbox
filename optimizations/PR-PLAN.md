@@ -148,3 +148,20 @@ in that table would shift under a post-#1245 BASE.
 `upstream-p8-lease-release`, `upstream-p9-sdk-single-watch`,
 `upstream-p10-router-name-cache` (fork branches; PRs target
 `kubernetes-sigs:main`).
+
+**P11 REST-client latency histograms — CLOSED (2026-07-22), superseded by
+upstream.** igooch held [#1247](https://github.com/kubernetes-sigs/agent-sandbox/pull/1247):
+controller-runtime#3510 (merged 2026-05-22, cherry-picked to `release-0.24`
+via c-r#3525) adds the same histograms — identical names/labels — as opt-in
+via `metrics.RegisterRESTClientMetrics(...)`. Carrying our local adapter
+would panic on duplicate registration post-bump and races c-r's early
+`sync.Once` adapter registration for client-go's metrics hook. Agreed and
+closed; successor plan: after the next c-r 0.24.x/0.25 dependency bump, send
+the one-line enablement PR
+(`metrics.RegisterRESTClientMetrics(metrics.MetricRequestLatency,
+metrics.MetricRateLimiterLatency)`). Sub-5ms bucket resolution (upstream
+classic buckets start at 5ms; our warm hot path is 1–15ms) raised upstream as
+[controller-runtime#3559](https://github.com/kubernetes-sigs/controller-runtime/issues/3559)
+(bucket overrides at registration; native histograms already cover
+native-capable pipelines). The instrumentation itself lives on in
+`perf-investigation-master` for our own benchmarking regardless.
