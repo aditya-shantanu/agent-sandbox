@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/pem"
 	"fmt"
-	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -66,7 +65,9 @@ func (c *connTrackingServer) snapshot() map[string]int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make(map[string]int, len(c.reqsPerConn))
-	maps.Copy(out, c.reqsPerConn)
+	for k, v := range c.reqsPerConn {
+		out[k] = v
+	}
 	return out
 }
 
@@ -136,7 +137,7 @@ func TestCreateShardingDistinctConnections(t *testing.T) {
 
 	// Sequential requests: round-robin is deterministic and a shard never
 	// dials twice (its connection is established by the prior request).
-	for i := range requests {
+	for i := 0; i < requests; i++ {
 		resp, err := httpClient.Get(fmt.Sprintf("%s/probe/%d", server.srv.URL, i))
 		if err != nil {
 			t.Fatalf("request %d: %v", i, err)
@@ -183,7 +184,7 @@ func TestWatchClientKeepsOwnConnection(t *testing.T) {
 		t.Fatalf("rest.HTTPClientFor(mutate): %v", err)
 	}
 
-	for i := range 2 * shardCount {
+	for i := 0; i < 2*shardCount; i++ {
 		resp, err := mutateClient.Get(server.srv.URL + "/create")
 		if err != nil {
 			t.Fatalf("mutate request %d: %v", i, err)
@@ -199,7 +200,7 @@ func TestWatchClientKeepsOwnConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rest.HTTPClientFor(base): %v", err)
 	}
-	for i := range 3 {
+	for i := 0; i < 3; i++ {
 		resp, err := watchClient.Get(server.srv.URL + "/watch")
 		if err != nil {
 			t.Fatalf("watch request %d: %v", i, err)
