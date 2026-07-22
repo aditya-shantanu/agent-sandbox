@@ -142,6 +142,27 @@ force-pushed → PR head `2588c32`; PR retitled + body replaced (Fixes
 and Copilot threads answered and resolved. /hold remains until she
 re-reviews.
 
+**P6 write-behind (`upstream-p6-write-behind-coalescing` = PR
+[#1252](https://github.com/kubernetes-sigs/agent-sandbox/pull/1252)) —
+rework SHIPPED 2026-07-22: RequeueAfter adopted, flusher retired.**
+justinsb's review suggested returning `RequeueAfter` instead of the
+`internal/writebehind` background flusher; the three-way A/B he asked
+for (immediate / flusher / RequeueAfter, one cluster, burst + sustained
+churn — full table in `RESULTS.md` and
+pull/1252#issuecomment-5052059674) showed the flusher has a
+churn-collapse mode (deferred writes fire post-deletion: 181 useful
+patches vs 3,072 404s, +33% total writes, monotonic latency spiral)
+while RequeueAfter holds (no collapse, fewest 409s, ~+10% reconciles as
+its only cost). SV-P6's earlier clean sustained flusher leg reconciles:
+it had no preceding burst — the same preceding-churn trigger pattern as
+the ARM-1256 rep1 collapse. Reworked (user-approved): single commit on
+main `9dcbe62`, RequeueAfter deferral + `deferredWriteClock`
+(timestamp-only, no payloads), same flag, `internal/writebehind` and
+DESIGN-NOTE.md removed; readiness-guarantee and crash-recovery tests
+pinned; validation green; force-pushed → PR head `e5a83ea`; PR retitled
++ body replaced (three-way table, "Why not the flusher" crediting
+justinsb); thread reply posted, left unresolved for his call.
+
 **A/B relevance after the merge:** #1245's change is now part of BASE for
 every future benchmark leg. The already-captured per-PR A/B tables predate
 it — that is fine: each table isolated exactly its own change against the

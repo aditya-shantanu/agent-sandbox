@@ -1156,3 +1156,63 @@ final body (Fixes #940); igooch reply posted
 (pull/1256#issuecomment-5051235861); CodeRabbit V(4) and Copilot
 ordering threads answered and resolved. /hold stays until igooch
 reviews the rework.
+
+## 2026-07-22 — PR #1252 THREE-WAY A/B (immediate / flusher / RequeueAfter): flusher has a churn-collapse mode; RequeueAfter ADOPTED, flusher RETIRED
+
+Direct comparison justinsb asked for on the PR: three legs on ONE fresh
+tuned 12-node kops cluster (redeploy only between legs; e2-standard-16
+CP; each leg: 300-claim warm burst + 45/s × 60s sustained Poisson churn,
+2s claim dwell, 0 failed claims everywhere). Arms: `window=0` immediate
+(control), the PR's `internal/writebehind` flusher at 250ms, and the
+RequeueAfter deferral variant (`p6-requeueafter-variant` @ `b81b504`) at
+250ms. Posted verbatim:
+[pull/1252#issuecomment-5052059674](https://github.com/kubernetes-sigs/agent-sandbox/pull/1252#issuecomment-5052059674).
+
+| | immediate (window=0) | write-behind flusher (250ms) | **RequeueAfter (250ms)** |
+|---|---|---|---|
+| burst p50/p90 | 1465/3201ms | **1049/2243ms** | 1271/3158ms |
+| sustained p50/p90 | **320/680ms** | 2139/7530ms (windows 399→4068ms, monotonic) | 507/1027ms (no collapse) |
+| pod metadata PATCHes | 2,953 ok | **181 ok + 3,072 hit 404** | 2,997 ok |
+| total controller writes | 48,624 | 64,823 (+33%) | 49,836 |
+| optimistic 409s | 5,447 | 7,877 | **3,077 (fewest)** |
+| sandbox reconciles | 53,462 | 55,641 | 58,819 (+10% — the "extra pass per deferred write" cost, confirmed and absorbed) |
+
+**Finding — flusher churn-collapse mode:** under sustained churn the
+flusher's deferred writes routinely fire AFTER their objects are deleted
+(2s dwell < in-flight lifetime + window backlog): the intended write
+reduction inverts into write amplification (181 useful patches vs 3,072
+404s; +33% total writes) plus a monotonic latency spiral. The
+RequeueAfter form kills the failure mode structurally — the flush pass
+re-reads current state before writing, so a deleted/changed object
+produces no patch — at a measured cost of ~+10% reconcile passes (and it
+recorded the FEWEST 409s of the three arms). Honest residual case for
+the flusher: it won the burst leg (1049/2243ms) — burst-heavy,
+long-lived-sandbox profiles — but that upside is not worth a mechanism
+with a collapse mode.
+
+**SV-P6 reconciliation:** SV-P6's earlier clean sustained leg for the
+flusher does NOT contradict this — that run had no preceding burst, the
+same preceding-churn trigger pattern as the ARM-1256 rep1 collapse
+(clean in rep2s burst-free control, collapsed after a burst). The
+flusher's pathology needs in-flight deferred writes racing deletions;
+a from-idle sustained leg never builds that backlog.
+
+**Decision + rework SHIPPED (user-approved):** PR #1252 reworked to the
+RequeueAfter mechanism. New single-commit series on upstream main
+`9dcbe62` (variant was already based on it; no conflicts): kept
+`controllers/writebehind_requeue.go` (deferredWriteClock, timestamp-only
+— no mutation payloads), `SandboxReconciler.WriteBehindWindow` deferral
++ RequeueAfter return in `sandbox_controller.go`, same
+`--sandbox-write-behind-window` flag in `main.go` (no flusher), tests
+incl. the readiness-never-gated pin and crash recovery
+(`TestRequeueDeferralCoalescesAdoptionPodPatch`,
+`TestRequeueDeferralCrashRecovery`, `TestWriteBehindDisabledIsSynchronous`).
+REMOVED: the entire `internal/writebehind` package (+tests) and
+DESIGN-NOTE.md (content moved to the PR body). Validation green
+(build/vet/gofmt/unit+race/lint-go 0 issues). Force-pushed → PR head
+`e5a83ea`; PR retitled ("perf(sandbox): opt-in coalescing of recoverable
+metadata writes via RequeueAfter deferral") with new body (three-way
+table + "Why not the flusher", credits justinsb's RequeueAfter
+suggestion); reply posted in his `writebehind.go` thread
+([discussion_r3634195788](https://github.com/kubernetes-sigs/agent-sandbox/pull/1252#discussion_r3634195788)),
+left unresolved for his call.
