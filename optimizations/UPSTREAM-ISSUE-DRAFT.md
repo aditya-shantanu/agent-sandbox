@@ -233,11 +233,18 @@ is lost.
 
 ### Task 5: 🟢 ++ — Adoption conflicts → bounded requeue, not exponential backoff
 
-**Problem.** A 409 on the adoption write routed the claim through
-controller-runtime's per-item exponential backoff (5ms·2^k). Under burst
-contention this produced visible retry waves at 0.8/1.2/1.6s — losing a
-race once pushed a claim's latency out by whole backoff steps, and the
-waves re-synchronized the herd.
+**Problem.** A 409 on the adoption write failed the reconcile pass. Under
+burst contention this produced visible retry waves at 0.8/1.2/1.6s. The
+wave spacing is not rate-limiter backoff — on controller-runtime v0.24.1
+the priority queue is the default (`ptr.Deref(options.UsePriorityQueue,
+true)`, `pkg/controller/controller.go:252-266`) and its default limiter is
+per-item exponential with a 5ms base only (the 10qps/100burst bucket
+limiter applies only on the legacy-queue path), so early retries delay
+5-80ms, not hundreds. The measured mechanism (`ROUND2-FINDINGS.md`, root
+cause #3): a clean adoption pass costs ≈300ms and each conflict/retry
+cycle adds ≈400ms of doomed write plus re-pass work, so losing the race
+once pushes a claim out by a whole conflict cycle — and the
+re-synchronized herd collides again.
 
 **Fix (mechanism).** Conflict sentinel → `nil` error + 50ms `RequeueAfter`,
 with the popped candidate returned to the queue so the retry pass has a
