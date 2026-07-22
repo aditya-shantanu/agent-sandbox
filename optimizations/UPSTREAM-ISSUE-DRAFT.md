@@ -86,7 +86,7 @@ reviewable and roughly maps to one investigation branch.
 | 1 | Watch/write connection split + sharding | 🟢 | ++++ | merged | none — novel |
 | 2 | Stale-cache re-adoption guard | 🟢 | +++ | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527), [#418](https://github.com/kubernetes-sigs/agent-sandbox/issues/418), [#940](https://github.com/kubernetes-sigs/agent-sandbox/issues/940) |
 | 3 | Cold-start guard + adoption optimistic lock | 🟢 | +++ | merged | [#418](https://github.com/kubernetes-sigs/agent-sandbox/issues/418), [#478](https://github.com/kubernetes-sigs/agent-sandbox/issues/478), [#1042](https://github.com/kubernetes-sigs/agent-sandbox/issues/1042) |
-| 4 | Kill pool→claims watch fan-out | 🟢 | ++ | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527) |
+| 4 | Kill pool→claims watch fan-out | 🟢 | ++ | merged; **UPSTREAM MERGED** as [PR #1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245) (2026-07-21, sha `4357fa4`) | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527) |
 | 5 | Adoption conflicts → bounded requeue | 🟢 | ++ | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527), [#1042](https://github.com/kubernetes-sigs/agent-sandbox/issues/1042)/[PR #1072](https://github.com/kubernetes-sigs/agent-sandbox/pull/1072) |
 | 6 | Write-payload & CPU reductions (rawpatch + flags) | 🟢 | ++ | merged | [#527](https://github.com/kubernetes-sigs/agent-sandbox/issues/527), [#350](https://github.com/kubernetes-sigs/agent-sandbox/issues/350), [#940](https://github.com/kubernetes-sigs/agent-sandbox/issues/940) |
 | 7 | Informer cache diet | 🟢 | ++ | merged | [#836](https://github.com/kubernetes-sigs/agent-sandbox/issues/836), [#484](https://github.com/kubernetes-sigs/agent-sandbox/issues/484) |
@@ -206,6 +206,11 @@ zero: zero). Covered by claim-controller unit tests including the
 **Default:** always on (no flag).
 
 ### Task 4: 🟢 ++ — Kill the pool→claims watch fan-out (O(N²) reconciles)
+
+> **Upstream status (2026-07-21):** filed as
+> [PR #1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245)
+> and **merged** to `kubernetes-sigs/agent-sandbox` main as `4357fa4`
+> (the current tip). This fix is now in BASE for all future benchmark runs.
 
 **Problem.** The claim controller watched SandboxWarmPool and mapped every
 pool event to **every claim referencing that pool**. Pool status churns

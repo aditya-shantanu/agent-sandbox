@@ -1,8 +1,10 @@
 # Upstream PR plan (12 PRs) — carved from the perf investigation
 
-Status: wave 1 in flight (2026-07-20). Source of truth for what goes
-upstream, in what order, and what stays on the fork. Task numbers refer to
-`UPSTREAM-ISSUE-DRAFT.md`.
+Status: wave 1 in flight (2026-07-20); **first merge landed 2026-07-21 —
+P3 = [#1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245)
+merged as upstream `4357fa4`** (see "Post-merge status" below). Source of
+truth for what goes upstream, in what order, and what stays on the fork.
+Task numbers refer to `UPSTREAM-ISSUE-DRAFT.md`.
 
 Ground rules for every upstream PR:
 
@@ -21,8 +23,8 @@ Ground rules for every upstream PR:
 |----|---------|---------------|--------|
 | P1 | 1 | perf(controller): dedicated watch connection + HTTP/2 API connection sharding (`--separate-watch-connection`, `--api-connections`, default off) | **wave 1** |
 | P2 | 3 | fix(sandboxclaim): cold-start guard (indexed List fallback + bounded defer) + adoption optimistic lock | wave 2 |
-| P3 | 4 | perf(sandboxclaim): stop fanning pool status churn out to every claim (GenerationChangedPredicate + bound/deleting skip) — links #527 | **wave 1** |
-| P4 | 2 + 5 | fix(sandboxclaim): stale-pass write suppression + adoption-conflict bounded requeue | **HELD for #1118** — it rewrites adoption finalization; re-express the invariants (never re-enter adoption from a stale cache view; conflict → 50ms bounded requeue) in its structure once it merges, do not port the code |
+| P3 | 4 | perf(sandboxclaim): stop fanning pool status churn out to every claim (GenerationChangedPredicate + bound/deleting skip) — links #527 | **MERGED** upstream 2026-07-21 as [`4357fa4`](https://github.com/kubernetes-sigs/agent-sandbox/commit/4357fa4425f5999825c84af7d9d2e949c0b36850) ([#1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245)) |
+| P4 | 2 + 5 | fix(sandboxclaim): stale-pass write suppression + adoption-conflict bounded requeue | **ready to file** — #1118 merged; invariants re-expressed post-#1118 (draft `pr-drafts/P4.md`, body `/tmp/prwave2-p4-body-final.md`, A/B captured). 2026-07-21: branch rebased onto post-#1245 tip `4357fa4` (same file as #1245's merge), full validation green (build/vet/gofmt/lint-go/unit), pushed |
 | P5 | 6 | perf: targeted metadata merge patches (`internal/rawpatch`) + `--disable-claim-events` / `--disable-claim-observability-annotations` (default off) — reconcile with #1087/#1114 | wave 2 |
 | P6 | 7 | perf(controller): informer cache diet (strip managedFields, PodCacheTransform, opt-in `--cache-label-selectors`) — links #836, #484 | wave 2 |
 | P7 | 8 | perf(warmpool): refill shaping (`--sandbox-warm-pool-replenish-delay`, `--sandbox-warm-pool-max-refill-rate`, default 0) + `--pool-dedicated-connection` (default off) + backlog-aware cold-start polling — supersedes #913, links #1182 | wave 3 (needs P1's transport.go) |
@@ -53,6 +55,7 @@ Ground rules for every upstream PR:
    - P3 → [PR #1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245)
      (claim reconciles −19% at stock 50 workers; at 400/400 workers −43%
      (9,207→5,259), p90 1427→985ms, all-ready 8.39→6.42s; PAIR-P3HC)
+     — **MERGED 2026-07-21, upstream sha `4357fa4` (new main tip)**
    - P9 → [PR #1241](https://github.com/kubernetes-sigs/agent-sandbox/pull/1241)
      (SDK wait mean 68.4→54.9ms, p90 83.7→66.0ms, n=50/mode, same cluster)
    A/B mechanics: parallel per-PR cluster pairs (BASE + change leg on the
@@ -92,6 +95,52 @@ Ground rules for every upstream PR:
   `--api-connections=4`, `--one-write-adoption`,
   `--sandbox-write-behind-window=250ms`, `--no-spec-adoption`) — fork
   policy; upstream defaults stay legacy until maintainers opt in.
+
+## Post-merge status (2026-07-21, after #1245 landed)
+
+**Merged:** P3 → [#1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245)
+merged to upstream main as `4357fa4` (the new tip; #363 operator
+scaffolding landed just below it as `db7e7a2`).
+
+**All remaining open PRs re-checked against the new tip — every one is
+MERGEABLE; none rebased** (no gratuitous rebases; `UNSTABLE` merge-state is
+only pending/failing CI checks, not conflicts):
+[#1240](https://github.com/kubernetes-sigs/agent-sandbox/pull/1240) (p1
+transport sharding), [#1241](https://github.com/kubernetes-sigs/agent-sandbox/pull/1241)
+(p9 SDK single-watch), [#1246](https://github.com/kubernetes-sigs/agent-sandbox/pull/1246)
+(p10 router name cache), [#1247](https://github.com/kubernetes-sigs/agent-sandbox/pull/1247)
+(p11 REST-client latency histograms), [#1248](https://github.com/kubernetes-sigs/agent-sandbox/pull/1248)
+(p12 stress sustained-rate), [#1249](https://github.com/kubernetes-sigs/agent-sandbox/pull/1249)
+(p8 lease release), [#1250](https://github.com/kubernetes-sigs/agent-sandbox/pull/1250)
+(p5 rawpatch + claim write flags — touches `sandboxclaim_controller.go`
+like #1245, yet still merges clean), [#1251](https://github.com/kubernetes-sigs/agent-sandbox/pull/1251)
+(p2 warmpool refill shaping), [#1252](https://github.com/kubernetes-sigs/agent-sandbox/pull/1252)
+(p6 write-behind coalescing), [#1253](https://github.com/kubernetes-sigs/agent-sandbox/pull/1253)
+(p7 informer cache diet). Note: the wave-2/3 filings renumbered some
+P-slots relative to the table above — the `upstream-pN-*` branch names on
+the PRs are authoritative for what each contains.
+
+**P4** (`upstream-p4-claim-write-suppression`, not yet filed): rebased onto
+`4357fa4` — required, since its commit rewrites the same
+`extensions/controllers/sandboxclaim_controller.go` region #1245 touched —
+and revalidated in full (go build/vet, gofmt on touched files, lint-go 0
+issues, all Go unit tests green; the only gofmt/test-unit noise is
+pre-existing on upstream main: unformatted
+`examples/policy/vap/policy_test.go` and the harness's Python venv needing
+a package index that carries `annotated-doc`). Branch pushed
+(local == origin). Ready for wave-2's filing queue.
+
+**A/B relevance after the merge:** #1245's change is now part of BASE for
+every future benchmark leg. The already-captured per-PR A/B tables predate
+it — that is fine: each table isolated exactly its own change against the
+then-current baseline, so their deltas stand. The one fresh pair, P4's
+(`bench-wave2-base2` vs `bench-wave2-p4`), ran against post-#1118 upstream
+main `16e4aeb` — i.e. its BASE did **not** include #1245 (which merged
+after). Delta noted rather than rerun: P4's headline signal (exactly-1:1
+startup-latency histogram observations + bounded conflict requeue) is
+orthogonal to #1245's pool-watch predicate change, and the P4 code branch
+now carries #1245 beneath it post-rebase; only absolute reconcile counts
+in that table would shift under a post-#1245 BASE.
 
 ## Wave-1 branch names
 
