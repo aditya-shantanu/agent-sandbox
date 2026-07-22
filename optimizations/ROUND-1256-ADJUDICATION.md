@@ -98,7 +98,41 @@ during backlog, not missed observations).
 
 ---
 
-## OPEN ITEM — PROTO rep2s sustained-only ramp (no conclusion yet)
+## RESOLVED (2026-07-22, isolation-leg RCA) — the PROTO sustained ramp
+
+> **Root cause found and fixed** (fix local on `proto-1256-optimistic-status`
+> @ `ecdba21`, test/lint green; not yet pushed). The amplifier is a
+> control-flow hole reached at rate by the prototype:
+> `adoptSandboxFromCandidates` treats a `completeAdoption` failure (404 from
+> a stale cache view of a deleted candidate — 3,845 PATCH 404s in leg B) as
+> "try the next candidate" AFTER the adoption annotation is already
+> committed, so the pass overwrites the committed assignment (the claim's
+> in-memory resourceVersion is current — the status optimistic lock
+> arbitrates CLAIM staleness, not SANDBOX staleness). Watch-stream
+> forensics, leg B vs leg A: **340 vs 0** nonempty→different
+> assigned-sandbox annotation flips (max 8/claim), **323 status rebinds**
+> incl. 21 cold-create overwrites of already-bound claims, **74 Ready
+> True→False regressions** — all concentrated in the collapse minute. Each
+> flip orphans/steals sandboxes (the unlocked `MergeFrom` adoption patch
+> could silently re-transfer ownership) and feeds the upstream sandbox
+> controller's status-Update error-retry churn (PUT 409 10,880 / PUT 404
+> 8,200 / 18,709 wq retries, ~19 reconciles/sandbox); the write volume grows
+> informer lag which produces more stale views — positive feedback, hence
+> the monotonic ramp. BASE carries the same upstream fall-through but aborts
+> the pass at the first annotation-Update conflict, so it rarely reaches the
+> hole; the prototype's (correct) in-pass annotation retry made it reachable
+> at rate. Fix (stateless): optimistic lock on the adoption patch +
+> `resolveAdoptionCompletion` — authoritative APIReader resolution
+> (no-write when linkage already true; one fresh-base re-patch when still
+> pool-owned; TERMINAL cleanup of deleted/stolen references, never retried,
+> paced by the workqueue rate limiter). Regression tests pin the no-flip,
+> idempotent-no-write, and terminal-cleanup shapes. Exonerated with data:
+> APIReader GET volume (432 total) and the claim workqueue (1,064 retries).
+> Residual open question (minor): what seeds the initial window-0 elevation
+> on a second run before any flips occur (17:20 minute has zero anomalies;
+> all flips land in 17:21) — the runaway loop itself is closed regardless.
+
+### Original open-item record (superseded by the RCA above)
 
 In rep2s (reused cluster, sustained-only), PROTO ramped p50 637→2089ms from
 window 2 onward, p99 12.3s, 2,043 claim retries — beginning BEFORE the +26s

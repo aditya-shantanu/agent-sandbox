@@ -1088,6 +1088,18 @@ chaos; dedicated long-lived claims for annotation grading). Candidate
 attributions held open: stale-reuse conditions vs intrinsic
 (suspect: APIReader uncached-GET retry feedback).
 
+> **RESOLVED same day (isolation-leg RCA):** the ramp is an
+> assignment-flip amplification loop — completeAdoption 404/steal on a
+> stale candidate view caused the pass to overwrite the already-committed
+> adoption annotation with the next candidate (340 flips leg B vs 0 leg A;
+> 323 status rebinds; 74 Ready regressions; sandbox-controller error churn
+> 10,880 PUT 409 + 8,200 PUT 404). APIReader GETs (432) and claim
+> workqueue (1,064) exonerated as suspected. Fixed statelessly on
+> `proto-1256-optimistic-status` @ `ecdba21` (adoption-patch optimistic
+> lock + authoritative resolveAdoptionCompletion; terminal cleanup of dead
+> references; no in-pass rebinding). Full RCA:
+> `ROUND-1256-ADJUDICATION.md` resolved section.
+
 **Interim verdict:** BASE's #940 inflation reproducible (1.52-1.58×);
 ARM-1256 v1 fixes #940 exactly but fails self-healing 0/5 and collapses
 post-burst under sustained load — not shippable as designed; PROTO
