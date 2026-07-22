@@ -233,6 +233,13 @@ is lost.
 
 ### Task 5: 🟢 ++ — Adoption conflicts → bounded requeue, not exponential backoff
 
+> **Status (2026-07-22):** three-arm adjudication data collected
+> (`ROUND-1256-ADJUDICATION.md`: BASE vs PR #1256 v1 vs optimistic-lock
+> prototype). The PR #1256 machinery is being reworked to the
+> reviewer-suggested optimistic-lock design (server-arbitrated staleness,
+> in-pass conflict retry — no bounded-requeue polling); final validation
+> pending the prototype's sustained-only isolation leg.
+
 **Problem.** A 409 on the adoption write failed the reconcile pass. Under
 burst contention this produced visible retry waves at 0.8/1.2/1.6s. The
 wave spacing is not rate-limiter backoff — on controller-runtime v0.24.1

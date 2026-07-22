@@ -105,3 +105,26 @@ written before it.
 - Docker daemon is colima: `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock`; the `colima` docker context had to be recreated (`docker context create colima --docker host=...`), and the buildx builder `agent-sandbox-builder` references it.
 - gcloud tokens expire and hang the gcr push with `failed to authorize: DeadlineExceeded` — rerun `gcloud auth login`.
 - Concurrent local runs saturate the uplink (layer-push EOFs).
+
+## Round-1256 adjudication ops notes / RCA (2026-07-22)
+
+- **adjarm v19 chaos_loop wedge (9.6h, all three arms).** The chaos
+  injector's target-selection loop was unbounded: `kubectl get` returning an
+  empty list + swallowed stderr + `sleep 2; continue` spun forever, and the
+  loop's PID held `run_rep`'s `wait` — every arm's rep sat "running" for
+  9.6h after the phases finished. Forensics confirmed the injector fired but
+  never mutated (2-line chaos.log, 0-byte targets file, 0 mutations in the
+  watch forensics), so the arms stayed comparable and rep1 data is valid.
+- **v21 recovery without rerun:** rep1 artifacts were recovered from the VM
+  disks via instance metadata + reset and uploaded to GCS; no leg was rerun.
+- **v22 fix:** all injector/selection loops bounded (attempt caps +
+  surfaced stderr). Clusters were then reused for rep2s and deleted —
+  verified 0 IGMs, 0 state-store entries, 0 instances.
+- **Cluster-deletion verification pitfall (record forever):** kops GCE
+  instance names are `control-plane-*` / `nodes-*` WITHOUT the cluster-name
+  prefix — filtering instances on a bare `sandbox-2026` pattern
+  false-negatives and "verifies" deletion while instances still run. Verify
+  by IGM/instance listing in the cluster's zone, not by name prefix.
+- **Sidebar P2SUST leg:** `--sandbox-warm-pool-replenish-delay=0` +
+  `--sandbox-warm-pool-max-refill-rate=100` at sustained 45/s held p50 92ms
+  / p90 182ms with flat windows; posted as the two-knob comment on PR #1251.

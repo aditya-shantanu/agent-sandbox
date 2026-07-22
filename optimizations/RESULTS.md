@@ -1037,3 +1037,70 @@ Artifacts: `gs://kops-state-142966328212/perf-bench-results/round10/`
 incl. apfVerification=exempt, sandboxes.jsonl, timeseries.jsonl,
 metrics.jsonl.gz with both shards' scrapes, apiserver pprof, reports;
 STATUS.txt + heartbeats). Cluster deleted; zero leaks.
+
+---
+
+## 2026-07-22 — ROUND 1256 ADJUDICATION (3-arm: BASE 4357fa4 / PR#1256-v1 160e00f / optimistic-lock PROTO 8b5408f) — rep1 + rep2s COMPLETE; PROTO isolation leg PENDING
+
+Full write-up: `ROUND-1256-ADJUDICATION.md`. Identical tuned 12-node kops
+clusters, e2-standard-16 CP, identical harness. Zero failures in every
+arm/phase.
+
+**Rep1 (burst-300 + fill + mif50/100 + sustained 45/s × 60s):**
+
+| arm | burst p50/p90 (all-ready) | sustained 45/s p50/p90 | mif50/100 p50 |
+|---|---|---|---|
+| BASE | 1082/2096ms (2.44s) | 108/236ms | 1064/1144ms |
+| ARM-1256 (v1) | 838/1660ms (1.91s) | **727/4177ms** (p99 6.1s, monotonic degradation, 46 cold starts, 23,249 wq retries) | 1136/1220ms |
+| PROTO | 904/2019ms (2.65s) | 113/261ms | 890/904ms |
+
+#940 inflation: BASE 4503 obs/2955 claims (+52%; 333 vs 320 on the burst
+label); ARM-1256 ~exact; PROTO exact on every label. Byte-identical-patch
+watch probe: **0 identical MODIFIED events in ALL arms** — apiserver no-op
+short-circuit confirmed (k8s.io/apiserver v0.36.2 etcd3
+`store.go:553-576`). Retry fingerprints: BASE conflict-scattered 0-8s;
+ARM-1256 fixed-requeue churn (57/72 gaps <1s on only 19 conflicts);
+PROTO optimistic-409 + per-item exponential 5-11s stragglers.
+
+**Rep2s (sustained-only control + manual chaos; clusters reused,
+controllers 11h/0 restarts):**
+
+- ARM-1256's sustained collapse VANISHES without a preceding burst
+  (windows 118/288/109/106/129ms, 0 cold starts) → rep1 collapse is
+  preceding-burst debris in the guard machinery (matches SV-P4's clean
+  192ms, also burst-free).
+- Manual chaos, 5 status wipes/arm landed: BASE repaired 5/5 in 18-52ms;
+  PROTO 5/5 in 144-381ms; **ARM-1256 0/5** (no restore events in the
+  115-1445ms dwell-bounded windows; 7 watch events/target vs
+  8-with-restore elsewhere) — the lastWrittenStatusMap write-suppression
+  signature, **empirically confirming igooch's self-healing objection**.
+  Annotation-removal prediction ungraded (all targets NotFound-raced by
+  the 2s dwell; re-run rides the isolation leg).
+- #940 independent leg: BASE 4232/2680 = **1.58×** (reproducible);
+  ARM-1256 2635/2635 = 1.000; PROTO 2627/2664 = 0.986 (37 claims deleted
+  pre-sample during backlog).
+
+**OPEN (no conclusion recorded):** PROTO rep2s sustained-only ramp — p50
+637→2089ms from window 2, p99 12.3s, 2,043 claim retries, beginning
+BEFORE the +26s wipes; inverse of its clean rep1. Isolation leg running
+(fresh cluster+deploy; burst+sustained then sustained-after-idle; no
+chaos; dedicated long-lived claims for annotation grading). Candidate
+attributions held open: stale-reuse conditions vs intrinsic
+(suspect: APIReader uncached-GET retry feedback).
+
+**Interim verdict:** BASE's #940 inflation reproducible (1.52-1.58×);
+ARM-1256 v1 fixes #940 exactly but fails self-healing 0/5 and collapses
+post-burst under sustained load — not shippable as designed; PROTO
+matches the #940 fix, self-heals 5/5, and is comparable-or-better on
+every latency leg, gated only on the open isolation item. PR #1256
+rework to the optimistic-lock design proceeds.
+
+Ops note: the adjarm chaos_loop wedge (9.6h held `wait` in all arms),
+v21 artifact recovery, v22 loop bounding, and the kops instance-name
+deletion pitfall are recorded in `INFRASTRUCTURE.md`. Sidebar P2SUST leg
+(replenish delay=0 / rate=100 at sustained 45/s): p50 92ms / p90 182ms
+flat windows — posted as the two-knob comment on PR #1251. All 3
+clusters reused across reps then deleted (verified 0 IGMs/state/instances).
+
+Artifacts:
+`gs://kops-state-142966328212/perf-bench-results/round-1256-adjudication/<ARM>/{rep1,rep2s}/`.
