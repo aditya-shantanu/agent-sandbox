@@ -43,7 +43,6 @@ import (
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 	"sigs.k8s.io/agent-sandbox/internal/version"
-	"sigs.k8s.io/agent-sandbox/internal/writebehind"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -352,32 +351,22 @@ func main() {
 	// Register the custom Sandbox metric collector globally.
 	asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
 
-	// Write-behind coalescing for the Sandbox controller's recoverable
-	// metadata-only writes. Default (0) is fully synchronous: no Flusher is
-	// constructed and the controller keeps its stock write path.
-	var writeBehindFlusher *writebehind.Flusher
+	// Write-behind deferral (RequeueAfter variant) for the Sandbox
+	// controller's recoverable metadata-only writes. Default (0) is fully
+	// synchronous: the controller keeps its stock write path. No background
+	// flusher exists in this variant; the workqueue's AddAfter provides the
+	// coalescing window.
 	if sandboxWriteBehindWindow > 0 {
-		writeBehindFlusher, err = writebehind.New(mgr.GetClient(), mgr.GetScheme(), writebehind.Options{
-			Window: sandboxWriteBehindWindow,
-		})
-		if err != nil {
-			setupLog.Error(err, "unable to build write-behind flusher")
-			os.Exit(1)
-		}
-		if err := mgr.Add(writeBehindFlusher); err != nil {
-			setupLog.Error(err, "unable to register write-behind flusher with manager")
-			os.Exit(1)
-		}
-		setupLog.Info("Sandbox controller write-behind coalescing enabled (--sandbox-write-behind-window)",
+		setupLog.Info("Sandbox controller write deferral enabled (RequeueAfter variant, --sandbox-write-behind-window)",
 			"window", sandboxWriteBehindWindow, "podPatchBound", "1s")
 	}
 
 	if err = (&controllers.SandboxReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Tracer:        instrumenter,
-		ClusterDomain: clusterDomain,
-		WriteBehind:   writeBehindFlusher,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Tracer:            instrumenter,
+		ClusterDomain:     clusterDomain,
+		WriteBehindWindow: sandboxWriteBehindWindow,
 	}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)
