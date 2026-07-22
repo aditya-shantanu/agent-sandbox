@@ -131,11 +131,7 @@ func main() {
 			"tracking label (value = the owning sandbox's name hash) to remain visible to the controller when "+
 			"this flag is enabled.")
 	flag.DurationVar(&sandboxWriteBehindWindow, "sandbox-write-behind-window", 0,
-		"Coalescing window for the Sandbox controller's recoverable metadata-only writes (the pod "+
-			"label/annotation reconciliation patch and the sandbox pod-name annotation). Pending mutations "+
-			"to the same object merge into one patch flushed within the window; pod patches additionally "+
-			"flush within min(window, 1s) so the safe-to-evict strip cannot lag the cluster autoscaler. "+
-			"0 disables coalescing (synchronous writes); e.g. 250ms enables coalescing.")
+		"Coalescing window for the Sandbox controller's recoverable metadata-only writes. 0 disables coalescing.")
 	opts := zap.Options{
 		Development: false,
 	}
