@@ -39,7 +39,10 @@ type stressTest struct {
 	// are sharded over N dedicated connections so create bursts neither
 	// queue on the ~100-stream per-connection cap nor congest the watches
 	// (see clientconns.go).
-	mutateClient  dynamic.Interface
+	mutateClient dynamic.Interface
+	// nsClient creates/deletes the extra namespaces of the multi-namespace
+	// sustained phase (cluster-scoped).
+	nsClient      dynamic.ResourceInterface
 	sandboxClient dynamic.ResourceInterface
 	// Extensions clients (extensions.agents.x-k8s.io/v1beta1), used by the
 	// claims-warm phases. The extensions controller must be deployed
@@ -404,7 +407,7 @@ func buildClaimObject(id types.NamespacedName, poolName string) *unstructured.Un
 // recorded on the record rather than aborting the phase.
 func (s *stressTest) createClaim(ctx context.Context, claimClient dynamic.ResourceInterface, id types.NamespacedName, poolName string, phase Phase, number PhaseNumber) error {
 	claim := buildClaimObject(id, poolName)
-	s.tracker.RegisterClaim(id, phase, number)
+	s.tracker.Register(id, phase, number)
 	_, err := claimClient.Create(ctx, claim, metav1.CreateOptions{})
 	s.tracker.MarkCreateReturned(id, err)
 	if err != nil {
@@ -506,17 +509,13 @@ func (s *stressTest) runClaimsWarmPhase(ctx context.Context, number PhaseNumber)
 	// profile window opens right as claim creation begins (the adoption
 	// transaction is over within the first seconds), with heap snapshots
 	// bracketing the burst. The apiserver profile runs over the same window
-	// to correlate server-side cost. All best-effort. The phase can finish
-	// well inside the 15s profile window (that is the goal), so the deferred
-	// Wait keeps the process alive until the profiles are written.
-	var profileWG sync.WaitGroup
-	defer profileWG.Wait()
+	// to correlate server-side cost. All best-effort.
 	if s.ctrlProfiler != nil {
-		profileWG.Go(func() { s.ctrlProfiler.CaptureCPUProfile(ctx, PhaseClaimsWarm, 0, 15*time.Second) })
-		profileWG.Go(func() { s.ctrlProfiler.CaptureHeapProfile(ctx, PhaseClaimsWarm, "burst-start") })
+		go s.ctrlProfiler.CaptureCPUProfile(ctx, PhaseClaimsWarm, 0, 15*time.Second)
+		go s.ctrlProfiler.CaptureHeapProfile(ctx, PhaseClaimsWarm, "burst-start")
 	}
 	if s.profiler != nil {
-		profileWG.Go(func() { s.profiler.CaptureCPUProfile(ctx, PhaseClaimsWarm, 0, 15*time.Second) })
+		go s.profiler.CaptureCPUProfile(ctx, PhaseClaimsWarm, 0, 15*time.Second)
 	}
 
 	release := make(chan struct{})

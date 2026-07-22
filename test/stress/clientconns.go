@@ -82,7 +82,7 @@ func configureCreateConnectionsWithDialer(cfg *rest.Config, connections int, bas
 	}
 
 	shards := make([]http.RoundTripper, 0, connections)
-	for i := range connections {
+	for i := 0; i < connections; i++ {
 		shardCfg := rest.CopyConfig(cfg)
 		// The shard transports live *below* the WrapTransport slot of the
 		// outer config; never inherit an outer wrapper (recursion guard).

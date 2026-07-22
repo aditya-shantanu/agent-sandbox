@@ -41,6 +41,10 @@ const (
 	// PhaseClaimsWarm fires SandboxClaims simultaneously against a fully
 	// provisioned SandboxWarmPool, measuring claim-create -> claim-Ready latency.
 	PhaseClaimsWarm Phase = "claims-warm"
+	// PhaseClaimsWarmSustained streams SandboxClaims at a target rate with
+	// Poisson jitter against continuously replenished warm pools, measuring
+	// whether create -> Ready latency holds over time (see sustained.go).
+	PhaseClaimsWarmSustained Phase = "claims-warm-sustained"
 )
 
 // PhaseNumber is a 1-based index into the run's phase list (Config.Phases /
@@ -144,14 +148,6 @@ type SandboxRecord struct {
 
 	Error string `json:"error,omitempty"`
 
-	// isClaim marks records whose tracked object is a SandboxClaim. The claim
-	// controller's cold-start fallback creates a Sandbox (and thus a Pod)
-	// named after the claim, so without this marker a cold-started claim's
-	// sandbox/pod watch events would stamp sandbox milestones onto the claim
-	// record and under-report adoption latency (the Sandbox turns Ready
-	// before the claim does).
-	isClaim bool
-
 	ready *Future[bool]
 	gone  *Future[bool]
 }
@@ -185,16 +181,6 @@ func (t *Tracker) Register(id types.NamespacedName, name Phase, number PhaseNumb
 	rec.gone = newFuture[bool]()
 	t.mu.Lock()
 	t.records[id] = rec
-	t.mu.Unlock()
-	return rec
-}
-
-// RegisterClaim is Register for a SandboxClaim: the record's milestones are
-// driven by the sandboxclaims watch only (see SandboxRecord.isClaim).
-func (t *Tracker) RegisterClaim(id types.NamespacedName, name Phase, number PhaseNumber) *SandboxRecord {
-	rec := t.Register(id, name, number)
-	t.mu.Lock()
-	rec.isClaim = true
 	t.mu.Unlock()
 	return rec
 }
@@ -362,9 +348,9 @@ func (t *Tracker) HandleWatchEvent(resource string, eventType watch.EventType, u
 // Claim milestones are stored in the shared SandboxRecord fields (see the
 // field comments): the claim's Ready condition marks SandboxReady, so the
 // existing summary/report pipeline treats claim readiness like sandbox
-// readiness. Records share one map across resources; the isClaim marker
-// keeps claim records and sandbox/pod records from cross-talking when names
-// collide (the cold-start fallback names its Sandbox after the claim).
+// readiness. Claim names (p<N>-claim-<i>) never collide with the names of
+// sandboxes or pods created by other phases, so keying by NamespacedName in
+// the same records map is safe.
 func (t *Tracker) handleClaimEvent(eventType watch.EventType, u *unstructured.Unstructured) {
 	id := types.NamespacedName{Name: u.GetName(), Namespace: u.GetNamespace()}
 	now := time.Now()
@@ -372,7 +358,7 @@ func (t *Tracker) handleClaimEvent(eventType watch.EventType, u *unstructured.Un
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	rec, ok := t.records[id]
-	if !ok || !rec.isClaim {
+	if !ok {
 		return
 	}
 
@@ -412,9 +398,7 @@ func (t *Tracker) handleSandboxEvent(eventType watch.EventType, u *unstructured.
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	rec, ok := t.records[id]
-	if !ok || rec.isClaim {
-		// A same-named Sandbox next to a claim record means the claim
-		// cold-started; its milestones must come from the claim itself.
+	if !ok {
 		return
 	}
 
@@ -453,9 +437,7 @@ func (t *Tracker) handlePodEvent(eventType watch.EventType, u *unstructured.Unst
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	rec, ok := t.records[id]
-	if !ok || rec.isClaim {
-		// Claim records take no pod milestones, even from a same-named
-		// cold-start pod (see handleSandboxEvent).
+	if !ok {
 		return
 	}
 
