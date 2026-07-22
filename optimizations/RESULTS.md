@@ -1116,3 +1116,43 @@ clusters reused across reps then deleted (verified 0 IGMs/state/instances).
 
 Artifacts:
 `gs://kops-state-142966328212/perf-bench-results/round-1256-adjudication/<ARM>/{rep1,rep2s}/`.
+
+## 2026-07-22 — PR #1256 REWORK SHIPPED: v24 final validation gates all 6 PASS (fresh cluster + deploy of `ecdba21`; rebased and force-pushed as PR head `2588c32`)
+
+All 6 v24 gates PASS (full table: `ROUND-1256-ADJUDICATION.md`, v24
+section). 0 failed claims in every phase of every run:
+
+- **#940 exactly-once:** rework 3,022 samples / 3,022 claims, exact on
+  every label (revalidation); independently 2,773 samples for exactly
+  2,740+20+8+5 accountable events in a second leg. BASE over-records
+  reproducibly: 4,503/2,955 (+52%) and 4,232/2,680 (1.58×), incl. 333
+  samples for the 320-claim burst label.
+- **Burst-300 parity:** 1097/2394/2571ms p50/p90/p99, all-300 in 2.63s
+  (revalidation) vs BASE 1082/2096/2401ms, 2.44s (3-arm run) — within
+  cross-cluster noise; correctness PR, not a burst speedup.
+- **Sustained parity:** 45/s × 60s p50/p90 BASE 108/236ms → rework
+  108/221ms; second back-to-back run 115/262ms, flat 92-139ms windows,
+  no post-burst degradation (v1's 23k-retry collapse absent).
+- **Watch probe:** 0 byte-identical MODIFIED events across all runs
+  (normalized minus resourceVersion/managedFields) — server-side
+  short-circuit confirmed; the PR's wins are client-side + non-identical
+  stale overwrites.
+- **Chaos self-healing:** 20 external status wipes across runs, zero
+  restarts — BASE repairs 18-52ms, rework 19-77ms, v1 memory-guard 0/5
+  (never) — igooch's objection empirically confirmed.
+- **Retry fingerprint:** rework drops optimistic 409s benignly with
+  workqueue-rate-limited retry; assignment-flip loop eliminated with
+  regression tests.
+
+**Shipped:** rebase onto upstream main `9dcbe62` (one conflict in
+`sandboxclaim_controller.go` — #1114's error-returning
+`recordCreationLatencyMetric` + one-shot annotation composed with the
+`statusAuthoritative` gate, both kept); full validation green
+(build/vet/gofmt/lint-go 0 issues/unit+race). Force-pushed to
+`upstream-p4-claim-write-suppression` → PR #1256 head `2588c32`; PR
+retitled ("fix(sandboxclaim): duplicate startup-latency metrics and
+stale-status overwrites via optimistic-locked status writes") with the
+final body (Fixes #940); igooch reply posted
+(pull/1256#issuecomment-5051235861); CodeRabbit V(4) and Copilot
+ordering threads answered and resolved. /hold stays until igooch
+reviews the rework.

@@ -152,7 +152,32 @@ reports:
 
 ---
 
-## Interim verdict
+## v24 final validation gates (2026-07-22) — all 6 PASS, verdict FINAL
+
+Revalidation = fresh cluster + fresh deploy of the final commit
+(`proto-1256-optimistic-status` @ `ecdba21`, shipped as PR #1256 head
+`2588c32` after rebase onto upstream main `9dcbe62`). 0 failed claims in
+every phase of every run, all arms.
+
+| # | gate | result | numbers |
+|---|---|---|---|
+| 1 | #940 exactly-once histograms | **PASS** | rework 3,022 samples / 3,022 claims — exact on every label (revalidation); independently 2,773 samples for exactly 2,740+20+8+5 accountable events in a second leg. BASE inflation reproducible: 4,503/2,955 (+52%) and 4,232/2,680 (1.58×), incl. 333 samples for the 320-claim burst label (the #940 signature) |
+| 2 | burst-300 parity | **PASS** | create→Ready p50/p90/p99 1097/2394/2571ms, all-300 in 2.63s (revalidation) vs BASE 1082/2096/2401ms, 2.44s (3-arm run) — parity within cross-cluster noise; the PR claims correctness, not burst speedup |
+| 3 | sustained parity, no post-burst degradation | **PASS** | 45/s × 60s p50/p90: BASE 108/236ms; rework 108/221ms; second back-to-back sustained run on the same controller 115/262ms with flat 92-139ms windows — the v1 post-burst collapse (727ms p50, 23k retries) is absent |
+| 4 | watch probe: no redundant events | **PASS** | 0 byte-identical MODIFIED events (normalized minus resourceVersion/managedFields) across ALL runs and arms — server short-circuits byte-identical status patches (etcd3 `GuaranteedUpdate`); the PR's wins are client-side cost + non-identical stale overwrites |
+| 5 | chaos self-healing (external status wipe) | **PASS** | 20 wiped claim statuses across runs, zero controller restarts: BASE repairs in 18-52ms; rework in 19-77ms; v1 memory-guard repaired 0/5 (never, absent a restart) — igooch's objection empirically confirmed, memory-guard design abandoned |
+| 6 | retry fingerprint | **PASS** | BASE: conflict-driven rate-limited requeues; v1: fast fixed-requeue churn (23k wq retries post-burst, multi-second p50, 46 cold starts); rework: optimistic 409s dropped benignly + workqueue-rate-limited retry — sustained parity with BASE, assignment-flip loop eliminated (regression tests pin no-flip / idempotent-no-write / terminal-cleanup) |
+
+**VERDICT (final): ship.** Shipped 2026-07-22: rework force-pushed to
+`upstream-p4-claim-write-suppression` (PR #1256 head `2588c32`), PR retitled
+and body replaced (fixes #940), reply to igooch posted
+(<https://github.com/kubernetes-sigs/agent-sandbox/pull/1256#issuecomment-5051235861>),
+CodeRabbit V(4) and Copilot ordering threads answered and resolved. /hold
+remains until igooch reviews the rework.
+
+---
+
+## Interim verdict (superseded by the v24 section above)
 
 - **BASE:** #940 inflation is real and reproducible (1.52-1.58× across two
   independent legs); stale-view retry costs scatter completions over 0-8s.

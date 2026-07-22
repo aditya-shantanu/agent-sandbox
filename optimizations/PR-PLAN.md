@@ -24,7 +24,7 @@ Ground rules for every upstream PR:
 | P1 | 1 | perf(controller): dedicated watch connection + HTTP/2 API connection sharding (`--separate-watch-connection`, `--api-connections`, default off) | **wave 1** |
 | P2 | 3 | fix(sandboxclaim): cold-start guard (indexed List fallback + bounded defer) + adoption optimistic lock | wave 2 |
 | P3 | 4 | perf(sandboxclaim): stop fanning pool status churn out to every claim (GenerationChangedPredicate + bound/deleting skip) — links #527 | **MERGED** upstream 2026-07-21 as [`4357fa4`](https://github.com/kubernetes-sigs/agent-sandbox/commit/4357fa4425f5999825c84af7d9d2e949c0b36850) ([#1245](https://github.com/kubernetes-sigs/agent-sandbox/pull/1245)) |
-| P4 | 2 + 5 | fix(sandboxclaim): stale-pass write suppression + adoption-conflict bounded requeue | **ready to file** — #1118 merged; invariants re-expressed post-#1118 (draft `pr-drafts/P4.md`, body `/tmp/prwave2-p4-body-final.md`, A/B captured). 2026-07-21: branch rebased onto post-#1245 tip `4357fa4` (same file as #1245's merge), full validation green (build/vet/gofmt/lint-go/unit), pushed |
+| P4 | 2 + 5 | fix(sandboxclaim): duplicate startup-latency metrics and stale-status overwrites via optimistic-locked status writes (was: stale-pass write suppression) | **filed as [#1256](https://github.com/kubernetes-sigs/agent-sandbox/pull/1256); REWORK SHIPPED 2026-07-22** — v1 memory-guard design abandoned after igooch's review (her self-healing objection empirically confirmed, 0/5 chaos repairs); reworked to stateless optimistic-locked writes, v24 gates all 6 PASS, head `2588c32`. /hold stays pending her re-review |
 | P5 | 6 | perf: targeted metadata merge patches (`internal/rawpatch`) + `--disable-claim-events` / `--disable-claim-observability-annotations` (default off) — reconcile with #1087/#1114 | wave 2 |
 | P6 | 7 | perf(controller): informer cache diet (strip managedFields, PodCacheTransform, opt-in `--cache-label-selectors`) — links #836, #484 | wave 2 |
 | P7 | 8 | perf(warmpool): refill shaping (`--sandbox-warm-pool-replenish-delay`, `--sandbox-warm-pool-max-refill-rate`, default 0) + `--pool-dedicated-connection` (default off) + backlog-aware cold-start polling — supersedes #913, links #1182 | wave 3 (needs P1's transport.go) |
@@ -120,15 +120,27 @@ like #1245, yet still merges clean), [#1251](https://github.com/kubernetes-sigs/
 P-slots relative to the table above — the `upstream-pN-*` branch names on
 the PRs are authoritative for what each contains.
 
-**P4** (`upstream-p4-claim-write-suppression`, not yet filed): rebased onto
-`4357fa4` — required, since its commit rewrites the same
-`extensions/controllers/sandboxclaim_controller.go` region #1245 touched —
-and revalidated in full (go build/vet, gofmt on touched files, lint-go 0
-issues, all Go unit tests green; the only gofmt/test-unit noise is
-pre-existing on upstream main: unformatted
-`examples/policy/vap/policy_test.go` and the harness's Python venv needing
-a package index that carries `annotated-doc`). Branch pushed
-(local == origin). Ready for wave-2's filing queue.
+**P4** (`upstream-p4-claim-write-suppression` = PR
+[#1256](https://github.com/kubernetes-sigs/agent-sandbox/pull/1256)) —
+**rework SHIPPED 2026-07-22.** History: filed as the v1
+`lastWrittenStatusMap` write-suppression design; igooch /hold'd it and her
+self-healing objection was empirically confirmed by the 3-arm adjudication
+(v1 repaired 0/5 externally wiped statuses and collapsed post-burst with
+23k fixed-requeue retries — `ROUND-1256-ADJUDICATION.md`). Reworked to her
+suggested stateless design: optimistic lock on the status patch
+(`MergeFromWithOptimisticLock`, benign 409 drop, metrics only after an
+authoritative write) plus optimistic-locked adoption patch with in-pass
+`retry.RetryOnConflict` over `GetAPIReader()` — which also surfaced and
+fixed the assignment-flip latent defect (committed assignments are never
+abandoned on stale-view patch failures; regression tests pin it). v24
+final gates: all 6 PASS (exactly-once #940, burst/sustained parity, 0
+byte-identical watch events, 19-77ms chaos self-heal, clean retry
+fingerprint). Shipped: rebased onto upstream main `9dcbe62` (one conflict
+composed with #1114's one-shot metric annotation), full validation green,
+force-pushed → PR head `2588c32`; PR retitled + body replaced (Fixes
+#940); igooch reply posted (pull/1256#issuecomment-5051235861); CodeRabbit
+and Copilot threads answered and resolved. /hold remains until she
+re-reviews.
 
 **A/B relevance after the merge:** #1245's change is now part of BASE for
 every future benchmark leg. The already-captured per-PR A/B tables predate
