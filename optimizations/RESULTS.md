@@ -1291,3 +1291,42 @@ unschedulable hold + exactly-once events, fake-clock quiet-cluster
 walk-through. All non-e2e -race green, lint-go 0 issues. Semantic deltas to
 watch in review: replace-on-next-pass (stuck GC / Recreate rollouts), Owns →
 Watches wrapper.
+
+---
+
+## 2026-07-23 — Y16 APF-INSULATION A/B (overlay off/on; stock + tuned inflight) — COMPLETE; PR #1270 FILED
+
+Setup: kops, 12 worker nodes, k8s v1.35.6, controller at upstream main
+`dcd2fb4`, 45 claims/s sustained workload; overlay =
+`examples/apf-insulation/apf-insulation.yaml` (branch
+`upstream-y16-apf-insulation` @ `e55e2b3`).
+
+**Routing verified (same-cluster A/B, stock limits):** controller traffic
+moved from `workload-low` (75.0k reqs, demand HWM 161 seats) to
+`agent-sandbox-critical` (51.0k, HWM 86) + `agent-sandbox-bulk` (21.1k,
+HWM 52); `workload-low` left with events only (3.4k). APF wait p99 ≤20ms
+on all levels; 0 rejections.
+
+**Neutrality:** `system` / `workload-high` / `leader-election` /
+`node-high` all held wait p50+p99 ≤5ms, demand unchanged, 0 rejections.
+
+**Sizing rule confirmed (second cluster, mutating inflight 1000):**
+critical level ≈516 seats vs demand HWM 115 — the `>=2x` rule holds with
+~4.5x headroom; wait p99 ≤5ms every level in both configs; 0 rejections.
+
+**HONEST FINDING — no latency delta from the overlay in either
+configuration** (APF waits ~0 in all legs). WHY this differs from
+round-4/5's p90 1740→1094ms: that win came from raising the SERVER
+inflight limits when the pre-optimization controller (several times more
+writes per claim) saturated the 600-seat pool (272-seat demand HWM vs 77
+seats, wait p99 359ms). The current optimized write volumes measure an
+86-seat critical HWM at 45/s and never queue at stock limits — the seat
+wall the overlay+limits combination once removed no longer exists at
+typical rates. The overlay's standing value is isolation + guaranteed
+claim-path capacity under multi-tenant contention and higher-rate
+regimes; branch docs and PR body were reframed accordingly (`e55e2b3`)
+before filing, with the historical numbers kept only as clearly-labeled
+context motivating the sizing rule.
+
+PR: https://github.com/kubernetes-sigs/agent-sandbox/pull/1270 (shipped
+body archived in `pr-drafts/Y16.md`).
