@@ -1330,3 +1330,25 @@ context motivating the sizing rule.
 
 PR: https://github.com/kubernetes-sigs/agent-sandbox/pull/1270 (shipped
 body archived in `pr-drafts/Y16.md`).
+
+## 2026-07-23 — PR #1266 adversarial proof pass (v31): 6/6 pre-registered expectations PASS
+
+Arms: BEFORE = main 95380d9 (warm-pool controller byte-identical to 9dcbe62);
+AFTER = merge 9f7c649 (PR head 0d0aa75 onto 95380d9 — ship simulation). One
+fresh tuned 12-node cluster, redeploy between arms.
+
+- E1 over-creation (20x25, heavy image, workers=1000): BEFORE peak 597
+  sandboxes / 1,292 pods (2.58x), 3,799 POSTs (~3.8x); AFTER 1,002 POSTs
+  exact (501+501), peak 500/501, 500 + exactly 1 legitimate replacement,
+  all-ready +19s vs +28s. PASS both directions.
+- E2 unschedulable hold: BEFORE churned on the first post-grace touch (3
+  deleted + 3 recreated); AFTER untouched 540s: 0 deletes, one
+  WarmPoolNotProgressing at +5m14.3s (inside the jittered 5m02s-5m30s
+  window), self-triggered. PASS.
+- E3 jitter herd (30 pools simultaneous): exactly 30 events, 0 duplicates,
+  spread 138.3s near-uniform — no synchronized spike. PASS.
+- E4 phantom-delete stall (6->3 raced with out-of-band deletes, 3x):
+  reconvergence <=~0.5s each, no expectation stall. PASS x3.
+
+Evidence comment posted: PR #1266 issuecomment-5064242380. Artifacts:
+gs://kops-state-142966328212/perf-bench-results/round-1266-proof/.
