@@ -198,3 +198,14 @@ classic buckets start at 5ms; our warm hot path is 1–15ms) raised upstream as
 (bucket overrides at registration; native histograms already cover
 native-capable pipelines). The instrumentation itself lives on in
 `perf-investigation-master` for our own benchmarking regardless.
+
+**#1215 warm-pool over-creation fix (2026-07-22) — outside the 12-PR perf
+series but investigation-adjacent:** filed as
+[#1266](https://github.com/kubernetes-sigs/agent-sandbox/pull/1266)
+(`fix-1215-warmpool-expectations`, head `788b90b`): expectations-gated
+creates, terminating-aware counting, unschedulable hold, self-scheduled
+grace evaluation. Live v26/v27 before/after + full writeup in
+[RESULTS.md](RESULTS.md) ("ISSUE #1215 FIX SHIPPED"). Interacts with open
+#1251 (refill shaping flags) — if #1266 lands first, #1251's
+replenish-delay/max-refill-rate become secondary shaping on top of a
+correct-by-construction create path.

@@ -1216,3 +1216,78 @@ table + "Why not the flusher", credits justinsb's RequeueAfter
 suggestion); reply posted in his `writebehind.go` thread
 ([discussion_r3634195788](https://github.com/kubernetes-sigs/agent-sandbox/pull/1252#discussion_r3634195788)),
 left unresolved for his call.
+
+## 2026-07-22 — ISSUE #1215 FIX SHIPPED (PR #1266): warm-pool over-creation — expectations gate + terminating counting + unschedulable hold + self-scheduled grace requeue; v26 null repro / v27 decisive
+
+**Issue:** [kubernetes-sigs/agent-sandbox#1215](https://github.com/kubernetes-sigs/agent-sandbox/issues/1215)
+— SandboxWarmPool over-creates replicas (reporter: ~5x pods vs Σ spec.replicas,
+cluster-wide scheduler/apiserver overload). tomergee's log-confirmed RCA:
+create-path read-after-write — `toCreate = replicas − len(cachedSandboxes)`
+computed off the informer cache, which lags the controller's own just-issued
+creates; every create's watch event re-enqueues the pool while the cache is
+still stale. workers=1000 amplifies. NOT the 5-min grace GC loop (that fired
+once in the runaway window vs ≥5,000 creates).
+
+**Fix (branch `fix-1215-warmpool-expectations`, PR
+[#1266](https://github.com/kubernetes-sigs/agent-sandbox/pull/1266), head
+`788b90b` on upstream `dcd2fb4`):**
+1. Self-contained ReplicaSet-style expectations tracker
+   (`extensions/controllers/warmpool_expectations.go`): counted creates
+   recorded pre-issue, UID-tracked deletes, watch-observed lowering via a
+   wrapping `Watches` handler (replaces `Owns`), 5-min timeout fallback,
+   ATOMIC check-and-record create gate (stricter than kube — race-free even
+   under overlapping reconciles).
+2. Hard invariant: creates gated on active + terminating-still-present
+   population; pool can never overshoot spec.replicas while deletes drain.
+   Consequence: delete-and-replace defers one watch round-trip.
+3. Unschedulable-aware stuck GC: PodScheduled=False/Unschedulable → hold +
+   1-min requeue instead of delete-and-replace (was an unbounded churn loop
+   under capacity shortfall).
+4. Self-scheduled post-grace evaluation: reconciles seeing young not-Ready
+   sandboxes return RequeueAfter = earliest grace deadline (+2s slack),
+   min-composed with other requeues. Fixes a LATENT UPSTREAM DEFECT the
+   quiet-cluster forensics exposed: the 5-min stuck GC only ever fired on
+   ambient traffic (pod FailedScheduling events never touch Sandbox objects;
+   next guaranteed reconcile ~10h resync).
+5. WarmPoolNotProgressing (Warning) / WarmPoolProgressing (Normal) transition
+   Events (status has no conditions field; CRD schema change deliberately out
+   of scope — flagged as additive follow-up).
+
+**v26 (null repro, diagnostic; quiet cluster, 500×replicas:1, fast image):**
+reproduced NEITHER symptom — the amplifier is cache lag under load. But E2
+exposed the reachability gap above: pool settled Ready=False got NO
+post-grace evaluation for 12+ min; first cut's NotProgressing event was
+empirically unreachable → self-scheduled requeue added (commit `37fea85`,
+now `5bb457d` post-rebase).
+
+**v27 (decisive; kops/GCE k8s v1.35.6, 12-node tuned; artifacts
+`gs://kops-state-142966328212/perf-bench-results/round-1215-repro/v27/`):**
+
+E1 — 20 pools × replicas:25 (500 target), cold python-runtime-sandbox,
+workers=1000:
+
+| metric | BEFORE (main 9dcbe62) | AFTER (37fea85) |
+|---|---|---|
+| controller sandbox POSTs | 5,537 (~5.5×) | 1,004 = 502+502 EXACT |
+| peak concurrent sandboxes | 624 (+24.8%) | 502 |
+| peak pods | 1,230 (2.46×) | 502 |
+| events | Scheduled 1,153 / Killing 292 / Failed 854 / FailedScheduling 1,453 | Killing 2 |
+| watch stream | churn | 502 ADDED / 2 DELETED (2 legitimate replacements) |
+| all-ready | +48s | +19s |
+
+E2 — 1 pool replicas:3 cpu:64 (unschedulable): BEFORE stable until single
+post-grace touch at +367s → delete all 3 + recreate, cadence re-arms per
+trigger (real clusters: ambient traffic). AFTER: zero deletes, same 3 UIDs
+for 420s, exactly ONE WarmPoolNotProgressing Warning at +5m02s with NO
+external trigger.
+
+**Status:** PR [#1266](https://github.com/kubernetes-sigs/agent-sandbox/pull/1266)
+filed 2026-07-22 (MERGEABLE, base dcd2fb4); issue comment crediting
+tomergee's RCA + headline numbers:
+[#1215 (comment)](https://github.com/kubernetes-sigs/agent-sandbox/issues/1215#issuecomment-5053997976).
+Unit coverage: laggingClient stale-cache repro (proof: gate disabled → 15
+creates for replicas=3), concurrent -race, terminating-counting,
+unschedulable hold + exactly-once events, fake-clock quiet-cluster
+walk-through. All non-e2e -race green, lint-go 0 issues. Semantic deltas to
+watch in review: replace-on-next-pass (stuck GC / Recreate rollouts), Owns →
+Watches wrapper.
