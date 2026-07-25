@@ -1352,3 +1352,35 @@ fresh tuned 12-node cluster, redeploy between arms.
 
 Evidence comment posted: PR #1266 issuecomment-5064242380. Artifacts:
 gs://kops-state-142966328212/perf-bench-results/round-1266-proof/.
+
+## 2026-07-25 — v33 warm-pool scenario validation (two directions) — PR #1285 FILED
+
+Upstream contribution requested by barney-s on merged PR #1266
+(issuecomment-5074246533 / -5074791006): the 1215 repro is now permanent,
+optional stress phases `warmpool-overcreate` + `warmpool-unschedulable`
+(branch `stress-warmpool-scenario`, base 059f730, README fix e2d6f7c) with
+scenario wrapper `benchmarks-kops-gcp-warmpool` (12 nodes, workers=1000,
+multi-GB --wp-image) mirroring the claims scenario; no prow config (test-infra
+side, noted in PR body).
+
+v33 validation, one tuned cluster (e2-standard-8 workers + e2-16 CP, quota;
+invariants node-shape-independent), both controllers back to back:
+
+- legPASS (fixed, af8a790-equivalent tree 1ce9055): rc=0. Overcreate 500/500
+  distinct creates, 0 replacements, 0 over-creates, per-pool peak 25/25, all
+  pools Ready in 18.1s. Unschedulable: 3 creates / 0 deletes over 480s, UIDs
+  stable, exactly one WarmPoolNotProgressing at +365s (inside 5m-7m35s jitter
+  window).
+- legFAIL (pre-fix 95380d9 tree 8d9dc2e): rc=1 in phase 1 — 1,535 distinct
+  creates for the 500 target (3.07x), all 20 pools exceeded population caps
+  (worst peak 75 vs 25), replacement tolerance blown (534 vs 2). Per-pool
+  forensics printed in the abort line.
+
+Finding folded into the scenario README (e2d6f7c): the harness aborts after
+the first failed phase, so a pre-fix full run shows ONLY the overcreate
+failure; the unschedulable signature needs STRESS_PHASES=warmpool-unschedulable
+standalone.
+
+PR: https://github.com/kubernetes-sigs/agent-sandbox/pull/1285. Done-comment:
+PR #1266 issuecomment-5079004004. Artifacts:
+gs://kops-state-142966328212/perf-bench-results/round-wpscenario-validation/.
