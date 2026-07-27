@@ -1384,3 +1384,26 @@ standalone.
 PR: https://github.com/kubernetes-sigs/agent-sandbox/pull/1285. Done-comment:
 PR #1266 issuecomment-5079004004. Artifacts:
 gs://kops-state-142966328212/perf-bench-results/round-wpscenario-validation/.
+
+## 2026-07-27 — v34 small-image FAIL leg: scenario default flipped to small image (PR #1285 review)
+
+justinsb asked on PR #1285 whether the multi-GB overcreate image was needed
+at all (once pulled it sits on the nodes). v34 measured the pre-fix
+controller at the exact scenario shape (20x25, workers=1000) with
+debian:bookworm-slim: asserts trip LOUDER than big-image — 3,070 distinct
+creates vs 500 target (6.1x vs big-image's 3.1x), 1,312 over-creates, 1,258
+replacements, worst pool peak 117/25, global peak 1,796/500, 2,570 deletes
+during fill, wall 432s (~7 min failing leg). Mechanism: fast readiness
+transitions drive more status-update reconciles/sec against the stale
+cache; the quick create->Ready->excess-delete cycle adds delete churn the
+slow image never reaches. (v26's small-image null was the replicas:1
+confound.)
+
+Action: scenario default flipped to the standard small image in 0d690e4 on
+stress-warmpool-scenario (--wp-image kept as slow-pull escape hatch);
+README/flag docs and PR body updated; credited justinsb in
+discussion_r3660040976. PASS-direction small-image evidence: v32 gate-cost
+run's exactly-600-for-600 on the fixed controller (single-pool); a 20x25
+small-image PASS leg noted in the PR body as optional belt-and-braces on a
+future cluster run. Artifacts:
+gs://kops-state-142966328212/perf-bench-results/round-1285-smallimg/.
